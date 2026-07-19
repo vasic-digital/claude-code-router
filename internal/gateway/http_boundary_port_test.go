@@ -30,49 +30,100 @@ package gateway
 //   - shouldSendBody(method) — N/A, the gateway's Upstream seam always POSTs
 //     a body; there is no GET/HEAD upstream call to gate.
 //
-// Two pieces describe real, in-scope gateway behaviour:
-//   - inbound Authorization/x-api-key parsing is genuinely missing (GAP);
+// Two pieces describe real, in-scope gateway behaviour, and BOTH are now
+// PORTED:
+//   - inbound Authorization/x-api-key parsing was originally a GAP. It is no
+//     longer: RequireAPIKey (auth.go) reads both header forms and is mounted
+//     on POST /v1/messages (gateway.go). The skip was replaced with a real
+//     test rather than left in place — a skip asserting a gap that has since
+//     been closed is a false record of coverage.
 //   - response-header filtering, once messages.go's handleMessages/
 //     streamAnthropicSSE/respondNonStreaming existed to relay a response at
 //     all, turned out to already hold — PORTED, not GAP, see below.
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
 )
 
-// TestInboundAuthTokenParsing_GAP documents upstream's readAuthToken/
-// readHeader contract: a client may authenticate with either
-// "Authorization: Bearer <token>" or "x-api-key: <token>", both trimmed of
-// surrounding whitespace, and a header supplied as an array (as Node's http
-// module does for repeated headers) resolves to its first value.
+// TestInboundAuthTokenParsing ports upstream's readAuthToken/readHeader
+// contract: a client may authenticate with either "Authorization: Bearer
+// <token>" or "x-api-key: <token>", both trimmed of surrounding whitespace.
+// (Upstream's "header supplied as an array resolves to its first value" case
+// is Node-specific — Go's net/http exposes repeated headers via Header.Get,
+// which already returns the first value, so there is nothing to port.)
 //
-// This repository's gateway has no inbound-authentication concept at all:
-// handleMessages (internal/gateway/messages.go) never reads c.Request's
-// Authorization or x-api-key header — it goes straight from body to router
-// to upstream. That may be intentional for a purely-localhost-bound default
-// (opt.Host defaults to 127.0.0.1), but once EnableHTTP3/TLS or a
-// non-default Host is used the gateway would accept unauthenticated
-// requests from any reachable caller.
-func TestInboundAuthTokenParsing_GAP(t *testing.T) {
+// GAP CLOSED. This was skipped with "no inbound Authorization/x-api-key token
+// parsing exists anywhere in this repository". That is no longer true, so the
+// skip is replaced by a real test: leaving it would falsely record the
+// capability as missing.
+//
+// The property worth asserting is end-to-end rather than the parse in
+// isolation — a presented token must be ACCEPTED when it matches a configured
+// key and REJECTED when it does not, via either header spelling.
+func TestInboundAuthTokenParsing(t *testing.T) {
+	const key = "secret-token"
+
 	cases := []struct {
-		headers map[string]string
-		want    string
+		name       string
+		headers    map[string]string
+		wantStatus int
 	}{
-		{map[string]string{"authorization": " Bearer secret-token "}, "secret-token"},
-		{map[string]string{"x-api-key": " api-key-token "}, "api-key-token"},
-		{map[string]string{}, ""},
+		{"Authorization: Bearer", map[string]string{"Authorization": "Bearer " + key}, http.StatusOK},
+		{"x-api-key", map[string]string{"x-api-key": key}, http.StatusOK},
+		{"trailing whitespace trimmed", map[string]string{"Authorization": "Bearer " + key + "  "}, http.StatusOK},
+		{"wrong key rejected", map[string]string{"x-api-key": "not-the-key"}, http.StatusUnauthorized},
+		{"no credential rejected", map[string]string{}, http.StatusUnauthorized},
+		{"empty Bearer rejected", map[string]string{"Authorization": "Bearer "}, http.StatusUnauthorized},
 	}
-	_ = cases
-	t.Skip("GAP: no inbound Authorization/x-api-key token parsing exists anywhere in " +
-		"this repository; handleMessages does not authenticate incoming requests at all. " +
-		"(upstream: test/unit/gateway/http-boundary.test.mjs)")
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(testCfg(), Options{APIKeys: []string{key}})
+			s.Upstream = authOKUpstream{}
+
+			body := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body: %s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			// A rejection must never echo the configured credential back.
+			if tc.wantStatus == http.StatusUnauthorized && strings.Contains(rec.Body.String(), key) {
+				t.Errorf("401 body leaked the configured key: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
+// authOKUpstream returns a minimal valid completion so an AUTHORISED request
+// reaches 200 rather than dying downstream for an unrelated reason — otherwise
+// the test could not distinguish "auth passed" from "auth passed but the
+// request failed later".
+type authOKUpstream struct{}
+
+func (authOKUpstream) Do(_ context.Context, _ config.Provider, _ []byte) (*http.Response, error) {
+	const body = `{"id":"c1","choices":[{"message":{"content":"ok"},"finish_reason":"stop"}]}`
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}, nil
 }
 
 // TestUpstreamResponseHeaderNeverLeaksToClient is the PORTED counterpart of
