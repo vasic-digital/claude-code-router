@@ -121,8 +121,17 @@ const charsPerToken = 4
 // OUTPUT budget, not prompt input) is intentionally excluded.
 //
 // This reads only fields the router already receives on translate.AnthropicRequest,
-// so — unlike think-routing — long-context routing fires in production today
-// with no caller-side change.
+// so — unlike think-routing — long-context routing fires in production today with
+// no caller-side change FOR Anthropic-inbound requests (POST /v1/messages), whose
+// body populates System/Messages/Tools.
+//
+// SCOPE CAVEAT (no bluff): the OpenAI-compatible inbound facade
+// (POST /v1/chat/completions) routes on model alone — it builds an
+// AnthropicRequest carrying only Model+Stream (see
+// internal/gateway/openai_inbound.go), so estimateTokenCount sees an empty body
+// (~0 tokens) and long-context routing does NOT trip for that path; such a
+// request routes to Router.Default regardless of its true size. Wiring the
+// OpenAI facade to estimate from its own body is a documented future item.
 func estimateTokenCount(req *translate.AnthropicRequest) int {
 	if req == nil {
 		return 0

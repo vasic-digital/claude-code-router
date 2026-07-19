@@ -85,6 +85,15 @@ func requestProtocolForPath(path string) string {
 //     /interactions/<id>/cancel) is excluded even though it shares a prefix
 //     with the routable collection: the model for an in-flight interaction is
 //     fixed by the interaction record, not chosen from the request body.
+//
+// SCOPE (no bluff): this is a faithful, tested port of upstream's predicate,
+// kept for the multi-path dispatch upstream performs. In THIS gateway only
+// requestProtocolForPath is on the live path (handleInbound dispatches by it),
+// and gin's route table already enforces the POST+path predicate for the two
+// served endpoints — so shouldApplyGatewayRouting has no production caller yet
+// and is exercised only by protocol_endpoints_port_test.go. It becomes
+// load-bearing the day a single catch-all inbound route needs to gate routing
+// eligibility itself instead of relying on per-path registration.
 func shouldApplyGatewayRouting(method, path string) bool {
 	if method != http.MethodPost {
 		return false

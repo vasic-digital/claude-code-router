@@ -90,6 +90,14 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 	// Reuse the same model-based router. It selects on model/stream, which a
 	// minimal AnthropicRequest carries — no OpenAI-specific Router method is
 	// needed, and the fuller internal/router selection logic applies unchanged.
+	//
+	// CAVEAT (no bluff): because this AnthropicRequest carries only Model+Stream
+	// (never the OpenAI body's messages), internal/router's content-based
+	// LongContext tier cannot see this request's true size — it estimates ~0
+	// tokens and never trips, so a large /v1/chat/completions body routes to
+	// Router.Default rather than Router.LongContext. See estimateTokenCount's
+	// doc in internal/router/selector.go. Estimating from the OpenAI body is a
+	// documented future item.
 	provider, model, rerr := s.Router.Route(&translate.AnthropicRequest{Model: in.Model, Stream: in.Stream})
 	if rerr != nil {
 		writeOpenAIError(c, http.StatusServiceUnavailable, "not_found_error", rerr.Error())
