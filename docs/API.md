@@ -136,7 +136,7 @@ The same `AnthropicRequest` shape documented in `internal/translate/anthropic.go
 | `temperature`, `top_p` | float, optional | Passed through. |
 | `stop_sequences` | []string, optional | Renamed to OpenAI's `stop` upstream. |
 | `stream` | bool | Selects [streaming](#streaming-response) vs [buffered](#non-streaming-response) response handling. |
-| `thinking` | object, optional | Anthropic's extended-thinking request field. When present with a non-null value it is a **routing** signal: the request routes to `Router.think` when that route is configured (`requestWantsThinking`, `internal/router/selector.go:150-174`; live as of v0.4.0). An omitted field or `"thinking": null` has no routing effect. Applies to this Anthropic-inbound path only — the OpenAI facade routes on model alone. |
+| `thinking` | object, optional | Anthropic's extended-thinking request field. When present with a non-null value it is a **routing** signal: the request routes to `Router.think` when that route is configured (`requestWantsThinking`, `internal/router/selector.go:150-174`; live as of v0.4.0). An omitted field or `"thinking": null` has no routing effect. Applies to this Anthropic-inbound path only — the OpenAI facade has no `thinking` field to derive the signal from. (Long-context routing, by contrast, DOES apply to the facade as of v0.4.5.) |
 
 ### Non-streaming response
 

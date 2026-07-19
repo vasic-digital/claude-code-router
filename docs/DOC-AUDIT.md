@@ -197,10 +197,12 @@ Current, honest list (mirrored in `README.md`):
    carrying a non-null `thinking` block routes to `Router.think` when configured
    (`requestWantsThinking`, `internal/router/selector.go:150-174`; `chooseRoute`,
    `router.go:164-175`). This is no longer a limitation — the only remaining scope
-   caveat is that the OpenAI-inbound facade routes on model alone. `Router.longContext`
-   likewise fires in production when an estimated prompt exceeds
-   `DefaultLongContextThreshold` (60000 tokens) and the route is set
-   (`internal/router/selector.go:95-138`, `router.go:130-175`).
+   caveat is `Router.think` on the OpenAI-inbound facade (which has no `thinking`
+   field to derive the signal from). `Router.longContext` fires in production when
+   an estimated prompt exceeds `DefaultLongContextThreshold` (60000 tokens) and the
+   route is set, for BOTH inbound paths as of v0.4.5 — the OpenAI facade estimates
+   its own request size via `routingRequestFromOpenAI`
+   (`internal/router/selector.go`, `router.go:130-175`, `internal/gateway/openai_inbound.go`).
 4. **The retry loop's attempt budget (`MaxAttempts`, default 3) has no CLI/config
    surface.**
 5. **An authenticated, explicitly-configured outbound proxy**

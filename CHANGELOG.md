@@ -4,9 +4,24 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.5` (below) are the
+`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.6` (below) are the
 current releases. Entries are drawn from this repository's real `git log`
 history — nothing here is speculative.
+
+## [0.4.6] - 2026-07-20
+
+Documentation only — correct claims the v0.4.5 routing change made stale.
+
+### Documentation
+
+- README, `docs/FAQ.md`, `docs/ARCHITECTURE.md`, `docs/API.md`,
+  `docs/LIVE_TESTING.md`, and `docs/DOC-AUDIT.md` no longer state that the
+  OpenAI-inbound facade (`POST /v1/chat/completions`) "routes on model alone" or
+  that `Router.longContext` "never triggers" for it — as of v0.4.5 the facade
+  estimates its own request size, so long-context routing fires symmetrically
+  for both inbound paths. `Router.think` remaining Anthropic-inbound only (the
+  OpenAI facade has no `thinking` field) is now stated precisely, without
+  implying the facade ignores request size.
 
 ## [0.4.5] - 2026-07-20
 
