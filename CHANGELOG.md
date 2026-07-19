@@ -4,9 +4,43 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0` (the initial clean-room Go port) and `v0.2.0` were tagged 2026-07-19;
-`v0.3.0` (below) is the current release. Entries are drawn from this
-repository's real `git log` history — nothing here is speculative.
+`v0.1.0`–`v0.3.0` were tagged 2026-07-19; `v0.4.0` (below) is the current
+release. Entries are drawn from this repository's real `git log` history —
+nothing here is speculative.
+
+## [0.4.0] - 2026-07-19
+
+Observability and the semantic cache tier are now WIRED live, plus content-aware
+Think routing and exhaustive verification suites. Every addition is opt-in and
+default OFF/inert — an existing config's request path stays byte-identical to
+v0.3.0. Full suite green under `-race` incl. chaos/security/mutation/helixqa.
+
+### Added
+
+- Prometheus metrics: a `/metrics` endpoint on the loopback management server
+  exposing RED HTTP metrics (requests_total by method/route-template/status,
+  in-flight gauge, duration histogram) and `gen_ai.*` counters (upstream
+  requests, input/output tokens for streaming AND non-streaming, cache lookups
+  by tier). Labels carry only method/route-template/provider-name/model — no
+  secrets. Self-contained (no `client_golang`). Live-proven against a running
+  binary. (`e8b7f50`, `8fac80c`)
+- Semantic response cache WIRED: `Cache.semantic` (+ `Cache.semantic_threshold`,
+  default 0.85) makes the gateway serve a near-duplicate prior request on an
+  exact miss via the local lexical embedder — exact-first, scope-isolated,
+  bounded registry, short-turn guard. A new `ResponseCache` interface lets the
+  gateway consume the exact or semantic tier uniformly. Off by default.
+  (`e8b7f50`)
+- `Router.think` activated: a request carrying Anthropic's `thinking` field
+  routes to `Router.think` when configured. The OpenAI translation still drops
+  `thinking`; passthrough preserves it. (`103aa89`)
+
+### Tests
+
+- Exhaustive confirmation/validation/verification suites across cache
+  (fingerprint/gate/memory/sqlite/embedder/semantic + 2 fuzzers), metrics (a
+  Prometheus exposition-grammar validator + property + 24-writer concurrency),
+  logging (redaction leaves no secret fragment + 3 fuzzers), and proxy (verbatim
+  URL, no-key-in-error). All green under `-race`. (`d196018`)
 
 ## [0.3.0] - 2026-07-19
 
