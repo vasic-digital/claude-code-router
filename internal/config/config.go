@@ -21,10 +21,25 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+)
+
+// Protocol names the wire protocol a provider's upstream speaks.
+const (
+	// ProtocolOpenAI: the upstream accepts OpenAI chat-completions requests.
+	// This is the default for every provider that does not say otherwise,
+	// because it is what the overwhelming majority of upstreams — and every
+	// provider the toolkit configures today — actually speak.
+	ProtocolOpenAI = "openai"
+	// ProtocolAnthropic: the upstream is an Anthropic-native Messages API
+	// endpoint. A request to such a provider is sent UNCHANGED (Anthropic
+	// shape in, Anthropic shape out) rather than translated to OpenAI shape by
+	// internal/translate.AnthropicToOpenAI.
+	ProtocolAnthropic = "anthropic"
 )
 
 // Provider is one upstream model endpoint.
@@ -38,6 +53,14 @@ type Provider struct {
 	APIKey      string       `json:"api_key"`
 	Models      []string     `json:"models"`
 	Transformer *Transformer `json:"transformer,omitempty"`
+	// Protocol is the wire protocol the upstream speaks: "openai" (the
+	// default) or "anthropic". It is OPTIONAL: an ABSENT protocol behaves
+	// exactly as before this field existed — the provider is treated as an
+	// OpenAI chat-completions upstream — so every config already on disk (none
+	// of which carries this key) keeps working byte-for-byte. See
+	// ResolvedProtocol for how an absent value is inferred, and Validate for
+	// the accepted set.
+	Protocol string `json:"protocol,omitempty"`
 }
 
 // Transformer names the request/response fixups to apply for a provider.
@@ -55,6 +78,51 @@ func (p *Provider) Has(t string) bool {
 	}
 	for _, u := range p.Transformer.Use {
 		if u == t {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolvedProtocol reports the wire protocol to use for this provider.
+//
+// An EXPLICIT Protocol field always wins. When it is absent, the protocol is
+// INFERRED from api_base_url purely as a convenience for existing configs: a
+// URL that unmistakably names an Anthropic endpoint — the api.anthropic.com
+// host (or any *.anthropic.com), or a URL carrying an "/anthropic" path
+// segment (the toolkit's proxy convention for a native base) — resolves to
+// "anthropic"; everything else resolves to "openai".
+//
+// Inference is deliberately conservative so that no ordinary OpenAI-shaped
+// provider is ever silently reclassified: it yields "anthropic" only for a URL
+// that could not plausibly be anything else. An operator who needs certainty
+// (or whose native endpoint the heuristic does not recognise) sets Protocol
+// explicitly, which always overrides inference.
+func (p *Provider) ResolvedProtocol() string {
+	if p.Protocol != "" {
+		return p.Protocol
+	}
+	if isAnthropicNativeURL(p.APIBaseURL) {
+		return ProtocolAnthropic
+	}
+	return ProtocolOpenAI
+}
+
+// isAnthropicNativeURL reports whether raw unmistakably names an Anthropic
+// Messages endpoint. It parses rather than substring-matches so that a query
+// string or an unrelated host such as "api.anthropic-proxy.example.com" (which
+// is NOT *.anthropic.com) does not trigger a false positive.
+func isAnthropicNativeURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "anthropic.com" || strings.HasSuffix(host, ".anthropic.com") {
+		return true
+	}
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == "anthropic" {
 			return true
 		}
 	}
@@ -134,6 +202,16 @@ func (c *Config) Validate() error {
 		}
 		if !strings.HasPrefix(p.APIBaseURL, "http://") && !strings.HasPrefix(p.APIBaseURL, "https://") {
 			return fmt.Errorf("provider %q: api_base_url must be http(s), got %q", p.Name, p.APIBaseURL)
+		}
+		// An empty protocol means "infer" (see ResolvedProtocol); anything
+		// other than the two known values is a typo we must reject loudly
+		// rather than silently treat as OpenAI — silently mishandling a
+		// misspelled "anthropic " is exactly the failure this field prevents.
+		switch p.Protocol {
+		case "", ProtocolOpenAI, ProtocolAnthropic:
+		default:
+			return fmt.Errorf("provider %q: protocol %q is not one of %q, %q",
+				p.Name, p.Protocol, ProtocolOpenAI, ProtocolAnthropic)
 		}
 	}
 	for label, r := range map[string]string{

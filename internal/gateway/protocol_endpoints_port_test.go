@@ -12,31 +12,31 @@ package gateway
 // Upstream Node CCR resolves, for every inbound HTTP request, which wire
 // protocol it speaks (Anthropic Messages, OpenAI chat-completions, OpenAI
 // Responses, Gemini generateContent, Gemini "Interactions") purely from the
-// request path via a reusable requestProtocolForPath classifier, and
-// separately decides whether that request is eligible for model-based
-// routing at all via shouldApplyGatewayRouting (POST + a small path
-// allowlist; sub-resource paths like ".../interaction-1/cancel" are
-// explicitly excluded even though they share a path prefix with a routable
-// one, because the model for an in-flight interaction is fixed by the
-// interaction record, not the request body).
+// request path via a reusable requestProtocolForPath classifier, and separately
+// decides whether that request is eligible for model-based routing via
+// shouldApplyGatewayRouting (POST + a path allowlist; interaction sub-resources
+// like ".../interaction-1/cancel" are excluded even though they share a prefix
+// with a routable one, because the model for an in-flight interaction is fixed
+// by the interaction record, not the request body).
 //
-// gateway.go now registers a real POST /v1/messages route (see
-// internal/gateway/messages.go, added after this test-porting task began —
-// it is off-limits to edit here), so the single-protocol subset of this
-// contract (Anthropic Messages, POST-only) is real and PORTED below.
-// Everything beyond that single hardcoded route is still GAP:
-//   - there is no REUSABLE path->protocol classifier function anywhere —
-//     "POST /v1/messages routes, everything else 404s" is an artifact of
-//     gin's route table (routes() in gateway.go), not a callable function
-//     upstream's requestProtocolForPath equivalent could be ported as;
-//   - none of OpenAI chat-completions ("/chat/completions"), OpenAI
-//     Responses ("/responses"), Gemini generateContent, Gemini
-//     Interactions, or the "/proxy/v1/*" path aliases are recognised at
-//     all — Claude Code is this gateway's only supported client shape.
+// GAP CLOSED. Both classifiers are now REAL, callable functions (see
+// internal/gateway/protocol.go) and BOTH are load-bearing: handleInbound
+// (openai_inbound.go) dispatches every inbound request via
+// requestProtocolForPath, and routes() registers the routable POST paths. The
+// two previous t.Skip placeholders — which asserted the classifiers did not
+// exist — are replaced by real tests running upstream's full path tables.
+//
+// Coverage note (honest scope): the classifier recognises all five families as
+// a faithful port of upstream's pure function, but the gateway currently SERVES
+// two of them — Anthropic Messages (/v1/messages) and OpenAI chat-completions
+// (/v1/chat/completions, see openai_inbound.go). OpenAI Responses and the two
+// Gemini families are classified but not yet given live handlers; they are
+// documented as recognised-not-served rather than silently mishandled.
 
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
@@ -50,9 +50,8 @@ func portTestCfg() *config.Config {
 }
 
 // TestOnlyPOSTMessagesIsRoutingEligible is the real, narrow analogue of
-// upstream's "gateway routing applies only to POST model-selection
-// endpoints": for the one endpoint this gateway actually implements
-// (/v1/messages), only POST is routing-eligible — every other method 404s
+// upstream's "gateway routing applies only to POST model-selection endpoints":
+// for /v1/messages, only POST is routing-eligible — every other method 404s
 // rather than being silently accepted or misrouted.
 func TestOnlyPOSTMessagesIsRoutingEligible(t *testing.T) {
 	s := New(portTestCfg(), Options{})
@@ -65,51 +64,44 @@ func TestOnlyPOSTMessagesIsRoutingEligible(t *testing.T) {
 	}
 }
 
-// TestRequestProtocolForPath_GAP documents upstream's requestProtocolForPath
-// contract (protocol-endpoints.test.mjs, "request protocol detection covers
-// every supported public endpoint shape") in full. Only the first row
-// ("/messages" family -> anthropic_messages, via the literal POST
-// /v1/messages route) has any counterpart in this repository; there is no
-// reusable classifier function, and none of the other protocol families are
-// recognised at any path.
-func TestRequestProtocolForPath_GAP(t *testing.T) {
+// TestRequestProtocolForPath ports upstream's requestProtocolForPath contract in
+// full: "request protocol detection covers every supported public endpoint
+// shape", including the "/proxy/v1/*" alias and the strict edges where an
+// unrecognised shape must resolve to "" (no protocol) rather than a guess.
+func TestRequestProtocolForPath(t *testing.T) {
 	cases := []struct {
 		path string
 		want string
 	}{
-		{"/messages", "anthropic_messages"},
-		{"/proxy/v1/messages", "anthropic_messages"},
-		{"/chat/completions", "openai_chat_completions"},
-		{"/proxy/v1/chat/completions", "openai_chat_completions"},
-		{"/responses", "openai_responses"},
-		{"/proxy/v1/responses", "openai_responses"},
-		{"/v1/models/gemini-2.5-pro:generateContent", "gemini_generate_content"},
-		{"/v1beta/models/gemini-2.5-pro:streamGenerateContent", "gemini_generate_content"},
-		{"/v1/interactions", "gemini_interactions"},
-		{"/v1beta/interactions/interaction-1", "gemini_interactions"},
-		{"/v1beta/interactions/interaction-1/cancel", "gemini_interactions"},
+		{"/messages", protoAnthropicMessages},
+		{"/proxy/v1/messages", protoAnthropicMessages},
+		{"/chat/completions", protoOpenAIChatCompletions},
+		{"/proxy/v1/chat/completions", protoOpenAIChatCompletions},
+		{"/responses", protoOpenAIResponses},
+		{"/proxy/v1/responses", protoOpenAIResponses},
+		{"/v1/models/gemini-2.5-pro:generateContent", protoGeminiGenerateContent},
+		{"/v1beta/models/gemini-2.5-pro:streamGenerateContent", protoGeminiGenerateContent},
+		{"/v1/interactions", protoGeminiInteractions},
+		{"/v1beta/interactions/interaction-1", protoGeminiInteractions},
+		{"/v1beta/interactions/interaction-1/cancel", protoGeminiInteractions},
 		// Unrecognised shapes must resolve to "no protocol", not a guess.
-		{"/v1/completions", ""},
-		{"/v1beta/models/gemini-2.5-pro:countTokens", ""},
+		{"/v1/completions", ""},                           // bare completions, not chat
+		{"/v1beta/models/gemini-2.5-pro:countTokens", ""}, // not a generate call
+		{"/v1/embeddings", ""},                            // unrelated OpenAI endpoint
+		{"/", ""},                                         // root
 	}
-	_ = cases
-	t.Skip("GAP: no requestProtocolForPath (or equivalent) exists in internal/gateway; " +
-		"routing to /v1/messages is a single hardcoded gin route (see gateway.go's " +
-		"routes()), not a reusable path->protocol classifier, and no other protocol " +
-		"family (OpenAI chat-completions, OpenAI Responses, Gemini generateContent, " +
-		"Gemini Interactions, or any \"/proxy/v1/*\" alias) is recognised at any path. " +
-		"(upstream: test/unit/routing/protocol-endpoints.test.mjs)")
+	for _, tc := range cases {
+		if got := requestProtocolForPath(tc.path); got != tc.want {
+			t.Errorf("requestProtocolForPath(%q) = %q, want %q", tc.path, got, tc.want)
+		}
+	}
 }
 
-// TestShouldApplyGatewayRouting_GAP documents upstream's full
-// shouldApplyGatewayRouting contract across every protocol family. The
-// POST-vs-other-methods slice of it, restricted to /v1/messages, is real —
-// see TestOnlyPOSTMessagesIsRoutingEligible — but the path-allowlist and
-// sub-resource-exclusion behaviour (Gemini Interactions "get status" /
-// "cancel" sharing a prefix with a routable path yet being excluded from
-// routing) has no counterpart, because none of those paths exist here at
-// all.
-func TestShouldApplyGatewayRouting_GAP(t *testing.T) {
+// TestShouldApplyGatewayRouting ports upstream's shouldApplyGatewayRouting
+// contract across every protocol family, including the POST-only rule and the
+// interaction sub-resource exclusion (a specific interaction / its cancel share
+// a prefix with the routable collection yet are NOT routing-eligible).
+func TestShouldApplyGatewayRouting(t *testing.T) {
 	cases := []struct {
 		method string
 		path   string
@@ -124,12 +116,30 @@ func TestShouldApplyGatewayRouting_GAP(t *testing.T) {
 		{"POST", "/v1beta/models/gemini:generateContent", true},
 		{"GET", "/v1/messages", false},
 		{"DELETE", "/v1beta/interactions", false},
+		{"POST", "/v1/completions", false}, // unrecognised path is never routable
 	}
-	_ = cases
-	t.Skip("GAP: no shouldApplyGatewayRouting (or equivalent) exists as a callable function " +
-		"anywhere in this repository, and only one of the paths in upstream's table " +
-		"(/v1/messages) is implemented at all — see TestOnlyPOSTMessagesIsRoutingEligible " +
-		"for the real subset of this contract that is PORTED. (upstream: " +
-		"test/unit/routing/protocol-endpoints.test.mjs, " +
-		"test/unit/gateway/routing-architecture.test.mjs)")
+	for _, tc := range cases {
+		if got := shouldApplyGatewayRouting(tc.method, tc.path); got != tc.want {
+			t.Errorf("shouldApplyGatewayRouting(%q, %q) = %v, want %v", tc.method, tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestProxyAliasReachesMessagesHandler proves the "/proxy/v1/*" alias is not
+// merely classified but actually WIRED: a POST to the alias reaches the same
+// Anthropic handler as the canonical path (200 via a stub upstream), so the
+// classifier's alias handling is load-bearing end-to-end.
+func TestProxyAliasReachesMessagesHandler(t *testing.T) {
+	s := New(testCfg(), Options{})
+	s.Upstream = authOKUpstream{} // canned OpenAI completion -> 200
+
+	body := `{"model":"m","max_tokens":10,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/proxy/v1/messages", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/proxy/v1/messages = %d, want 200 (alias must reach the messages handler)", rec.Code)
+	}
 }

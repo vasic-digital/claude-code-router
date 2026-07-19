@@ -472,6 +472,49 @@ func AnthropicToOpenAI(in *AnthropicRequest, opt Options) (*OpenAIRequest, error
 	return out, nil
 }
 
+// AnthropicPassthrough prepares an Anthropic-shaped request body for an
+// Anthropic-NATIVE upstream (a config.Provider whose ResolvedProtocol is
+// "anthropic"), which must receive the request UNCHANGED rather than translated
+// to OpenAI shape.
+//
+// It applies only the two provider-scoped fixups that are meaningful for a
+// native endpoint:
+//
+//   - opt.Model overrides the top-level "model" (the router's chosen model id);
+//   - opt.CleanCache strips cache_control — for a self-hosted Anthropic-COMPATIBLE
+//     upstream that does not implement prompt caching. A real Anthropic endpoint
+//     accepts cache_control, so a provider pointed at api.anthropic.com should
+//     leave the cleancache transformer OFF.
+//
+// Every other field is preserved VERBATIM. It works on the raw JSON rather than
+// the typed AnthropicRequest precisely so that fields this package does not
+// model (metadata, tool_choice, top_k, thinking, ...) are not silently dropped:
+// a passthrough that quietly discarded fields would defeat its own purpose.
+// UseNumber keeps large-integer / high-precision literals intact, exactly as
+// StripCacheControl does and for the same reason (see its doc).
+func AnthropicPassthrough(raw []byte, opt Options) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("anthropic request body must be a JSON object")
+	}
+	if opt.Model != "" {
+		m["model"] = opt.Model
+	}
+	if opt.CleanCache {
+		// stripKey is schema-aware: a tool input_schema property legitimately
+		// NAMED cache_control is preserved (see stripKey); only Anthropic
+		// cache_control metadata is removed.
+		v = stripKey(v, "cache_control")
+	}
+	return json.Marshal(v)
+}
+
 // StripCacheControl removes every cache_control key from a raw request body.
 //
 // This operates on the generic JSON tree rather than the typed structs because

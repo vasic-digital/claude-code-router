@@ -1,0 +1,276 @@
+package gateway
+
+// OpenAI-compatible inbound facade.
+//
+// Alongside the primary Anthropic Messages endpoint (POST /v1/messages), the
+// gateway accepts OpenAI chat-completions requests (POST /v1/chat/completions,
+// and the /proxy/v1/... alias) so an OpenAI-SDK client can reach any routed
+// provider. Because every provider the toolkit configures today is itself
+// OpenAI-shaped, the common path is a near-passthrough: the client's OpenAI
+// request is forwarded with only the routed model overridden, and the
+// provider's OpenAI response is relayed straight back to the client, which
+// asked for OpenAI shape.
+//
+// The one case this facade does NOT yet serve is an OpenAI-inbound request that
+// routes to an Anthropic-NATIVE provider: that needs OpenAI->Anthropic request
+// AND response translation (the reverse of internal/translate), which is not
+// implemented. Rather than send an OpenAI body to a Messages API that will
+// reject it with a confusing error, the facade fails with an explicit 501 that
+// names the provider and the two supported alternatives. No real config today
+// has an Anthropic-native provider, so this path is unreachable in practice —
+// but it is handled honestly rather than silently mishandled.
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/vasic-digital/claude-code-router/internal/config"
+	"github.com/vasic-digital/claude-code-router/internal/translate"
+)
+
+// handleInbound is the classifier-driven entrypoint every routable POST path is
+// registered to. It uses requestProtocolForPath (the ported classifier) to
+// dispatch to the handler for the request's protocol family, so that classifier
+// is genuinely load-bearing on every inbound request rather than dead code.
+func (s *Server) handleInbound(c *gin.Context) {
+	switch requestProtocolForPath(c.Request.URL.Path) {
+	case protoAnthropicMessages:
+		s.handleMessages(c)
+	case protoOpenAIChatCompletions:
+		s.handleOpenAIChatCompletions(c)
+	default:
+		// Unreachable given the registered routes (routes() only mounts paths
+		// that classify to the two served families), but fail explicitly rather
+		// than silently 200 a path we do not actually handle.
+		writeAnthropicError(c, http.StatusNotFound, "not_found_error",
+			"unsupported inbound protocol for path "+c.Request.URL.Path)
+	}
+}
+
+// openAIInboundRequest is the minimal shape the facade needs from an inbound
+// OpenAI chat-completions body: the model (for routing and override) and the
+// stream flag (to choose the response path). Every other field is forwarded to
+// the upstream verbatim, so nothing else needs modelling.
+type openAIInboundRequest struct {
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
+}
+
+func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
+	// Same inbound-body cap as /v1/messages: a distinct 413 (via MaxBytesReader)
+	// rather than a truncated body surfacing as a confusing parse error.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeOpenAIError(c, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				fmt.Sprintf("request body exceeds the %d-byte limit", maxRequestBodyBytes))
+			return
+		}
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("read request body: %v", err))
+		return
+	}
+
+	var in openAIInboundRequest
+	if err := json.Unmarshal(body, &in); err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("invalid JSON: %v", err))
+		return
+	}
+
+	// Reuse the same model-based router. It selects on model/stream, which a
+	// minimal AnthropicRequest carries — no OpenAI-specific Router method is
+	// needed, and the fuller internal/router selection logic applies unchanged.
+	provider, model, rerr := s.Router.Route(&translate.AnthropicRequest{Model: in.Model, Stream: in.Stream})
+	if rerr != nil {
+		writeOpenAIError(c, http.StatusServiceUnavailable, "not_found_error", rerr.Error())
+		return
+	}
+
+	if provider.ResolvedProtocol() == config.ProtocolAnthropic {
+		writeOpenAIError(c, http.StatusNotImplemented, "invalid_request_error",
+			fmt.Sprintf("model %q routes to Anthropic-native provider %q; the OpenAI-compatible inbound endpoint "+
+				"cannot bridge to an Anthropic upstream yet — route this model to an OpenAI-shaped provider, or call POST /v1/messages",
+				in.Model, provider.Name))
+		return
+	}
+
+	outBody, err := overrideModelField(body, model)
+	if err != nil {
+		writeOpenAIError(c, http.StatusInternalServerError, "api_error", fmt.Sprintf("encode upstream request: %v", err))
+		return
+	}
+
+	ctx := c.Request.Context()
+	if !in.Stream {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.opt.UpstreamTimeout)
+		defer cancel()
+	}
+
+	resp, ok := s.doUpstreamWithRetry(c, ctx, provider, outBody, openAIResponder{})
+	if !ok {
+		return
+	}
+	defer resp.Body.Close()
+
+	relayOpenAIResponse(c, resp, in.Stream)
+}
+
+// overrideModelField sets the top-level "model" on a JSON object body while
+// preserving every other field verbatim (UseNumber keeps large/high-precision
+// literals intact, as elsewhere). An empty model leaves the body unchanged.
+func overrideModelField(raw []byte, model string) ([]byte, error) {
+	if model == "" {
+		return raw, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("request body must be a JSON object")
+	}
+	m["model"] = model
+	return json.Marshal(v)
+}
+
+// relayOpenAIResponse forwards an OpenAI-shaped upstream response to the client
+// unchanged (the client asked for OpenAI shape and the provider produced it).
+// Like every other response path here, it copies NO upstream header — the
+// response is rebuilt from the body alone.
+func relayOpenAIResponse(c *gin.Context, resp *http.Response, stream bool) {
+	if stream {
+		relayRawStream(c.Writer, resp.Body)
+		return
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
+		return
+	}
+	c.Data(http.StatusOK, "application/json", raw)
+}
+
+// relayRawStream copies an SSE body through to the client line by line,
+// flushing each line so events arrive as they are produced. Shared by the
+// Anthropic-native and OpenAI relay paths. Only the Content-Type/cache headers
+// this gateway itself sets are written; no upstream header is forwarded.
+func relayRawStream(w gin.ResponseWriter, r io.Reader) {
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	w.Flush() // open the connection immediately, before the first event
+
+	reader := bufio.NewReader(r)
+	for {
+		chunk, readErr := reader.ReadString('\n')
+		if len(chunk) > 0 {
+			if _, werr := io.WriteString(w, chunk); werr != nil {
+				return // client hung up; nothing more we can do
+			}
+			w.Flush()
+		}
+		if readErr != nil {
+			return
+		}
+	}
+}
+
+// ---------- Error-envelope strategy ----------
+//
+// The retry loop (doUpstreamWithRetry) is shared by both inbound facades, but a
+// failure must be reported in the envelope the CLIENT expects: Anthropic shape
+// for /v1/messages, OpenAI shape for /v1/chat/completions. errorResponder is
+// that strategy; each handler passes the responder matching its inbound family.
+
+type errorResponder interface {
+	writeError(c *gin.Context, status int, errType, message string)
+	forwardUpstream(c *gin.Context, resp *http.Response)
+}
+
+// anthropicResponder emits the Anthropic error shape (the pre-existing
+// behaviour of /v1/messages, unchanged).
+type anthropicResponder struct{}
+
+func (anthropicResponder) writeError(c *gin.Context, status int, errType, message string) {
+	writeAnthropicError(c, status, errType, message)
+}
+func (anthropicResponder) forwardUpstream(c *gin.Context, resp *http.Response) {
+	forwardUpstreamError(c, resp)
+}
+
+// openAIResponder emits the OpenAI error shape:
+// {"error":{"message":...,"type":...,"code":null}}.
+type openAIResponder struct{}
+
+func (openAIResponder) writeError(c *gin.Context, status int, errType, message string) {
+	writeOpenAIError(c, status, errType, message)
+}
+func (openAIResponder) forwardUpstream(c *gin.Context, resp *http.Response) {
+	forwardOpenAIUpstreamError(c, resp)
+}
+
+// writeOpenAIError writes the OpenAI error envelope at the given status.
+func writeOpenAIError(c *gin.Context, status int, errType, message string) {
+	c.AbortWithStatusJSON(status, gin.H{
+		"error": gin.H{
+			"message": message,
+			"type":    errType,
+			"code":    nil,
+		},
+	})
+}
+
+// forwardOpenAIUpstreamError maps a non-2xx OpenAI upstream response to the
+// client, PRESERVING the upstream status. If the upstream body is already an
+// OpenAI error object it is relayed verbatim; otherwise the raw text is wrapped
+// in the OpenAI error envelope so the client always sees a well-formed error.
+func forwardOpenAIUpstreamError(c *gin.Context, resp *http.Response) {
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+
+	var probe struct {
+		Error json.RawMessage `json:"error"`
+	}
+	if json.Unmarshal(raw, &probe) == nil && len(probe.Error) > 0 {
+		// Already an OpenAI-shaped {"error":{...}} — pass it through untouched.
+		c.Data(resp.StatusCode, "application/json", raw)
+		c.Abort()
+		return
+	}
+
+	msg := strings.TrimSpace(string(raw))
+	if msg == "" {
+		msg = fmt.Sprintf("upstream returned status %d", resp.StatusCode)
+	}
+	writeOpenAIError(c, resp.StatusCode, openAIErrTypeForStatus(resp.StatusCode), msg)
+}
+
+// openAIErrTypeForStatus maps an HTTP status to an OpenAI error "type".
+func openAIErrTypeForStatus(status int) string {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "authentication_error"
+	case status == http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case status == http.StatusBadRequest || status == http.StatusUnprocessableEntity:
+		return "invalid_request_error"
+	case status >= 500:
+		return "api_error"
+	default:
+		return "api_error"
+	}
+}

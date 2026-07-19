@@ -150,15 +150,30 @@ func (s *Server) routes() {
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
 
-	// The Anthropic-compatible endpoint Claude Code actually talks to.
-	// RequireAPIKey is mounted HERE ONLY, as route-scoped middleware — NOT
-	// via s.eng.Use, which would also gate /health and /ready above and
-	// break liveness/readiness probing the moment APIKeys is configured.
-	// When s.opt.APIKeys is empty (the zero-value default), RequireAPIKey
-	// itself disables auth entirely (see auth.go's package doc): the
-	// toolkit that drives this gateway today sends no client key at all,
-	// and must keep working unchanged.
-	s.eng.POST("/v1/messages", RequireAPIKey(s.opt.APIKeys), s.handleMessages)
+	// The inbound completion endpoints. Every routable POST path is dispatched
+	// through the SAME classifier-driven entrypoint (handleInbound, which calls
+	// requestProtocolForPath), so the ported protocol classifier is genuinely
+	// load-bearing rather than dead code:
+	//   - Anthropic Messages (/v1/messages)      — the endpoint Claude Code talks to;
+	//   - OpenAI chat-completions (/v1/chat/completions) — the OpenAI-compatible
+	//     inbound facade (see openai_inbound.go), so an OpenAI-SDK client can
+	//     reach any OpenAI-shaped provider.
+	// Both are also exposed under the "/proxy/v1/..." alias upstream uses.
+	//
+	// RequireAPIKey is mounted HERE ONLY, as route-scoped middleware — NOT via
+	// s.eng.Use, which would also gate /health and /ready above and break
+	// liveness/readiness probing the moment APIKeys is configured. When
+	// s.opt.APIKeys is empty (the zero-value default), RequireAPIKey itself
+	// disables auth entirely (see auth.go's package doc): the toolkit that
+	// drives this gateway today sends no client key at all, and must keep
+	// working unchanged.
+	inbound := RequireAPIKey(s.opt.APIKeys)
+	for _, p := range []string{
+		"/v1/messages", "/proxy/v1/messages",
+		"/v1/chat/completions", "/proxy/v1/chat/completions",
+	} {
+		s.eng.POST(p, inbound, s.handleInbound)
+	}
 }
 
 // Start binds and serves. It returns once the listener is up; serving

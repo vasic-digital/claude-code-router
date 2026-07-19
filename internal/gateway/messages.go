@@ -225,24 +225,44 @@ func (s *Server) handleMessages(c *gin.Context) {
 		return
 	}
 
-	outReq, err := translate.AnthropicToOpenAI(&in, translate.Options{
-		CleanCache:    provider.Has("cleancache"),
-		StreamOptions: provider.Has("streamoptions"),
-		// Always on: a tool with no input_schema otherwise reaches upstreams
-		// (e.g. Poe) that hard-reject it with a misleading "Field required".
-		// Harmless for tools that already declare a schema.
-		EnsureToolParameters: true,
-		Model:                model,
-	})
-	if err != nil {
-		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
-	}
+	// An Anthropic-native provider (ResolvedProtocol == "anthropic") speaks the
+	// Messages API directly: the request is sent UNCHANGED and the response is
+	// relayed back verbatim. Translating either leg would corrupt an
+	// already-correct payload. Every other provider is OpenAI-shaped and takes
+	// the translate path below (the default for every config on disk today).
+	anthropicNative := provider.ResolvedProtocol() == config.ProtocolAnthropic
 
-	outBody, err := json.Marshal(outReq)
-	if err != nil {
-		writeAnthropicError(c, http.StatusInternalServerError, "api_error", fmt.Sprintf("encode upstream request: %v", err))
-		return
+	var outBody []byte
+	if anthropicNative {
+		outBody, err = translate.AnthropicPassthrough(body, translate.Options{
+			// cache_control is native to Anthropic, so it is preserved unless the
+			// operator opted a compatible-but-non-caching upstream into cleancache.
+			CleanCache: provider.Has("cleancache"),
+			Model:      model,
+		})
+		if err != nil {
+			writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return
+		}
+	} else {
+		outReq, terr := translate.AnthropicToOpenAI(&in, translate.Options{
+			CleanCache:    provider.Has("cleancache"),
+			StreamOptions: provider.Has("streamoptions"),
+			// Always on: a tool with no input_schema otherwise reaches upstreams
+			// (e.g. Poe) that hard-reject it with a misleading "Field required".
+			// Harmless for tools that already declare a schema.
+			EnsureToolParameters: true,
+			Model:                model,
+		})
+		if terr != nil {
+			writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", terr.Error())
+			return
+		}
+		outBody, err = json.Marshal(outReq)
+		if err != nil {
+			writeAnthropicError(c, http.StatusInternalServerError, "api_error", fmt.Sprintf("encode upstream request: %v", err))
+			return
+		}
 	}
 
 	ctx := c.Request.Context()
@@ -255,7 +275,7 @@ func (s *Server) handleMessages(c *gin.Context) {
 		defer cancel()
 	}
 
-	resp, ok := s.doUpstreamWithRetry(c, ctx, provider, outBody)
+	resp, ok := s.doUpstreamWithRetry(c, ctx, provider, outBody, anthropicResponder{})
 	if !ok {
 		// A terminal failure, an exhausted retry budget, or a cancelled
 		// context has already written the response — nothing left to do.
@@ -263,6 +283,11 @@ func (s *Server) handleMessages(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	if anthropicNative {
+		// Upstream already speaks Anthropic: relay verbatim, no re-translation.
+		relayAnthropicResponse(c, resp, in.Stream)
+		return
+	}
 	if in.Stream {
 		streamAnthropicSSE(c, resp.Body, model)
 		return
@@ -299,10 +324,11 @@ var (
 //
 // It returns (resp, true) on a successful (status < 400) response, which the
 // caller owns and must resp.Body.Close(). It returns (nil, false) once an
-// error has already been written to c via writeAnthropicError or
-// forwardUpstreamError — covering a Terminal failure, an exhausted retry
-// budget, or ctx ending (client disconnect, or the non-streaming request
-// deadline) while waiting to retry.
+// error has already been written to c via the caller-supplied errorResponder
+// (Anthropic shape for /v1/messages, OpenAI shape for /v1/chat/completions) —
+// covering a Terminal failure, an exhausted retry budget, or ctx ending
+// (client disconnect, or the non-streaming request deadline) while waiting to
+// retry.
 //
 // The critical invariant this function exists to uphold: it NEVER writes a
 // single response byte to c except on that final, no-more-retries outcome.
@@ -315,7 +341,7 @@ var (
 // would corrupt an in-flight SSE conversation Claude Code is already
 // consuming, and cannot happen because this function has, by construction,
 // no further opportunity to run once streamAnthropicSSE starts.
-func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provider config.Provider, body []byte) (*http.Response, bool) {
+func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provider config.Provider, body []byte, er errorResponder) (*http.Response, bool) {
 	maxAttempts := s.opt.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = defaultMaxAttempts
@@ -326,7 +352,7 @@ func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provid
 			// The client disconnected, or (non-streaming only) the overall
 			// request deadline already passed, before this attempt even
 			// started. Hammering the upstream further would serve no one.
-			writeAnthropicError(c, http.StatusGatewayTimeout, "api_error",
+			er.writeError(c, http.StatusGatewayTimeout, "api_error",
 				fmt.Sprintf("request context ended before attempt %d: %v", attempt+1, err))
 			return nil, false
 		}
@@ -335,13 +361,13 @@ func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provid
 		if err != nil {
 			if router.ClassifyTransportError(err) == router.Retryable && attempt+1 < maxAttempts {
 				if !sleepForRetry(ctx, retryDelayAfterNetworkError(attempt)) {
-					writeAnthropicError(c, http.StatusGatewayTimeout, "api_error",
+					er.writeError(c, http.StatusGatewayTimeout, "api_error",
 						fmt.Sprintf("request context ended while waiting to retry: %v", ctx.Err()))
 					return nil, false
 				}
 				continue
 			}
-			writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("upstream request failed: %v", err))
+			er.writeError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("upstream request failed: %v", err))
 			return nil, false
 		}
 
@@ -358,7 +384,7 @@ func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provid
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 			_ = resp.Body.Close()
 			if !sleepForRetry(ctx, retryDelayAfterStatus(attempt, retryAfter)) {
-				writeAnthropicError(c, http.StatusGatewayTimeout, "api_error",
+				er.writeError(c, http.StatusGatewayTimeout, "api_error",
 					"request context ended while waiting to retry")
 				return nil, false
 			}
@@ -368,7 +394,7 @@ func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provid
 		// Either Terminal (never retry — see the package doc on
 		// router.Retryable/Terminal) or Retryable but out of attempts:
 		// either way, report exactly what upstream said.
-		forwardUpstreamError(c, resp)
+		er.forwardUpstream(c, resp)
 		_ = resp.Body.Close()
 		return nil, false
 	}
@@ -378,7 +404,7 @@ func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provid
 	// when attempt+1 < maxAttempts guarantees another iteration is still in
 	// range. This exists solely to give the function a terminating return
 	// the compiler can see.
-	writeAnthropicError(c, http.StatusInternalServerError, "api_error", "retry loop ended without a result (this is a bug)")
+	er.writeError(c, http.StatusInternalServerError, "api_error", "retry loop ended without a result (this is a bug)")
 	return nil, false
 }
 
@@ -475,6 +501,36 @@ func forwardUpstreamError(c *gin.Context, resp *http.Response) {
 			"message": msg,
 		},
 	})
+}
+
+// relayAnthropicResponse forwards an Anthropic-native upstream's response to
+// the client UNCHANGED. Used only when the routed provider's ResolvedProtocol
+// is "anthropic": the upstream already speaks the Messages API, so translating
+// its body (as respondNonStreaming / streamAnthropicSSE do for OpenAI
+// upstreams) would corrupt an already-correct payload.
+//
+// Consistent with the rest of this gateway, NOT ONE upstream header is copied
+// to the client (the property TestUpstreamResponseHeaderNeverLeaksToClient
+// pins): the response is rebuilt from the upstream BODY alone, with only the
+// Content-Type this gateway itself sets. doUpstreamWithRetry has already
+// guaranteed resp.StatusCode < 400, so this only ever relays a success body.
+func relayAnthropicResponse(c *gin.Context, resp *http.Response, stream bool) {
+	if stream {
+		// Shared line-by-line SSE relay (see relayRawStream in
+		// openai_inbound.go); the upstream's Anthropic SSE events reach the
+		// client unchanged, as they arrive.
+		relayRawStream(c.Writer, resp.Body)
+		return
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
+		return
+	}
+	// The Content-Type is the one this gateway chooses; the body is the
+	// upstream's Anthropic-shaped JSON, forwarded byte-for-byte.
+	c.Data(http.StatusOK, "application/json", raw)
 }
 
 // respondNonStreaming decodes a complete OpenAI chat-completion response and
