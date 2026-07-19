@@ -243,5 +243,10 @@ func serveChildArgs(f commonFlags) []string {
 	if f.MaxAttempts >= 1 {
 		args = append(args, "--max-attempts", fmt.Sprintf("%d", f.MaxAttempts))
 	}
+	// Likewise 0 = unset; forward a real duration as a Go-duration string the
+	// child re-parses with time.ParseDuration.
+	if f.UpstreamTimeout > 0 {
+		args = append(args, "--upstream-timeout", f.UpstreamTimeout.String())
+	}
 	return args
 }

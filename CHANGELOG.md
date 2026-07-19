@@ -4,9 +4,32 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.8` (below) are the
+`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.9` (below) are the
 current releases. Entries are drawn from this repository's real `git log`
 history — nothing here is speculative.
+
+## [0.4.9] - 2026-07-20
+
+The last operator knob without a CLI surface — the upstream timeout — is now
+configurable. Backward compatible: unset = the built-in 10m default.
+
+### Added
+
+- **`--upstream-timeout <d>`** (env `CCR_UPSTREAM_TIMEOUT`) bounds a single
+  non-streaming upstream call, as a Go duration (e.g. `30s`, `2m`); must be `> 0`
+  when provided, default `10m`. It flows into `gateway.Options.UpstreamTimeout`
+  and is forwarded by `ccr start`/`ui` to the detached `serve` child alongside
+  the other transport flags. Pinned by flag/env/precedence unit tests and a live
+  `test/livetimeout` proof (a slow upstream is cut off well under its sleep when
+  the flag is short, while a fast call still succeeds).
+
+### Documentation
+
+- `docs/DOC-AUDIT.md`'s end-of-run "Known limitations" list is brought back in
+  sync with the code: the inbound-auth switch, `ccr start`/`ui` flag forwarding,
+  `--max-attempts`, and the authenticated outbound proxy are recorded as closed;
+  the config hot-reload entry is corrected (the reloader IS wired — it just does
+  not hot-swap the live gateway, which still needs a restart to apply).
 
 ## [0.4.8] - 2026-07-20
 

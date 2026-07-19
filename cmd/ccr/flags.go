@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // commonFlags is the flag set shared by start, ui, serve and web.
@@ -37,6 +38,11 @@ type commonFlags struct {
 	// "unset" — the gateway applies its built-in default (3). Set via
 	// --max-attempts or CCR_MAX_ATTEMPTS; must be >= 1 when provided.
 	MaxAttempts int
+	// UpstreamTimeout bounds a single non-streaming upstream call. 0 means
+	// "unset" — the gateway applies its built-in default (10m). Set via
+	// --upstream-timeout or CCR_UPSTREAM_TIMEOUT as a Go duration (e.g. "30s",
+	// "2m"); must be > 0 when provided.
+	UpstreamTimeout time.Duration
 }
 
 // defaultManagementHost/Port match the Node implementation's management
@@ -122,6 +128,16 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 			return f, nil, fmt.Errorf("CCR_MAX_ATTEMPTS=%q must be >= 1", v)
 		}
 		f.MaxAttempts = n
+	}
+	if v := os.Getenv("CCR_UPSTREAM_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return f, nil, fmt.Errorf("CCR_UPSTREAM_TIMEOUT=%q is not a valid duration: %w", v, err)
+		}
+		if d <= 0 {
+			return f, nil, fmt.Errorf("CCR_UPSTREAM_TIMEOUT=%q must be > 0", v)
+		}
+		f.UpstreamTimeout = d
 	}
 
 	// A --api-key flag (repeatable) OVERRIDES the CCR_API_KEYS env entirely, so an
@@ -212,6 +228,19 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 				return f, nil, fmt.Errorf("--max-attempts %q must be >= 1", args[i])
 			}
 			f.MaxAttempts = n
+		case "--upstream-timeout":
+			i++
+			if i >= len(args) {
+				return f, nil, fmt.Errorf("--upstream-timeout requires a value")
+			}
+			d, err := time.ParseDuration(args[i])
+			if err != nil {
+				return f, nil, fmt.Errorf("--upstream-timeout %q is not a valid duration: %w", args[i], err)
+			}
+			if d <= 0 {
+				return f, nil, fmt.Errorf("--upstream-timeout %q must be > 0", args[i])
+			}
+			f.UpstreamTimeout = d
 		default:
 			rest = append(rest, args[i])
 		}

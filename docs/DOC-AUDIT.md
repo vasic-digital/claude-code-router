@@ -86,7 +86,7 @@ part of correcting the claim they annotate, not double-counted.
 |---|---|---|
 | `--host`/`--port` (management, default `127.0.0.1:3458`, env `CCR_WEB_HOST`/`CCR_WEB_PORT`) | ACCURATE | `cmd/ccr/flags.go:27-28`, `59-68`, `100-115` |
 | `--gateway-host`/`--gateway-port` (gateway, default `127.0.0.1:3456`, env `CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT`); loopback default because the gateway holds live keys; a container needs `0.0.0.0` because `127.0.0.1` is the container's own loopback | ACCURATE (now documented in README/USER_GUIDE/ADMIN + `--help`) | `cmd/ccr/flags.go:37,43,70-99`, `main.go:50-58`, `serve.go:46` |
-| `ccr start`/`ui` do **not** forward `--gateway-host`/`--gateway-port` to the detached `serve` child (only env survives) | ACCURATE (documented as a known limitation) | `cmd/ccr/service.go:104-114` forwards only `--host`/`--port`/`--gateway`/`--open` |
+| `ccr start`/`ui` **now** forward `--gateway-host`/`--gateway-port` (plus `--tls-cert`/`--tls-key`/`--http3`/`--no-http3`, `--max-attempts`, `--upstream-timeout`) to the detached `serve` child | ACCURATE — was doc'd as **not forwarded** (STALE, corrected) | `serveChildArgs`, `cmd/ccr/service.go:209-251`; inbound API keys are deliberately excluded from this argv list and travel via inherited env instead (`applyChildAPIKeyEnv`, `service.go:109`) |
 | `-h`/`--help`/`help`/no-args print the usage text, exit 0; unknown first arg → `Profile "<name>" was not found or is disabled.`, exit 1 | ACCURATE | `cmd/ccr/main.go:71-97`, tested `main_test.go` |
 | `ccr config validate [path]` / `ccr config show [path]` exist; `show` redacts every `api_key` | ACCURATE — was doc'd as **PLANNED/not present** (STALE, corrected) | `cmd/ccr/config_cmd.go`, `internal/config/validate_cmd.go`; `config.Redacted` replaces `APIKey` with `[REDACTED]` before marshalling (never truncates) |
 
@@ -109,7 +109,7 @@ part of correcting the claim they annotate, not double-counted.
 | `Router.default/background/think/longContext` validated the same; only `default`/`background` drive routing | ACCURATE | `config.go:133-138`, `217-231`; `router.go` |
 | Missing file → empty valid config; malformed JSON / failed `Validate()` → error | ACCURATE | `config.go:170-186` |
 | Route splits on first comma only | ACCURATE | `config.go:239-249` |
-| Config hot-reload (`config.Watcher`): rejects a reload that fails parse/`Validate()`, keeps last good config, reports via `onError`; tolerates a briefly-absent file | ACCURATE — **but not wired into `ccr serve`** (loads once at `serve.go:38`); documented honestly | `config/watch.go` |
+| Config hot-reload (`config.Watcher`): rejects a reload that fails parse/`Validate()`, keeps last good config, reports via `onError`; tolerates a briefly-absent file | ACCURATE, and **now wired into `ccr serve`/`start`/`ui`/`web`** via `newConfigReloader` — was doc'd as **not wired** (STALE, corrected). Remaining boundary: a validated reload is kept as latest-known-good (`Current()`), but the running `gateway.Server` holds its startup `*config.Config` with no public setter, so the live gateway keeps serving that startup config — a restart is still required for a reload to take effect | `config/watch.go`; `cmd/ccr/reload.go` (`newConfigReloader`, `configReloader.Current`); wired at `cmd/ccr/serve.go:131-159` |
 | No `config.json` field for inbound gateway API keys or `MaxAttempts` | ACCURATE | `config.go` has no such field |
 
 ## 4. Transformers & translation (`internal/translate/anthropic.go`)
@@ -129,14 +129,14 @@ part of correcting the claim they annotate, not double-counted.
 | A real retry loop drives the classifier/backoff policy; up to `MaxAttempts` (default 3); never retries `Terminal`; never retries after a response byte is written | ACCURATE | `messages.go:319-416` (`doUpstreamWithRetry`); `fallback.go` |
 | 32MiB inbound body cap → `413` | ACCURATE | `messages.go:28`, `189-214` |
 | Upstream error forwarded preserving the exact status code | ACCURATE | `messages.go:448-504` |
-| `MaxAttempts` has no CLI/config surface | ACCURATE (known limitation) | `cmd/ccr` never sets it |
+| `MaxAttempts` has a CLI/env surface | ACCURATE — was doc'd as **no CLI/config surface** (STALE, corrected) | `cmd/ccr/flags.go:37-40` (field), `:122-130` (`CCR_MAX_ATTEMPTS` env), `:218-231` (`--max-attempts` flag, must be ≥1); wired into `Options.MaxAttempts` at `cmd/ccr/serve.go:61` and forwarded to the detached `serve` child by `ccr start`/`ui` (`service.go:242-244`) |
 
 ## 6. Inbound auth (`internal/gateway/auth.go`)
 
 | Claim | Verdict | Evidence |
 |---|---|---|
 | `RequireAPIKey` mounted route-scoped on the completion routes only; `/health`/`/ready` never gated; empty key list disables auth entirely; constant-time compare; fixed `401`, never leaks the presented key | ACCURATE | `auth.go`; mounted at `gateway.go:201-207` |
-| `cmd/ccr` never populates `Options.APIKeys` → unauthenticated by default | ACCURATE (known limitation) | no CLI flag / config field |
+| `cmd/ccr` now has an operator-facing switch for `Options.APIKeys` (`--api-key`, repeatable; `CCR_API_KEYS`, comma-separated; flag replaces env wholesale when given); still unauthenticated **by default** (empty list) unless explicitly configured — a deliberate compatibility default, not a missing switch | ACCURATE — was doc'd as **no switch exists / never sets `Options.APIKeys`** (STALE, corrected) | `cmd/ccr/flags.go:31-36` (field), `:119-120` (env), `:209-217` (flag), `:249-252` (flag-overrides-env); wired into `Options.APIKeys` at `cmd/ccr/serve.go:60`; `auth.go:63-74` (`RequireAPIKey`, empty list ⇒ `c.Next()`, auth disabled) |
 
 ## 7. Structured logging (`internal/logging`, `internal/gateway/logging_middleware.go`)
 
@@ -186,11 +186,23 @@ second-range form and cleared.
 
 Current, honest list (mirrored in `README.md`):
 
-1. **Inbound gateway authentication has no operator-facing switch.** `RequireAPIKey`
-   is mounted on the completion routes, but `cmd/ccr` never sets `Options.APIKeys`
-   (no flag/env/config), so the key list is always empty ⇒ auth disabled.
-2. **`--gateway-host`/`--gateway-port` are not forwarded by `ccr start`/`ui`** to
-   the detached `serve` child (only the `CCR_GATEWAY_*` env form survives).
+1. **RESOLVED: inbound gateway authentication now has an operator-facing
+   switch.** `--api-key` (repeatable) / `CCR_API_KEYS` (comma-separated) sets
+   `Options.APIKeys` (`cmd/ccr/flags.go:31-36,119-120,209-217,249-252`, wired
+   at `cmd/ccr/serve.go:60`), and `RequireAPIKey` is mounted on all four
+   completion routes (`internal/gateway/gateway.go:362-368`). The residual:
+   auth is still **disabled by default** — an empty key list (what an
+   operator gets by setting nothing) makes `RequireAPIKey` a no-op
+   (`internal/gateway/auth.go:63-74`). That default-open posture is a
+   deliberate compatibility choice, documented in `auth.go`'s package doc, not
+   a missing switch.
+2. **RESOLVED: `--gateway-host`/`--gateway-port` are now forwarded by
+   `ccr start`/`ui`** to the detached `serve` child, along with
+   `--tls-cert`/`--tls-key`/`--http3`/`--no-http3`, `--max-attempts`, and
+   `--upstream-timeout` (`serveChildArgs`, `cmd/ccr/service.go:209-251`).
+   Inbound API keys are deliberately excluded from this argv forwarding — they
+   travel via inherited environment instead, so they never appear in `ps`
+   (`applyChildAPIKeyEnv`, `cmd/ccr/service.go:109`).
 3. **`Router.think` routing — RESOLVED in v0.4.0** (was: "wired but inert"). As of
    v0.4.0 `translate.AnthropicRequest` models Anthropic's `thinking` field
    (`internal/translate/anthropic.go:51-60`), so a `POST /v1/messages` request
@@ -203,16 +215,24 @@ Current, honest list (mirrored in `README.md`):
    route is set, for BOTH inbound paths as of v0.4.5 — the OpenAI facade estimates
    its own request size via `routingRequestFromOpenAI`
    (`internal/router/selector.go`, `router.go:130-175`, `internal/gateway/openai_inbound.go`).
-4. **The retry loop's attempt budget (`MaxAttempts`, default 3) has no CLI/config
-   surface.**
-5. **An authenticated, explicitly-configured outbound proxy**
-   (`proxy.NewWithUpstreamProxy`) is implemented/tested but not wired into
-   `WireDefaults`/`cmd/ccr`, and has no `config.json` section. (Env
-   `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` proxying *is* live.)
+4. **RESOLVED: the retry loop's attempt budget (`MaxAttempts`, default 3) now
+   has a CLI/env surface** — `--max-attempts` / `CCR_MAX_ATTEMPTS`
+   (`cmd/ccr/flags.go:37-40,122-130,218-231`), wired into `Options.MaxAttempts`
+   at `cmd/ccr/serve.go:61` and forwarded to the detached `serve` child by
+   `ccr start`/`ui` (`cmd/ccr/service.go:242-244`).
+5. **RESOLVED: an authenticated, explicitly-configured outbound proxy is now
+   wired.** `config.json` has a `proxy` section (`ProxyConfig{URL, Username,
+   Password}`, `internal/config/config.go:170,180-186`), validated as
+   all-or-nothing and http(s)-only (`Validate`, `config.go:358-364`), and
+   `WireDefaults` builds `proxy.NewWithUpstreamProxy` from it when `cfg.Proxy`
+   is set (`internal/gateway/wiring.go:76-86`). `ccr config show` redacts the
+   password (`internal/config/validate_cmd.go:43-51`). (Env
+   `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` proxying remains the fallback when no
+   explicit `proxy` block is configured.)
 6. **Config hot-reload is wired into `ccr serve`, but the live gateway is not
    hot-swapped in place** (narrowed post-audit — see the reconciliation note
    below). `serve` now runs a `configReloader` on `config.json`
-   (`cmd/ccr/serve.go:93-112`, `cmd/ccr/reload.go`) that validates each change,
+   (`cmd/ccr/serve.go:131-159`, `cmd/ccr/reload.go`) that validates each change,
    logs an accepted one, keeps the previous good config on a rejected one, and
    stops on shutdown. The remaining boundary: `gateway.Server` holds its
    `*config.Config` in an unexported field with no public setter, so a validated
@@ -227,15 +247,20 @@ Items closed during this documentation pass (no longer limitations): the
 retry-loop wiring, vision/image support, `cleancache` actually stripping tool
 schemas, the provider `protocol` field + Anthropic-native passthrough,
 unambiguous bare-model resolution, the OpenAI chat-completions inbound facade +
-path→protocol classifier, and structured/per-request logging being wired in.
+path→protocol classifier, structured/per-request logging being wired in, the
+inbound-auth CLI/env switch (`--api-key`/`CCR_API_KEYS`), `--gateway-host`/
+`--gateway-port` (and TLS/HTTP3/`--max-attempts`/`--upstream-timeout`)
+forwarding to the detached `serve` child, the `MaxAttempts` CLI/env surface,
+and the authenticated outbound proxy being wired into `WireDefaults`/
+`cmd/ccr`/`config.json`.
 
-**Post-audit reconciliation (limitations #3 and #6, narrowed after the audit
-tables above were written).** Two features landed from other engineers *after*
-this audit's Config-section verdicts (§3, rows on "only `default`/`background`
-drive routing" and "hot-reload… not wired into `ccr serve`") were recorded, so
-those §3 rows describe the audit-time state and are intentionally left as the
-historical record; the *current* truth lives in limitations #3 and #6 above and
-in the code:
+**Post-audit reconciliation (limitation #3, narrowed after the audit tables
+above were written; §3's Config hot-reload row has since been corrected in
+place to match current code — see below).** One routing feature landed from
+another engineer *after* this audit's Config-section verdict (§3, the row on
+"only `default`/`background` drive routing") was recorded, so that §3 row
+describes the audit-time state and is intentionally left as the historical
+record; the *current* truth lives in limitation #3 above and in the code:
 - `Router.longContext` now fires in production — an estimated prompt over
   `DefaultLongContextThreshold` (60000 tokens) routes there when configured
   (`internal/router/router.go:130-175`, `internal/router/selector.go:95-138`);
@@ -243,8 +268,10 @@ in the code:
   now carries the `thinking` field, so a request that asks for extended reasoning
   routes to `Router.think` when configured (`internal/router/selector.go:150-174`).
 - Config hot-reload **is** now wired into `ccr serve`/`start`/`ui`/`web`
-  (`cmd/ccr/serve.go:93-112`, `cmd/ccr/reload.go`): a validated change is logged
-  and kept as latest-known-good, an invalid change is rejected with the previous
+  (`cmd/ccr/serve.go:131-159`, `cmd/ccr/reload.go`) — and, as of this pass, §3's
+  table row says so directly rather than needing this reconciliation note: a
+  validated change is logged and kept as latest-known-good, an invalid change
+  is rejected with the previous
   good config retained, and the watcher stops on shutdown — but the running
   gateway is not hot-swapped in place (no public config setter on
   `gateway.Server`), so a restart is still required for a reload to take effect.

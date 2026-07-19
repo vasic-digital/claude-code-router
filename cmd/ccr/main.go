@@ -74,6 +74,9 @@ Flags (start, ui, serve, web):
                             comma (the env-list separator).
   --max-attempts <n>       Upstream retry budget (env CCR_MAX_ATTEMPTS). Must be
                             >= 1; default 3.
+  --upstream-timeout <d>   Timeout for a single non-streaming upstream call, as a
+                            Go duration e.g. 30s, 2m (env CCR_UPSTREAM_TIMEOUT).
+                            Must be > 0; default 10m.
 
   -h, --help                Show this help
 `

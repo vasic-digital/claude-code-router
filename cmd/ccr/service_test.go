@@ -129,13 +129,13 @@ func TestServeChildArgsForwardsGatewayHostPortAndTLS(t *testing.T) {
 		GatewayHost: "0.0.0.0", GatewayPort: 9999,
 		Gateway: true, Open: false,
 		TLSCert: "/c.pem", TLSKey: "/k.pem", HTTP3: true,
-		MaxAttempts: 5,
+		MaxAttempts: 5, UpstreamTimeout: 45 * time.Second,
 	}
 	args := serveChildArgs(f)
 	for _, want := range [][2]string{
 		{"--gateway-host", "0.0.0.0"}, {"--gateway-port", "9999"},
 		{"--tls-cert", "/c.pem"}, {"--tls-key", "/k.pem"},
-		{"--max-attempts", "5"},
+		{"--max-attempts", "5"}, {"--upstream-timeout", "45s"},
 	} {
 		if !hasFlagValue(args, want[0], want[1]) {
 			t.Errorf("serveChildArgs missing %s %s\n%v", want[0], want[1], args)
@@ -171,7 +171,7 @@ func TestServeChildArgsRoundTripsThroughParse(t *testing.T) {
 		GatewayHost: "0.0.0.0", GatewayPort: 8443,
 		Gateway: true, Open: true,
 		TLSCert: "/etc/cert.pem", TLSKey: "/etc/key.pem", HTTP3: true,
-		MaxAttempts: 9,
+		MaxAttempts: 9, UpstreamTimeout: 90 * time.Second,
 	}
 	args := serveChildArgs(in)
 	// Drop the leading "serve" verb; parseCommonFlags takes the flag args.
@@ -186,7 +186,7 @@ func TestServeChildArgsRoundTripsThroughParse(t *testing.T) {
 		got.GatewayHost != in.GatewayHost || got.GatewayPort != in.GatewayPort ||
 		got.Gateway != in.Gateway || got.Open != in.Open ||
 		got.TLSCert != in.TLSCert || got.TLSKey != in.TLSKey || got.HTTP3 != in.HTTP3 ||
-		got.MaxAttempts != in.MaxAttempts {
+		got.MaxAttempts != in.MaxAttempts || got.UpstreamTimeout != in.UpstreamTimeout {
 		t.Errorf("forward+reparse not lossless:\n in = %+v\n got= %+v", in, got)
 	}
 }

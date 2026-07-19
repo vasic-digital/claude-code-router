@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseCommonFlagsDefaults(t *testing.T) {
 	f, rest, err := parseCommonFlags(nil, false, true)
@@ -298,6 +301,59 @@ func TestParseCommonFlagsMaxAttemptsEnvAndPrecedence(t *testing.T) {
 	}
 	if f2.MaxAttempts != 2 {
 		t.Errorf("MaxAttempts = %d, want the flag (2) to beat env (7)", f2.MaxAttempts)
+	}
+}
+
+func TestParseCommonFlagsUpstreamTimeout(t *testing.T) {
+	f, _, err := parseCommonFlags([]string{"--upstream-timeout", "30s"}, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.UpstreamTimeout != 30*time.Second {
+		t.Errorf("UpstreamTimeout = %v, want 30s", f.UpstreamTimeout)
+	}
+	// Default is 0 ("unset" → gateway applies its 10m default).
+	f2, _, _ := parseCommonFlags(nil, false, true)
+	if f2.UpstreamTimeout != 0 {
+		t.Errorf("default UpstreamTimeout = %v, want 0 (unset)", f2.UpstreamTimeout)
+	}
+}
+
+func TestParseCommonFlagsUpstreamTimeoutEnvAndPrecedence(t *testing.T) {
+	t.Setenv("CCR_UPSTREAM_TIMEOUT", "2m")
+	f, _, err := parseCommonFlags(nil, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.UpstreamTimeout != 2*time.Minute {
+		t.Errorf("UpstreamTimeout from env = %v, want 2m", f.UpstreamTimeout)
+	}
+	// Flag beats env.
+	f2, _, err := parseCommonFlags([]string{"--upstream-timeout", "45s"}, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f2.UpstreamTimeout != 45*time.Second {
+		t.Errorf("UpstreamTimeout = %v, want the flag (45s) to beat env (2m)", f2.UpstreamTimeout)
+	}
+}
+
+func TestParseCommonFlagsUpstreamTimeoutErrors(t *testing.T) {
+	cases := [][]string{
+		{"--upstream-timeout"},        // missing value
+		{"--upstream-timeout", "0"},   // must be > 0
+		{"--upstream-timeout", "-5s"}, // negative
+		{"--upstream-timeout", "abc"}, // not a duration
+		{"--upstream-timeout", "30"},  // no unit — time.ParseDuration rejects
+	}
+	for _, args := range cases {
+		if _, _, err := parseCommonFlags(args, false, true); err == nil {
+			t.Errorf("parseCommonFlags(%v) did not error", args)
+		}
+	}
+	t.Setenv("CCR_UPSTREAM_TIMEOUT", "nope")
+	if _, _, err := parseCommonFlags(nil, false, true); err == nil {
+		t.Error("bad CCR_UPSTREAM_TIMEOUT should error")
 	}
 }
 
