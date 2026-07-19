@@ -1,30 +1,24 @@
-// Package live is a genuine end-to-end test harness for the ccr binary.
+// Package liveload is a LIVE load / soak harness for the ccr binary.
 //
-// Unlike the in-process handler tests under internal/gateway (which mount
-// gateway.Handler() into httptest and never bind a socket), every test here:
-//
-//  1. builds the real ./cmd/ccr binary (TestMain, once);
-//  2. stands up an httptest "upstream" that returns canned OpenAI / Anthropic
-//     responses under per-provider path keys, with a hit counter per key;
-//  3. writes a ~/.claude-code-router/config.json (HOME pinned to a t.TempDir())
-//     pointing the gateway's providers at that fake upstream;
-//  4. starts `ccr serve` as an os/exec SUBPROCESS on free loopback ports;
-//  5. waits for the gateway's real /health listener;
-//  6. drives real HTTP through the gateway's real listener and scrapes the
-//     management server's real /metrics endpoint;
-//  7. asserts each scenario's response AND the moved metric counters;
-//  8. tears the subprocess down cleanly in t.Cleanup.
+// It mirrors the black-box pattern of test/live/harness_test.go — build the real
+// ./cmd/ccr binary once (TestMain), stand up an httptest fake upstream returning
+// canned OpenAI completions with a FIXED usage block, write a config.json under a
+// pinned HOME pointing the gateway at the fake upstream, start `ccr serve` as an
+// os/exec subprocess on free loopback ports, wait for /health, then drive real
+// HTTP through the gateway's real listener and scrape the management server's
+// real /metrics — but here the traffic is CONCURRENT and SUSTAINED, and the
+// assertions prove the metrics add up EXACTLY under load.
 //
 // This file owns the harness (binary build, free ports, fake upstream, serve
-// lifecycle, HTTP + Prometheus-scrape helpers). The scenarios live in
-// scenarios_test.go. Nothing here imports internal/gateway or internal/cache —
-// the gateway is driven strictly over the loopback network, as a black box.
-package live
+// lifecycle, GOROUTINE-SAFE HTTP + Prometheus-scrape helpers). The load
+// scenarios live in load_test.go. Nothing here imports internal/gateway,
+// internal/cache or internal/metrics — the gateway is a black box driven over
+// loopback. -race is intentionally NOT applied to this subprocess binary.
+package liveload
 
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"net"
@@ -51,7 +45,7 @@ var (
 
 func TestMain(m *testing.M) {
 	os.Exit(func() int {
-		dir, err := os.MkdirTemp("", "ccr-live-bin-")
+		dir, err := os.MkdirTemp("", "ccr-liveload-bin-")
 		if err != nil {
 			buildErr = fmt.Errorf("mktemp for binary: %w", err)
 			return m.Run()
@@ -65,9 +59,9 @@ func TestMain(m *testing.M) {
 			return m.Run()
 		}
 
-		// Build the real CLI. -count/-race are intentionally NOT applied to this
-		// subprocess build — the subprocess is driven over the network and a
-		// -race binary would only slow it down without exercising the harness.
+		// Build the real CLI. -race is intentionally NOT applied to this
+		// subprocess build — it is driven over the network as a black box and a
+		// -race binary would only slow the load test without exercising more.
 		cmd := exec.Command("go", "build", "-o", bin, "./cmd/ccr")
 		cmd.Dir = root
 		out, berr := cmd.CombinedOutput()
@@ -81,8 +75,7 @@ func TestMain(m *testing.M) {
 	}())
 }
 
-// requireBinary fails the calling test loudly (never a silent skip) if the
-// binary could not be built, surfacing the captured build output.
+// requireBinary fails loudly (never a silent skip) if the binary was not built.
 func requireBinary(t *testing.T) {
 	t.Helper()
 	if buildErr != nil || ccrBin == "" {
@@ -92,16 +85,10 @@ func requireBinary(t *testing.T) {
 
 // ---------- Free-port helper ----------
 
-// freePort asks the kernel for an unused TCP port, closes the listener, and
-// returns the port for the subprocess to re-bind. The close/re-bind window is
-// the standard, accepted race for allocating a port to a child process.
 func freePort(t *testing.T) int {
 	t.Helper()
-	// Bounded retry: under heavy concurrent port churn (e.g. the load suite
-	// leaving many sockets in TIME_WAIT), even an ephemeral :0 bind can
-	// transiently fail with "address already in use". Retrying with a short
-	// backoff makes the live suites robust to that pressure rather than failing
-	// the whole run on a spurious bind error.
+	// Bounded retry so a transient "address already in use" on an ephemeral :0
+	// bind (heavy concurrent port churn / TIME_WAIT) does not fail the run.
 	var lastErr error
 	for attempt := 0; attempt < 50; attempt++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -119,11 +106,9 @@ func freePort(t *testing.T) int {
 
 // ---------- Fake upstream ----------
 
-// fakeUpstream is one httptest.Server that multiplexes MANY provider scenarios
-// by URL path. A provider's api_base_url is set to <server>/<key>; every request
-// increments counts[key] and is served by the handler registered for key. This
-// is how per-provider scenario control (a 503 primary vs a 200 secondary, a
-// once-only cached backend, etc.) is expressed with a single upstream server.
+// fakeUpstream multiplexes provider scenarios by URL path. A provider's
+// api_base_url is <server>/<key>; every request increments counts[key] (under a
+// mutex, safe for the concurrent load) and is served by the handler for key.
 type fakeUpstream struct {
 	srv      *httptest.Server
 	mu       sync.Mutex
@@ -147,9 +132,8 @@ func (f *fakeUpstream) handle(key string, fn http.HandlerFunc) {
 	f.mu.Unlock()
 }
 
-// url returns the full chat-completions URL a provider config should use for
-// key. The gateway treats api_base_url as the complete endpoint (it does not
-// append a path), so this IS the URL the gateway POSTs to.
+// url returns the full endpoint a provider config should use for key. The
+// gateway treats api_base_url as the complete endpoint (no path appended).
 func (f *fakeUpstream) url(key string) string { return f.srv.URL + "/" + key }
 
 func (f *fakeUpstream) count(key string) int {
@@ -160,7 +144,6 @@ func (f *fakeUpstream) count(key string) int {
 
 func (f *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	key := strings.Trim(r.URL.Path, "/")
-	// Only the first path segment identifies the scenario.
 	if i := strings.IndexByte(key, '/'); i >= 0 {
 		key = key[:i]
 	}
@@ -176,9 +159,10 @@ func (f *fakeUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fn(w, r)
 }
 
-// ---------- Canned upstream responses ----------
+// ---------- Canned upstream responses (FIXED usage block) ----------
 
-// writeOpenAICompletion writes a canned non-streaming OpenAI chat-completion.
+// writeOpenAICompletion writes a canned non-streaming OpenAI chat-completion
+// with a fixed usage block so per-response token accounting is exact.
 func writeOpenAICompletion(w http.ResponseWriter, id, content string, promptTok, completionTok int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -240,11 +224,9 @@ type serveInstance struct {
 	mgmtPort int
 }
 
-// startServe writes cfgJSON to $HOME/.claude-code-router/config.json under a
-// fresh temp HOME, starts `ccr serve` on free ports, waits for the gateway's
-// /health, and registers cleanup. A build failure, a config-write failure, or a
-// readiness timeout is a hard t.Fatalf carrying the captured subprocess output —
-// never a silent skip that could hide a real break.
+// startServe writes cfgJSON under a fresh temp HOME, starts `ccr serve` on free
+// ports, waits for /health, and registers cleanup (kills the server + rm temp).
+// Every failure is a hard t.Fatalf carrying the captured subprocess output.
 func startServe(t *testing.T, cfgJSON string) *serveInstance {
 	t.Helper()
 	requireBinary(t)
@@ -277,7 +259,7 @@ func startServe(t *testing.T, cfgJSON string) *serveInstance {
 	si.cmd.Stderr = si.out
 	si.cmd.Env = envWith(os.Environ(), map[string]string{
 		"HOME":          home,
-		"CCR_LOG_LEVEL": "error", // keep the child's access log quiet
+		"CCR_LOG_LEVEL": "error", // keep the child's access log quiet under load
 	})
 
 	if err := si.cmd.Start(); err != nil {
@@ -285,12 +267,11 @@ func startServe(t *testing.T, cfgJSON string) *serveInstance {
 	}
 	t.Cleanup(si.stop)
 
-	si.waitHealthy(15 * time.Second)
+	si.waitHealthy(20 * time.Second)
 	return si
 }
 
-// envWith returns base with the given key=value overrides applied (replacing any
-// existing occurrence of each key so the child sees exactly one).
+// envWith returns base with the given key=value overrides applied.
 func envWith(base []string, overrides map[string]string) []string {
 	out := make([]string, 0, len(base)+len(overrides))
 	for _, kv := range base {
@@ -319,14 +300,13 @@ func (si *serveInstance) mgmtURL(path string) string {
 	return fmt.Sprintf("http://127.0.0.1:%d%s", si.mgmtPort, path)
 }
 
-// waitHealthy polls the gateway's real /health listener until it answers 200 or
-// the deadline passes. A timeout is fatal and prints the subprocess output.
+// waitHealthy polls /health until 200 or the deadline. A timeout is fatal and
+// prints the subprocess output.
 func (si *serveInstance) waitHealthy(within time.Duration) {
 	si.t.Helper()
 	deadline := time.Now().Add(within)
 	client := &http.Client{Timeout: 2 * time.Second}
 	for time.Now().Before(deadline) {
-		// A dead subprocess will never become healthy; fail fast with its output.
 		if si.cmd.ProcessState != nil && si.cmd.ProcessState.Exited() {
 			si.t.Fatalf("ccr serve exited before becoming healthy\n--- output ---\n%s", si.out.String())
 		}
@@ -343,8 +323,8 @@ func (si *serveInstance) waitHealthy(within time.Duration) {
 	si.t.Fatalf("gateway /health not ready within %s\n--- output ---\n%s", within, si.out.String())
 }
 
-// stop signals the subprocess to shut down gracefully, then kills it if it does
-// not exit in time. Always runs (t.Cleanup) so no ccr process is ever leaked.
+// stop signals SIGTERM, then kills if the process does not exit in time. Always
+// runs (t.Cleanup) so no ccr process is ever leaked.
 func (si *serveInstance) stop() {
 	if si.cmd.Process == nil {
 		return
@@ -360,7 +340,19 @@ func (si *serveInstance) stop() {
 	}
 }
 
-// ---------- HTTP client helpers ----------
+// ---------- Goroutine-safe HTTP client ----------
+
+// loadClient is tuned for many concurrent connections to one host so the load
+// generator, not connection pooling, is the bottleneck.
+var loadClient = &http.Client{
+	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        512,
+		MaxIdleConnsPerHost: 512,
+		MaxConnsPerHost:     0, // unlimited concurrent connections
+		IdleConnTimeout:     30 * time.Second,
+	},
+}
 
 // httpResult is a fully-read HTTP response.
 type httpResult struct {
@@ -369,67 +361,124 @@ type httpResult struct {
 	contentType string
 }
 
-// post sends a POST with the given body and optional headers, reading the full
-// response. Accept-Encoding: identity is forced so the gateway's negotiated
-// compression never leaves us with an undecoded brotli/gzip body.
-func post(t *testing.T, url, body string, headers map[string]string) httpResult {
-	t.Helper()
+// rawPost sends a POST and reads the full response. It NEVER touches *testing.T,
+// so it is safe to call from many goroutines concurrently (unlike a t.Fatalf
+// helper, whose FailNow must run on the test goroutine). Accept-Encoding:
+// identity is forced so a negotiated brotli/gzip body never arrives undecoded.
+func rawPost(url, body string, headers map[string]string) (httpResult, error) {
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
 	if err != nil {
-		t.Fatalf("build POST %s: %v", url, err)
+		return httpResult{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept-Encoding", "identity")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := loadClient.Do(req)
 	if err != nil {
-		t.Fatalf("POST %s: %v", url, err)
+		return httpResult{}, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("read response %s: %v", url, err)
+		return httpResult{}, err
 	}
-	return httpResult{status: resp.StatusCode, body: string(raw), contentType: resp.Header.Get("Content-Type")}
+	return httpResult{status: resp.StatusCode, body: string(raw), contentType: resp.Header.Get("Content-Type")}, nil
 }
 
-// get sends a GET and reads the full response.
+// rawGet sends a GET and reads the full response. Goroutine-safe.
+func rawGet(url string) (httpResult, error) {
+	resp, err := loadClient.Get(url)
+	if err != nil {
+		return httpResult{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return httpResult{}, err
+	}
+	return httpResult{status: resp.StatusCode, body: string(raw), contentType: resp.Header.Get("Content-Type")}, nil
+}
+
+// get is the t.Fatalf convenience wrapper for use on the test goroutine only.
 func get(t *testing.T, url string) httpResult {
 	t.Helper()
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(url)
+	res, err := rawGet(url)
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	return httpResult{status: resp.StatusCode, body: string(raw), contentType: resp.Header.Get("Content-Type")}
+	return res
+}
+
+// ---------- Concurrency driver ----------
+
+// taskResult is one request's outcome, gathered off the test goroutine.
+type taskResult struct {
+	idx    int
+	res    httpResult
+	err    error
+	elapse time.Duration
+}
+
+// runConcurrent fires n tasks across w worker goroutines, invoking fn(i) for
+// indices 0..n-1, and returns every result. Bounded: it drains a closed job
+// channel and every worker exits when the channel is empty — no open sleeps, no
+// leaked goroutines. Panics inside fn are recovered into an error so one bad
+// request cannot crash the whole test binary.
+func runConcurrent(n, w int, fn func(i int) (httpResult, error)) []taskResult {
+	jobs := make(chan int)
+	results := make([]taskResult, n)
+	var wg sync.WaitGroup
+	for g := 0; g < w; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				start := time.Now()
+				res, err := func() (r httpResult, e error) {
+					defer func() {
+						if p := recover(); p != nil {
+							e = fmt.Errorf("panic in request goroutine: %v", p)
+						}
+					}()
+					return fn(i)
+				}()
+				results[i] = taskResult{idx: i, res: res, err: err, elapse: time.Since(start)}
+			}
+		}()
+	}
+	for i := 0; i < n; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return results
 }
 
 // ---------- Prometheus scrape helpers ----------
 
-// scrapeMetrics fetches the management server's /metrics text, retrying briefly
-// since the management listener comes up just after the gateway's /health.
+// scrapeMetrics fetches /metrics, retrying briefly since the management listener
+// comes up just after the gateway's /health.
 func scrapeMetrics(t *testing.T, si *serveInstance) string {
 	t.Helper()
 	var last httpResult
+	var lastErr error
 	for i := 0; i < 40; i++ {
-		last = get(t, si.mgmtURL("/metrics"))
-		if last.status == http.StatusOK {
+		last, lastErr = rawGet(si.mgmtURL("/metrics"))
+		if lastErr == nil && last.status == http.StatusOK {
 			return last.body
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("management /metrics never returned 200 (last status %d)\n--- output ---\n%s", last.status, si.out.String())
+	t.Fatalf("management /metrics never returned 200 (last status %d, err %v)\n--- output ---\n%s",
+		last.status, lastErr, si.out.String())
 	return ""
 }
 
 // metricValue returns the value of the sample of metricName whose label set is a
-// superset of want, or 0 if no such sample exists (an absent counter reads as 0,
-// which is exactly right for before/after deltas).
+// superset of want, or 0 if none (an absent counter reads as 0 — exactly right
+// for before/after deltas).
 func metricValue(text, metricName string, want map[string]string) float64 {
 	sc := bufio.NewScanner(strings.NewReader(text))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -466,31 +515,6 @@ func metricValue(text, metricName string, want map[string]string) float64 {
 	return 0
 }
 
-// metricPresent reports whether at least one sample of metricName carries every
-// label in want (regardless of value).
-func metricPresent(text, metricName string, want map[string]string) bool {
-	sc := bufio.NewScanner(strings.NewReader(text))
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, metricName) {
-			continue
-		}
-		rest := line[len(metricName):]
-		if !strings.HasPrefix(rest, "{") {
-			continue
-		}
-		end := strings.IndexByte(rest, '}')
-		if end < 0 {
-			continue
-		}
-		if labelsSuperset(parseLabels(rest[1:end]), want) {
-			return true
-		}
-	}
-	return false
-}
-
 func parseLabels(s string) map[string]string {
 	out := map[string]string{}
 	for _, part := range strings.Split(s, ",") {
@@ -518,29 +542,17 @@ func labelsSuperset(have, want map[string]string) bool {
 	return true
 }
 
-// writeFile writes content to path (0644), creating no directories.
-func writeFile(path, content string) error {
-	return os.WriteFile(path, []byte(content), 0o644)
+// ---------- config / body builders ----------
+
+// providerJSON renders one Providers[] entry.
+func providerJSON(name, url, key, model string) string {
+	return fmt.Sprintf(`{"name":%q,"api_base_url":%q,"api_key":%q,"models":[%q]}`,
+		name, url, key, model)
 }
 
-// runCCR runs the ccr binary with args (no serve, no ports) and returns exit
-// code + combined output. Used for the `config validate` / `config show`
-// subprocess assertions.
-func runCCR(t *testing.T, home string, args ...string) (int, string) {
-	t.Helper()
-	requireBinary(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, ccrBin, args...)
-	cmd.Env = envWith(os.Environ(), map[string]string{"HOME": home})
-	out, err := cmd.CombinedOutput()
-	code := 0
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else {
-			t.Fatalf("run ccr %v: %v", args, err)
-		}
-	}
-	return code, string(out)
+// anthropicBody builds a POST /v1/messages request body. extra is appended raw
+// (e.g. `,"stream":true`).
+func anthropicBody(model, content, extra string) string {
+	return fmt.Sprintf(`{"model":%q,"max_tokens":256,"messages":[{"role":"user","content":%q}]%s}`,
+		model, content, extra)
 }
