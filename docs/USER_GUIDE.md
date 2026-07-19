@@ -67,6 +67,9 @@ Field reference (`internal/config/config.go:46-144`):
 | `Router.background` | `Route.Background` | No | `"provider,model"` string; used for Claude Code's cheap/background ("haiku") tier |
 | `Router.think` | `Route.Think` | No | Accepted and validated; routing branch is **wired and unit-tested but inert today** — no `thinking` signal reaches the router, so it never fires (see `docs/FAQ.md` Q11) |
 | `Router.longContext` | `Route.LongContext` | No | Accepted and validated, and **live**: a request whose estimated prompt exceeds ~60000 tokens routes here when this is set (see `docs/FAQ.md` Q11) |
+| `Router.crossProviderFallback` | — (**v0.3.0**) | No | Opt-in bool. When `true`, a **retryable** primary failure advances to the next configured provider that also serves the model; absent/`false` → today's single-provider retry. See §9 |
+| `Router.fallback` | — (**v0.3.0**) | No | Optional ordered `["provider,model", …]` chain tried before the auto-discovered same-model providers. See §9 |
+| `Cache` | `Config.Cache` | No | Optional top-level block enabling the response cache; **absent/`nil` → caching off** (byte-identical to before). See §8 (`internal/config/config.go:145-171`) |
 
 ### 2.3 Loading and validation behaviour
 
@@ -274,3 +277,98 @@ No client action is required — this happens for every response, including `/he
 | `ccr <name>` (anything not `start`/`ui`/`serve`/`web`/`stop`/`help`) prints `Profile "<name>" was not found or is disabled.` | This reimplementation has no profile store yet — every non-command first argument hits this path by design, matching the upstream CLI's own behaviour for an unknown profile | Use `start`/`ui`/`serve`/`web`/`stop` |
 
 For the underlying reasoning behind each of these behaviours, see `docs/FAQ.md`. For deployment concerns (systemd, Docker, firewalling, backups), see `docs/ADMIN_MANUAL.md`.
+
+## 8. Response cache (optional, off by default)
+
+The gateway can cache upstream responses so an identical, repeated request is answered locally — with **no upstream call, and no upstream billing** — instead of hitting the provider again. It is **off unless you configure it**: an absent `Cache` block (or `"enabled": false`) leaves the request path byte-identical to a build with no cache (`internal/config/config.go:145-171`, `internal/gateway/gateway.go:129-149`).
+
+### 8.1 Enabling it
+
+Add a top-level `Cache` block alongside `Providers`/`Router`:
+
+```json
+{
+  "Providers": [
+    {
+      "name": "deepseek",
+      "api_base_url": "https://api.deepseek.com/chat/completions",
+      "api_key": "sk-...",
+      "models": ["deepseek-chat"]
+    }
+  ],
+  "Router": { "default": "deepseek,deepseek-chat" },
+  "Cache": {
+    "enabled": true,
+    "backend": "sqlite",
+    "path": "/home/you/.claude-code-router/cache.db",
+    "ttl_seconds": 3600,
+    "max_entries": 1024,
+    "allow_tool_responses": false
+  }
+}
+```
+
+Field reference (`internal/config/config.go:152-171`, validated in `Validate()` at `internal/config/config.go:272-281`):
+
+| JSON key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch. `false` (the zero value) disables the whole feature |
+| `backend` | string | `"memory"` | `""`/`"memory"` = in-process LRU (lost on restart); `"sqlite"` = persistent, survives restart. Any other value is a validation error |
+| `path` | string | — | SQLite database path. **Required** when `backend` is `"sqlite"` (a hard validation error otherwise); ignored for `memory` |
+| `ttl_seconds` | int | `0` | Per-entry lifetime in seconds; `0` means no expiry |
+| `max_entries` | int | `1024` | Bounds the in-memory LRU; `0` uses the default (`gateway.defaultCacheMaxEntries`, 1024) |
+| `allow_tool_responses` | bool | `false` | When `false`, a response carrying tool calls is never cached (its answer depends on live tool state). Set `true` only if you understand that trade-off |
+
+On startup `ccr serve` prints `response cache enabled (backend "…")` when a cache is built; if a `sqlite` store fails to open it logs `response cache disabled (build failed): …` and **continues serving with caching off** rather than refusing to boot (`cmd/ccr/serve.go:46-65`).
+
+### 8.2 What is and isn't cached
+
+Caching is deliberately conservative — it only ever serves a byte-for-byte reusable answer:
+
+- **Only non-streaming requests routed to an OpenAI-shaped provider are cached.** A streaming request, or a request routed to an `anthropic`-protocol provider (its body is not the OpenAI shape an entry stores), bypasses the cache entirely (`internal/gateway/messages.go:287-298`).
+- **Request-side gate** (`internal/cache/gate.go:25-36`): a request with `temperature > 0` is not cacheable (a sampled response is non-deterministic); `temperature` unset or an explicit `0` is fine. Streaming requests are excluded here too.
+- **Response-side gate** (`internal/cache/gate.go:53-86`), applied after a successful upstream call, before storing: an error-shaped body (a top-level `error`, or no `choices`) is never stored, and a response carrying tool calls is not stored unless `allow_tool_responses` is `true`.
+
+On a **HIT**, the buffered upstream body is translated back to Anthropic shape through the same path a live response uses and returned to the client — no upstream request is made (`internal/gateway/messages.go:291-298`). A cache lookup or store error never fails a request; it only forgoes the optimisation (`internal/gateway/messages.go:325-337`).
+
+### 8.3 Changing the cache config requires a restart
+
+Like every other config change, editing the `Cache` block is **validated and logged by hot-reload but does not take effect on the running gateway** — the live listener keeps the cache (or lack of one) it built at startup. **Restart the process** (`ccr stop && ccr start`, or `systemctl restart …`) to apply a `Cache` change. See §4.2 and `docs/ADMIN_MANUAL.md` §6 for the hot-reload boundary, and §6.1 there for cache operations (backing up a `sqlite` store, etc.).
+
+### 8.4 Semantic tier and the local embedder
+
+Alongside the exact-match tier, the cache ships a semantic tier keyed on a text embedding. Its default embedder is `LocalEmbedder` — a **deterministic, dependency-free, offline** embedder that maps text to a vector by feature-hashing character trigrams and L2-normalising the result (`internal/cache/embedder_local.go`). Be honest about its scope: it is a **lexical near-duplicate** signal (a re-asked prompt, a retried request, a one-word edit score close), **not a learned/neural embedding model** — genuine paraphrase with little surface overlap is not reliably captured. For deep paraphrase equivalence a real embedding provider is still the right tool; `LocalEmbedder` is a working local approximation that activates the semantic seam without a model or a network call.
+
+## 9. Cross-provider fallback (v0.3.0)
+
+> **v0.3.0.** This section documents the `Router.crossProviderFallback` / `Router.fallback` schema and policy landing in the v0.3.0 release. Both fields are **optional and opt-in**: with neither set (the default), routing behaviour is exactly today's single-provider retry, byte-for-byte. The underlying planning primitives are implemented and unit-tested in `internal/router` (`plan.go`, `fallback.go`); this release wires them into the gateway.
+
+Today a failed upstream call is retried against the **same** provider up to the attempt budget, then given up on. Cross-provider fallback extends that: when the primary provider is exhausted on a **retryable** failure, the gateway advances to the **next provider that also serves the same model**, re-translating the request for it.
+
+### 9.1 The two fields
+
+```json
+{
+  "Router": {
+    "default": "openai,gpt-4o",
+    "crossProviderFallback": true,
+    "fallback": ["azure,gpt-4o", "openrouter,openai/gpt-4o"]
+  }
+}
+```
+
+- **`crossProviderFallback`** (bool, default `false`): the master switch. When `true`, a retryable primary failure advances through the fallback plan; when `false`/absent, behaviour is exactly today's single-provider retry.
+- **`fallback`** (`[]string`, optional): an explicit ordered chain of `"provider,model"` selectors tried **before** the auto-discovered same-model providers. Use it to force a preferred order, or to fall back to a *different* model. Absent → the plan is just the primary plus any auto-discovered same-model providers, in config order.
+
+### 9.2 Fallback policy — what does and does not advance
+
+The decision is driven by the same `Retryable`/`Terminal` classification the single-provider retry loop already uses (`internal/router/fallback.go:62-116`):
+
+- **Retryable → falls back.** A `429` (rate limit), a `5xx` (`500`/`502`/`503`/`504`, upstream unhealthy), or a transport error (timeout, connection reset/refused) is transient — a different provider stands a real chance of succeeding, so the gateway advances.
+- **Terminal → does NOT fall back.** A `400`/`422` (**bad request**), `401`/`403` (bad credentials), `404` (unknown model), or any other unlisted 4xx is a judgement about the request or credentials themselves. A bad request would fail *everywhere*, so falling back would only burn quota against every provider for no chance of success — it is forwarded immediately, exactly as today.
+
+The plan is assembled by `BuildProviderPlan` (`internal/router/plan.go:103-135`), in order: (1) the primary attempt; (2) each explicit `fallback` entry; (3) every *other* configured provider whose `models` list also contains the primary model, in config declaration order. Exact-duplicate `(provider, model)` attempts are de-duplicated so no upstream is ever double-charged within one plan, and a single-provider config (or a model only one provider serves) yields a one-element plan — identical to today's single-attempt behaviour.
+
+### 9.3 When to use it
+
+Cross-provider fallback is most useful when the **same model id is served by more than one provider** you have configured (e.g. `gpt-4o` on both a direct OpenAI provider and an Azure one, or an open model on two inference hosts). It buys resilience against one provider's rate limits or outages without changing the model the client asked for. It is **not** a way to recover from a malformed request — that is terminal by design.
