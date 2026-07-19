@@ -44,6 +44,11 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	var gw *gateway.Server
 	if flags.Gateway {
 		gw = gateway.New(cfg, gateway.Options{Port: defaultGatewayPort})
+		// Install the real router and upstream client. Without this the
+		// gateway keeps its minimal built-in defaults, which always resolve
+		// Router.default — so haiku-tier background requests would be sent to
+		// the expensive model instead of the configured cheap one.
+		gw.WireDefaults(0)
 		if err := gw.Start(); err != nil {
 			fmt.Fprintf(stderr, "start gateway: %v\n", err)
 			return 1
