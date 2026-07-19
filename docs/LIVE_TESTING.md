@@ -106,6 +106,29 @@ key), and `model` is the resolved model id. A cache HIT increments
 reaches the upstream — which is exactly the invariant the Cache-HIT scenario
 checks.
 
+## Additional live suites
+
+Beyond `test/live/` (the core scenarios above), three focused suites cover the
+transport and operational surfaces, each building `ccr` and driving it over real
+loopback:
+
+- **`test/livetls/`** — TLS transport: HTTP/2 over TLS (ALPN h2), the `Alt-Svc`
+  h3 advertisement, a real HTTP/3-over-QUIC request, and HTTP/3-without-TLS
+  erroring. (TLS/HTTP3 are reached via `gateway.Options`; the `ccr serve` CLI
+  does not yet expose them — a documented gap.)
+- **`test/livereload/`** — config hot-reload: a validated change is
+  detected + logged, an invalid one is rejected while the server stays up, and
+  the honest boundary holds (the running gateway is not swapped in place —
+  restart to apply).
+- **`test/liveload/`** — concurrency + soak: 500 concurrent requests with exact
+  metric equality, the in-flight gauge quiescing to 0, cache-under-load bounds,
+  200 concurrent streams, and a multi-second soak with zero errors and no panics.
+
+Run one (`go test ./test/livetls/...`) or all sequentially
+(`go test ./test/live/... ./test/livetls/... ./test/livereload/... ./test/liveload/... -p 1`).
+The free-port helpers retry a transient ephemeral-bind failure, so heavy
+concurrent port churn does not spuriously fail a run.
+
 ## Toolkit-side live proof
 
 The companion `claude_toolkit` repository proves the bundled router builds and

@@ -4,9 +4,38 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.4.0` were tagged 2026-07-19; `v0.4.1` (below) is the current
+`v0.1.0`–`v0.4.1` were tagged 2026-07-19; `v0.4.2` (below) is the current
 release. Entries are drawn from this repository's real `git log` history —
 nothing here is speculative.
+
+## [0.4.2] - 2026-07-19
+
+Three more LIVE end-to-end suites (transport, hot-reload, load/soak) and a
+robustness fix so the live suites survive back-to-back port pressure. Tests only
+— no change to the gateway or any served behavior.
+
+### Tests
+
+- `test/livetls/`: real TLS transport proof — HTTP/2 over TLS (ALPN h2,
+  `resp.Proto == HTTP/2.0`), the `Alt-Svc: h3=":port"` advertisement, a real
+  HTTP/3-over-QUIC request (handshake completes, `HTTP/3.0`), and HTTP/3 without
+  TLS correctly erroring (no silent downgrade). (Surfaced a gap: `ccr serve`
+  exposes no TLS/HTTP3 flags — reachable only via `gateway.Options`.)
+- `test/livereload/`: config hot-reload proven live — a validated change is
+  detected+logged, an invalid change is rejected while the server stays up, and
+  the honest boundary holds (the running gateway is NOT swapped in place —
+  restart to apply), plus clean shutdown.
+- `test/liveload/`: concurrency + soak — 500 concurrent `/v1/messages` all `200`
+  with EXACT metric equality (`requests==500`, tokens `5500/3500`), in-flight
+  gauge quiesces to 0, cache-under-load `upstream_hits <= workers` with
+  `hits+misses==500`, 200 concurrent streams complete, and a 4s soak of ~44k
+  requests with zero errors and no panics.
+
+### Fixed
+
+- The live harnesses' free-port helper retries a transient
+  "address already in use" on an ephemeral `:0` bind (bounded), so heavy
+  concurrent port churn / `TIME_WAIT` no longer spuriously fails a run.
 
 ## [0.4.1] - 2026-07-19
 
