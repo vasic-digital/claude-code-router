@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -38,6 +39,16 @@ func Redacted(c *Config) *Config {
 	if c.Cache != nil {
 		cc := *c.Cache
 		out.Cache = &cc
+	}
+	// Carry the Proxy block through with its PASSWORD redacted. url + username
+	// are shown so an operator can confirm their outbound-proxy settings, but the
+	// HTTP Basic password must NEVER appear in `config show` output — the same
+	// guarantee provider api_keys get. Dropping the block entirely would hide the
+	// feature from show; carrying it unredacted would leak the password.
+	if c.Proxy != nil {
+		pc := *c.Proxy
+		pc.Password = RedactedMarker
+		out.Proxy = &pc
 	}
 	return out
 }
@@ -100,6 +111,20 @@ func CheckAll(c *Config) *ValidationReport {
 		}
 		if !seen[name] {
 			report.add("Router.%s references unknown provider %q", route.label, name)
+		}
+	}
+
+	// A present Proxy block must be complete and http(s) — same rule as Validate,
+	// surfaced here so `ccr config validate` reports it alongside every other
+	// problem rather than only failing at load time.
+	if c.Proxy != nil {
+		if c.Proxy.URL == "" || c.Proxy.Username == "" || c.Proxy.Password == "" {
+			report.add("Proxy: %v", ErrProxyIncomplete)
+		} else if !strings.HasPrefix(c.Proxy.URL, "http://") && !strings.HasPrefix(c.Proxy.URL, "https://") {
+			report.add("Proxy.url %q: %v", c.Proxy.URL, ErrProxyURLScheme)
+		} else if _, err := url.Parse(c.Proxy.URL); err != nil {
+			// Match Validate so `config validate` and `serve` agree on URL validity.
+			report.add("Proxy.url %q is not a valid URL: %v", c.Proxy.URL, err)
 		}
 	}
 

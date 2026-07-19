@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -97,6 +98,12 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 			"Router":{"default":"ghost,m"}}`,
 		"route without comma": `{"Providers":[{"name":"a","api_base_url":"https://a/b"}],
 			"Router":{"default":"a"}}`,
+		"proxy missing password": `{"Providers":[{"name":"a","api_base_url":"https://a/b"}],
+			"proxy":{"url":"http://p:8888","username":"u"}}`,
+		"proxy missing username": `{"Providers":[{"name":"a","api_base_url":"https://a/b"}],
+			"proxy":{"url":"http://p:8888","password":"pw"}}`,
+		"proxy non-http scheme": `{"Providers":[{"name":"a","api_base_url":"https://a/b"}],
+			"proxy":{"url":"socks5://p:1080","username":"u","password":"pw"}}`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -104,6 +111,29 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 				t.Errorf("expected an error for %s", name)
 			}
 		})
+	}
+}
+
+// A COMPLETE, http(s) proxy block is valid; the specific error types are
+// matchable so callers/tests can distinguish "incomplete" from "bad scheme".
+func TestValidateProxy(t *testing.T) {
+	good := `{"Providers":[{"name":"a","api_base_url":"https://a/b"}],
+		"proxy":{"url":"http://proxy.corp:8888","username":"u","password":"pw"}}`
+	if _, err := Load(writeTemp(t, good)); err != nil {
+		t.Fatalf("complete proxy should be valid, got: %v", err)
+	}
+
+	incomplete := &Config{Proxy: &ProxyConfig{URL: "http://p", Username: "u"}}
+	if err := incomplete.Validate(); !errors.Is(err, ErrProxyIncomplete) {
+		t.Errorf("incomplete proxy err = %v, want ErrProxyIncomplete", err)
+	}
+	badScheme := &Config{Proxy: &ProxyConfig{URL: "socks5://p", Username: "u", Password: "pw"}}
+	if err := badScheme.Validate(); !errors.Is(err, ErrProxyURLScheme) {
+		t.Errorf("bad-scheme proxy err = %v, want ErrProxyURLScheme", err)
+	}
+	// nil Proxy is always valid.
+	if err := (&Config{}).Validate(); err != nil {
+		t.Errorf("nil proxy should be valid, got: %v", err)
 	}
 }
 

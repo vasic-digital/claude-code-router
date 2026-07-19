@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -62,12 +63,35 @@ func (u upstreamAdapter) Do(ctx context.Context, p config.Provider, body []byte)
 //
 // Call this after New. It is a separate step, not part of New, so tests can
 // keep using the minimal in-package defaults or inject their own fakes.
-func (s *Server) WireDefaults(timeout time.Duration) {
+func (s *Server) WireDefaults(timeout time.Duration) error {
 	if timeout <= 0 {
 		timeout = s.opt.UpstreamTimeout
 	}
 	s.Router = routerAdapter{cfg: s.cfg}
-	s.Upstream = upstreamAdapter{client: proxy.New(timeout)}
+
+	client := proxy.New(timeout)
+	// An explicit authenticated outbound proxy (config.proxy) routes every
+	// upstream request through that proxy, overriding the ambient
+	// HTTP_PROXY/HTTPS_PROXY. Absent/nil leaves the env-only behaviour untouched.
+	if p := s.cfg.Proxy; p != nil {
+		c, err := proxy.NewWithUpstreamProxy(timeout, proxy.UpstreamProxyConfig{
+			Mode: proxy.ProxyModeCustom,
+			Custom: proxy.CustomProxy{
+				Server:   p.URL,
+				Username: p.Username,
+				Password: p.Password,
+			},
+		})
+		if err != nil {
+			// NewWithUpstreamProxy's error text is credential-free by
+			// construction (built from the server URL alone), so it is safe to
+			// surface to the operator.
+			return fmt.Errorf("configure outbound proxy: %w", err)
+		}
+		client = c
+	}
+	s.Upstream = upstreamAdapter{client: client}
+	return nil
 }
 
 // TransformerOptionsFor exposes the provider's configured transformers

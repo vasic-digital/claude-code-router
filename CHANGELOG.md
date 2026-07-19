@@ -4,9 +4,38 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.7` (below) are the
+`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.8` (below) are the
 current releases. Entries are drawn from this repository's real `git log`
 history — nothing here is speculative.
+
+## [0.4.8] - 2026-07-20
+
+An authenticated outbound proxy becomes configurable — the last documented
+"Known limitation" is now closed. Backward compatible: no `proxy` block = the
+existing environment-only behaviour, unchanged.
+
+### Added
+
+- **Authenticated outbound proxy via a `proxy` config block.** A top-level
+  `"proxy": {"url": "http://proxy.corp:8888", "username": "u", "password": "…"}`
+  routes every upstream provider request through that proxy (HTTP Basic to the
+  proxy itself), overriding the ambient `HTTP_PROXY`/`HTTPS_PROXY`. The
+  already-built `proxy.NewWithUpstreamProxy` is now wired into `WireDefaults`,
+  which returns an error on a bad proxy config (a hard, credential-free startup
+  error). All three fields are required when the block is present — a partial
+  block is rejected by `Validate` (at load) and by `ccr config validate`, since
+  the proxy only activates when server+username+password are all set (a partial
+  block would silently fall through to the environment). For an *un*authenticated
+  proxy, keep using the `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment.
+- **The proxy `password` is a secret and is redacted.** `config.Redacted`
+  carries the `proxy` block into `ccr config show` with `password` replaced by
+  `[REDACTED]` (url + username are shown) — the same guarantee provider
+  `api_key`s get; the real password never appears in show/validate output, logs,
+  error messages, or the proxy library's error text (built from the server URL
+  alone). Pinned by a prefix-scanning redaction test, config validation tests
+  (complete/incomplete/bad-scheme, `errors.Is`-matchable), and a wiring test that
+  inspects the resolved proxy URL (host + Basic credentials) to prove requests
+  actually route through it.
 
 ## [0.4.7] - 2026-07-20
 

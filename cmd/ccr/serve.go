@@ -63,8 +63,13 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		// Install the real router and upstream client. Without this the
 		// gateway keeps its minimal built-in defaults, which always resolve
 		// Router.default — so haiku-tier background requests would be sent to
-		// the expensive model instead of the configured cheap one.
-		gw.WireDefaults(0)
+		// the expensive model instead of the configured cheap one. A configured
+		// outbound proxy (config.proxy) is applied here; a bad proxy config is a
+		// hard startup error (the gateway is not yet listening, nothing to undo).
+		if err := gw.WireDefaults(0); err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+			return 1
+		}
 		// Override the gateway's default per-instance Recorder with the shared
 		// one, so the counters the management /metrics scrapes are the gateway's.
 		gw.Metrics = rec

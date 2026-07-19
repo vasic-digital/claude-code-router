@@ -200,6 +200,74 @@ func TestConfigShowNeverPrintsTheKey(t *testing.T) {
 	}
 }
 
+// The outbound-proxy password is a secret: `ccr config show` must redact it to
+// the marker, never reveal it or any prefix, while still showing url + username
+// so an operator can confirm the proxy settings.
+func TestConfigShowRedactsProxyPassword(t *testing.T) {
+	const proxyPassword = "s3cr3t-proxy-canary-9f8e7d6c5b4a"
+	p := writeConfigFile(t, `{"Providers":[
+		{"name":"a","api_base_url":"https://a.example/v1","api_key":"`+realLookingKey+`"}
+	],"proxy":{"url":"http://proxy.corp:8888","username":"proxyuser","password":"`+proxyPassword+`"}}`)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"config", "show", p}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	out := stdout.String()
+
+	if strings.Contains(out, proxyPassword) {
+		t.Fatalf("PROXY PASSWORD LEAKED in `ccr config show`:\n%s", out)
+	}
+	for n := 4; n <= len(proxyPassword); n++ {
+		if strings.Contains(out, proxyPassword[:n]) {
+			t.Fatalf("proxy password PREFIX (len %d) leaked: %q\n%s", n, proxyPassword[:n], out)
+		}
+	}
+	// url + username must survive (operator needs to see them); marker present.
+	if !strings.Contains(out, "http://proxy.corp:8888") || !strings.Contains(out, "proxyuser") {
+		t.Errorf("proxy url/username should be shown (only the password is secret):\n%s", out)
+	}
+	if !strings.Contains(out, config.RedactedMarker) {
+		t.Errorf("output missing the redaction marker %q:\n%s", config.RedactedMarker, out)
+	}
+	// The redacted output must still be valid JSON with an intact proxy block.
+	var got config.Config
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("config show output is not valid JSON: %v\n%s", err, out)
+	}
+	if got.Proxy == nil {
+		t.Fatal("proxy block dropped from config show output")
+	}
+	if got.Proxy.Password != config.RedactedMarker {
+		t.Errorf("proxy password = %q, want the redaction marker", got.Proxy.Password)
+	}
+	if got.Proxy.URL != "http://proxy.corp:8888" || got.Proxy.Username != "proxyuser" {
+		t.Errorf("proxy url/username altered by redaction: %+v", got.Proxy)
+	}
+}
+
+// `ccr config validate` must (a) reject a proxy URL that `ccr serve` would
+// reject — closing the earlier validate/serve divergence — and (b) never leak
+// the proxy password in its report output.
+func TestConfigValidateProxyRejectsBadURLWithoutLeaking(t *testing.T) {
+	const proxyPassword = "validate-canary-a1b2c3d4e5"
+	// "http://[::1" (unclosed IPv6 bracket) is valid JSON and passes the http://
+	// prefix check, but url.Parse rejects it — the case validate used to greenlight.
+	p := writeConfigFile(t, "{\"Providers\":[{\"name\":\"a\",\"api_base_url\":\"https://a/b\"}],"+
+		"\"proxy\":{\"url\":\"http://[::1\",\"username\":\"u\",\"password\":\""+proxyPassword+"\"}}")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"config", "validate", p}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("config validate should reject an unparseable proxy URL; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	combined := stdout.String() + stderr.String()
+	if strings.Contains(combined, proxyPassword) {
+		t.Fatalf("proxy password leaked in config validate output:\n%s", combined)
+	}
+}
+
 func TestConfigShowRedactsEveryProvider(t *testing.T) {
 	key1 := "sk-live-provider-one-secret-0123456789"
 	key2 := "sk-live-provider-two-secret-9876543210"

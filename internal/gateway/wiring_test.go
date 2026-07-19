@@ -2,12 +2,91 @@ package gateway
 
 import (
 	"encoding/json"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
 	"github.com/vasic-digital/claude-code-router/internal/translate"
 )
+
+// upstreamTransport digs the *http.Transport out of the wired upstream client so
+// a test can inspect how outbound requests are proxied.
+func upstreamTransport(t *testing.T, s *Server) *http.Transport {
+	t.Helper()
+	ua, ok := s.Upstream.(upstreamAdapter)
+	if !ok {
+		t.Fatalf("Upstream is %T, want upstreamAdapter", s.Upstream)
+	}
+	tr, ok := ua.client.HTTP.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("upstream transport is %T, want *http.Transport", ua.client.HTTP.Transport)
+	}
+	return tr
+}
+
+// A complete config.proxy must route every upstream request through that
+// authenticated proxy — the config→WireDefaults→client wiring, proven by
+// inspecting the resolved proxy URL (host + Basic credentials).
+func TestWireDefaultsAppliesOutboundProxy(t *testing.T) {
+	cfg := wiringCfg()
+	cfg.Proxy = &config.ProxyConfig{URL: "http://proxy.corp:8888", Username: "u", Password: "pw"}
+	s := New(cfg, Options{})
+	if err := s.WireDefaults(30 * time.Second); err != nil {
+		t.Fatalf("WireDefaults with a valid proxy: %v", err)
+	}
+
+	tr := upstreamTransport(t, s)
+	if tr.Proxy == nil {
+		t.Fatal("transport.Proxy is nil — outbound proxy not applied")
+	}
+	req, _ := http.NewRequest(http.MethodPost, "https://provider.example/v1/chat/completions", nil)
+	pu, err := tr.Proxy(req)
+	if err != nil {
+		t.Fatalf("transport.Proxy: %v", err)
+	}
+	if pu == nil {
+		t.Fatal("transport.Proxy returned nil — request would not go through the proxy")
+	}
+	if pu.Host != "proxy.corp:8888" {
+		t.Errorf("proxy host = %q, want proxy.corp:8888", pu.Host)
+	}
+	if pu.User.Username() != "u" {
+		t.Errorf("proxy user = %q, want u", pu.User.Username())
+	}
+	if pw, _ := pu.User.Password(); pw != "pw" {
+		t.Error("proxy Basic password not carried into the resolved proxy URL")
+	}
+}
+
+// With NO config.proxy, WireDefaults must NOT route through our explicit proxy
+// (it stays env-only). Robust regardless of net/http's env caching: the test
+// host is never our proxy.corp.
+func TestWireDefaultsNoProxyDoesNotRouteToExplicitProxy(t *testing.T) {
+	s := New(wiringCfg(), Options{})
+	if err := s.WireDefaults(30 * time.Second); err != nil {
+		t.Fatalf("WireDefaults without proxy: %v", err)
+	}
+	tr := upstreamTransport(t, s)
+	if tr.Proxy != nil {
+		req, _ := http.NewRequest(http.MethodGet, "https://provider.example/", nil)
+		if pu, _ := tr.Proxy(req); pu != nil && pu.Host == "proxy.corp:8888" {
+			t.Errorf("no-proxy config routed through the explicit proxy %v", pu)
+		}
+	}
+}
+
+// A structurally-present proxy whose URL is unparseable (a control char slips
+// past the http(s) prefix check in Validate) must make WireDefaults return an
+// error, not panic or silently ignore it.
+func TestWireDefaultsRejectsBadProxyURL(t *testing.T) {
+	cfg := wiringCfg()
+	cfg.Proxy = &config.ProxyConfig{URL: "http://a\x7fb", Username: "u", Password: "pw"}
+	s := New(cfg, Options{})
+	if err := s.WireDefaults(30 * time.Second); err == nil {
+		t.Fatal("WireDefaults should error on an unparseable proxy URL")
+	}
+}
 
 // wiringCfg has DISTINCT default and background routes, so a test can tell
 // which one the router actually chose.

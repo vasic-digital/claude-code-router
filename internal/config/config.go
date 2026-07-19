@@ -160,6 +160,30 @@ type Config struct {
 	// exactly today's behaviour — so every config already on disk (none of
 	// which carries this key) serialises and behaves byte-for-byte unchanged.
 	Cache *CacheConfig `json:"Cache,omitempty"`
+	// Proxy configures an explicit, AUTHENTICATED outbound proxy for upstream
+	// provider requests (HTTP Basic to the proxy itself). ABSENT/nil (the
+	// default) means "no explicit proxy" — outbound requests use only the ambient
+	// HTTP_PROXY/HTTPS_PROXY/NO_PROXY environment, exactly today's behaviour. When
+	// set it OVERRIDES those env vars. It is distinct from any provider api_key
+	// (which authenticates to the provider at the far end of the proxy). The
+	// Password is a SECRET — `ccr config show` redacts it (see config.Redacted).
+	Proxy *ProxyConfig `json:"proxy,omitempty"`
+}
+
+// ProxyConfig is an explicit authenticated outbound proxy (config.proxy.upstream
+// .custom in the Node original). All three fields are REQUIRED when the block is
+// present: the proxy library only activates a custom proxy when server+username+
+// password are all set, silently falling through to the environment otherwise,
+// so a partial block would do nothing — Validate rejects it rather than surprise
+// the operator. For an UNauthenticated proxy, use the HTTP_PROXY/HTTPS_PROXY
+// environment instead.
+type ProxyConfig struct {
+	// URL is the proxy's scheme+host[:port], e.g. "http://proxy.corp:8888".
+	URL string `json:"url"`
+	// Username / Password authenticate to the proxy via HTTP Basic. Password is
+	// a SECRET (redacted by config.Redacted; never logged).
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 // CacheConfig configures the gateway's response cache. The whole feature is
@@ -206,6 +230,12 @@ var (
 	// ErrCacheSemanticThresholdRange is returned when an enabled cache sets a
 	// non-zero semantic_threshold outside the (0,1] cosine range.
 	ErrCacheSemanticThresholdRange = errors.New(`cache semantic_threshold must be in (0,1]`)
+	// ErrProxyIncomplete is returned when a Proxy block is present but missing
+	// any of url/username/password (a partial block would silently fall through
+	// to the environment).
+	ErrProxyIncomplete = errors.New("proxy requires url, username, and password (use the HTTP_PROXY env for an unauthenticated proxy)")
+	// ErrProxyURLScheme is returned when a Proxy url is not http(s).
+	ErrProxyURLScheme = errors.New("proxy url must be http(s)")
 )
 
 // Dir returns the platform configuration directory, matching the Node
@@ -323,6 +353,23 @@ func (c *Config) Validate() error {
 		if c.Cache.SemanticThreshold != 0 &&
 			(c.Cache.SemanticThreshold < 0 || c.Cache.SemanticThreshold > 1) {
 			return fmt.Errorf("Cache: %w", ErrCacheSemanticThresholdRange)
+		}
+	}
+	// An absent/nil Proxy is valid (env-only outbound proxying). When present it
+	// must be COMPLETE (url+username+password all set) and the url http(s), so a
+	// partial block does not silently fall through to the environment.
+	if c.Proxy != nil {
+		if c.Proxy.URL == "" || c.Proxy.Username == "" || c.Proxy.Password == "" {
+			return fmt.Errorf("Proxy: %w", ErrProxyIncomplete)
+		}
+		if !strings.HasPrefix(c.Proxy.URL, "http://") && !strings.HasPrefix(c.Proxy.URL, "https://") {
+			return fmt.Errorf("Proxy.url %q: %w", c.Proxy.URL, ErrProxyURLScheme)
+		}
+		// Parse here too, so `ccr config validate` never greenlights a URL that
+		// `ccr serve` (WireDefaults → url.Parse) would then reject — e.g. one
+		// carrying a control character. The error echoes only the URL (no creds).
+		if _, err := url.Parse(c.Proxy.URL); err != nil {
+			return fmt.Errorf("Proxy.url %q is not a valid URL: %w", c.Proxy.URL, err)
 		}
 	}
 	return nil

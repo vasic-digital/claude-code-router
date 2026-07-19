@@ -70,6 +70,7 @@ Field reference (`internal/config/config.go:46-144`):
 | `Router.crossProviderFallback` | — (**v0.3.0**) | No | Opt-in bool. When `true`, a **retryable** primary failure advances to the next configured provider that also serves the model; absent/`false` → today's single-provider retry. See §9 |
 | `Router.fallback` | — (**v0.3.0**) | No | Optional ordered `["provider,model", …]` chain tried before the auto-discovered same-model providers. See §9 |
 | `Cache` | `Config.Cache` | No | Optional top-level block enabling the response cache; **absent/`nil` → caching off** (byte-identical to before). See §8 (`internal/config/config.go:145-171`) |
+| `proxy` | `Config.Proxy` | No | Optional top-level block routing every outbound provider request through an **authenticated** proxy; **absent/`nil` → env-only proxying** (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`), byte-identical to before. See §2.5 (`internal/config/config.go:163-185`) |
 
 ### 2.3 Loading and validation behaviour
 
@@ -86,6 +87,34 @@ Field reference (`internal/config/config.go:46-144`):
 ### 2.4 Route string syntax
 
 A route is `"provider,model"`. Only the **first** comma is the separator — everything after it, including further commas, is the model id verbatim (`internal/config/config.go:239-249`, tested at `internal/config/config_test.go:110-124`). This matters for providers whose model ids legitimately contain commas.
+
+### 2.5 Outbound proxy (authenticated)
+
+By default, outbound requests to your upstream providers use only the ambient `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment — unchanged, and still the right choice for an **unauthenticated** corporate proxy. A top-level `proxy` block lets you configure an **authenticated** outbound proxy explicitly in `config.json` instead:
+
+```json
+{
+  "Providers": [ ... ],
+  "Router": { "default": "..." },
+  "proxy": {
+    "url": "http://proxy.corp:8888",
+    "username": "svc-ccr",
+    "password": "SECRET"
+  }
+}
+```
+
+Field reference (`internal/config/config.go` `ProxyConfig`, validated in `Validate()`):
+
+| JSON key | Type | Required | Notes |
+|---|---|---|---|
+| `url` | string | Yes (when block present) | The proxy's scheme+host[:port], e.g. `"http://proxy.corp:8888"`. Must start with `http://` or `https://` (`ErrProxyURLScheme`) |
+| `username` | string | Yes (when block present) | HTTP Basic username presented to the proxy itself — not a provider `api_key`, which still authenticates to the provider at the far end |
+| `password` | string | Yes (when block present) | HTTP Basic password presented to the proxy. A **secret** — `ccr config show` redacts it to `[REDACTED]` (see `docs/ADMIN_MANUAL.md` §5) |
+
+All three fields are **required together**: the proxy only activates when `url`, `username`, and `password` are all set, so a partial block would silently fall through to the environment instead of doing what it looks like it does. `Validate()` rejects a partial block at config load, and `ccr config validate` reports the same problem (`ErrProxyIncomplete`, `internal/config/config.go:358-368`, `internal/config/validate_cmd.go`).
+
+When `proxy` is set, `Server.WireDefaults` routes **every** upstream provider request through it with HTTP Basic auth to the proxy, **overriding** the ambient `HTTP_PROXY`/`HTTPS_PROXY` for those requests (`internal/gateway/wiring.go:72-90`). Absent/`nil` (the default) leaves today's env-only behaviour completely unchanged.
 
 ## 3. Provider setup walkthrough
 
