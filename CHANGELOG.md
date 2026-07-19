@@ -3,13 +3,70 @@
 All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-No tagged release has been cut yet — see [`docs/RELEASE.md`](docs/RELEASE.md)
-for the version scheme this project intends to adopt (SemVer, `v` prefix)
-once the first tag lands. Until then everything lives under `[Unreleased]`,
-seeded from this repository's real `git log --oneline` history (oldest
-first below, matching commit order) — nothing here is speculative.
+Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
+`v0.1.0` (the initial clean-room Go port) was tagged 2026-07-19; `v0.2.0`
+(below) is the current release. Entries are drawn from this repository's real
+`git log` history — nothing here is speculative.
 
-## [Unreleased]
+## [0.2.0] - 2026-07-19
+
+Multi-protocol gateway: an OpenAI-compatible inbound facade and Anthropic-native
+passthrough on top of the v0.1.0 Anthropic↔OpenAI core, plus content-aware
+routing, config hot-reload, and access logging with secret redaction. All four
+remaining upstream test-port GAP skips are closed (0 `t.Skip("GAP")` in the
+tree); full suite green under `-race` including chaos/security/mutation/helixqa.
+
+### Added
+
+- Provider `protocol` field (`"openai"` | `"anthropic"`) with conservative
+  `api_base_url` inference and validation; an **absent** field behaves exactly
+  as before (OpenAI), so every existing config is unchanged. An Anthropic-native
+  provider is proxied UNTRANSLATED on both legs (request passthrough + verbatim
+  response relay, no upstream-header leak). (`80b90db`)
+- OpenAI-compatible inbound facade: `POST /v1/chat/completions` (+ `/proxy/v1/*`
+  alias) forwards an OpenAI request to an OpenAI-shaped provider with the routed
+  model overridden and relays the OpenAI response verbatim; errors use the OpenAI
+  envelope via an `errorResponder` threaded through the shared retry loop. An
+  OpenAI-inbound request routed to an Anthropic-native provider returns an
+  explicit `501` rather than mistranslating. (`80b90db`)
+- Reusable path→protocol classifier (`requestProtocolForPath`) and
+  routing-eligibility predicate (`shouldApplyGatewayRouting`) matching upstream's
+  full table across five protocol families; a classifier-driven `handleInbound`
+  dispatcher. Anthropic Messages and OpenAI chat-completions are served live;
+  OpenAI Responses and the two Gemini families are classified but not served
+  (`404`). (`80b90db`)
+- Content-aware routing: `Router.LongContext` fires when an estimated prompt
+  token count exceeds the threshold (Anthropic-inbound); `Router.Think` routing
+  is wired and tested but inert pending a caller-side thinking signal. With both
+  unset, routing is byte-identical to before. (`914f002`)
+- Config hot-reload wired into `ccr serve`/`start`/`ui`/`web` via
+  `config.Watcher`: a validated change is logged, an invalid one is rejected and
+  the previous good config retained, the watcher is stopped on shutdown. The
+  running gateway is not swapped in place — a restart applies the new config.
+  (`12f62af`)
+- Structured access logging mounted with secret redaction: only request metadata
+  is logged (never a header value or body); any secret is scrubbed to the fixed
+  `[REDACTED]` marker (never a prefix). Honors `CCR_LOG_LEVEL` / `CCR_LOG_FORMAT`.
+  (`539ea2f`)
+- Unambiguous bare-model resolution as a subordinate route: resolves a bare model
+  to its sole owning provider only when no `Router.Default`/`Background` applies;
+  an ambiguous bare model is rejected loudly, and an explicit `Router.Default`
+  always wins — no request can silently bypass a configured default. (`e0757d5`)
+
+### Changed
+
+- Protocol inference classifies a URL as Anthropic-native only for an
+  `*.anthropic.com` host or an `/anthropic` path segment; an explicit `protocol`
+  always overrides inference. Verified against the live 20-provider config that
+  no real provider is reclassified. (`d69a793`)
+
+### Docs
+
+- Full documentation audit + reconciliation; `PORTING-MATRIX` synced to the
+  0-GAP reality (15 PORTED / 0 GAP / 29 N/A, 42 passing port tests); an
+  implementation-ready innovations dossier under `docs/research/innovations/`.
+
+## [0.1.0] - 2026-07-19
 
 ### Added
 
