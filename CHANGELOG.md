@@ -8,6 +8,32 @@ Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)
 (below) is the current release. Entries are drawn from this repository's real
 `git log` history — nothing here is speculative.
 
+## [Unreleased]
+
+Post-`v0.2.0` development. The groundwork below is tested but NOT yet wired into
+the gateway — it lands live in a future tagged release.
+
+### Fixed
+
+- Panicking request handlers are now access-logged: `gin.Recovery()` is mounted
+  INSIDE `LoggingMiddleware` (previously outside, so panics unwound past the
+  logger), and a recovered 500 is logged with the correct status. Reload-test
+  fixtures now differ in length; the reload-coalescing caveat is documented.
+  (`c881086`)
+
+### Added (groundwork, not yet wired)
+
+- `internal/cache`: self-contained response-cache package — exact-hash tier
+  (in-memory LRU + pure-Go SQLite persistence, no CGO), TTL/eviction, safety
+  gates (temperature > 0 / streaming / tool-call / error bodies refused),
+  scope-isolated fingerprints, and a semantic-index seam that fails explicitly
+  with `ErrNoEmbedder` rather than fabricating a vector. (`280469b`)
+- `internal/router` cross-provider execution-plan API (`BuildProviderPlan` /
+  `ResolveAttempt`): ordered, de-duplicated fallback attempts across providers,
+  composing with the existing classify/backoff primitives. The gateway retry
+  loop still targets one fixed provider; consumption is a documented seam.
+  (`196ed0c`)
+
 ## [0.2.0] - 2026-07-19
 
 Multi-protocol gateway: an OpenAI-compatible inbound facade and Anthropic-native
