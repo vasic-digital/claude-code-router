@@ -14,9 +14,34 @@ Every response, on every route, passes through the compression middleware descri
 
 ---
 
+## Authentication
+
+`internal/gateway.RequireAPIKey(keys []string)` (`internal/gateway/auth.go`) is mounted as route-scoped middleware directly ahead of `handleMessages`:
+
+```go
+s.eng.POST("/v1/messages", RequireAPIKey(s.opt.APIKeys), s.handleMessages)
+```
+
+— `internal/gateway/gateway.go:161`. It is deliberately **route-scoped**, not installed via `s.eng.Use(...)`: `GET /health`/`GET /ready` are never gated, so a supervisor can always probe liveness/readiness regardless of auth configuration.
+
+When `keys` (`Options.APIKeys`) is non-empty, a request must present a matching key via either header, checked in this order:
+
+1. `Authorization: Bearer <key>`
+2. `x-api-key: <key>` (the header Anthropic's own SDKs send)
+
+Comparison uses `crypto/subtle.ConstantTimeCompare`, so response timing cannot leak how much of a guessed key was correct; a mismatch or missing key gets a fixed `401` that never echoes what the client sent:
+
+```json
+{"type":"error","error":{"type":"authentication_error","message":"invalid or missing API key"}}
+```
+
+**When `keys` is empty — which is always, on a gateway launched via `cmd/ccr`** — `RequireAPIKey` disables authentication entirely and every request passes through, exactly as if the middleware were not installed at all. `cmd/ccr` has no `--api-key`/`--api-keys` flag and no `config.json` field to populate `Options.APIKeys`, so **`POST /v1/messages` is unauthenticated on every CLI-launched gateway today**. Populating `APIKeys` is only possible by constructing `gateway.New(cfg, gateway.Options{APIKeys: [...]})` yourself as a library. See README.md "Known limitations" and `docs/FAQ.md` Q29.
+
+---
+
 ## `GET /health`
 
-Liveness only. Always `200` once the process is accepting connections; says nothing about whether any configured provider is actually reachable (`internal/gateway/gateway.go:105-110`).
+Liveness only. Always `200` once the process is accepting connections; says nothing about whether any configured provider is actually reachable (`internal/gateway/gateway.go:129-134`).
 
 **Request:** no body, no parameters.
 
@@ -39,7 +64,7 @@ curl -s http://127.0.0.1:3456/health | jq
 
 ## `GET /ready`
 
-Readiness: green only when the router could actually resolve a request today (`internal/gateway/gateway.go:113-127`).
+Readiness: green only when the router could actually resolve a request today (`internal/gateway/gateway.go:137-151`).
 
 **Request:** no body, no parameters.
 
@@ -67,14 +92,16 @@ The Anthropic Messages API-compatible endpoint Claude Code actually talks to. Im
 
 ### Processing pipeline
 
-1. Read and JSON-decode the request body into an `AnthropicRequest` (`internal/translate.AnthropicRequest`). A read failure or invalid JSON → `400`.
-2. **Route** the request via `Server.Router.Route(&in)` to a `(config.Provider, model string)` pair — on a CLI-launched gateway this is `internal/router.Select`'s haiku-tier-aware policy (see `docs/FAQ.md` Q10). Failure (no route configured / route names an unknown provider) → `503`.
-3. **Translate** Anthropic → OpenAI via `translate.AnthropicToOpenAI`, with per-provider options derived from the routed provider's `transformer.use` list (`CleanCache`, `StreamOptions`) plus `EnsureToolParameters` **always on** and `Model` set to the routed model id. A translation failure (e.g. an image content block) → `400`.
-4. JSON-encode the translated request. An encode failure → `500` (should not happen for a request that already parsed and translated successfully).
-5. For **non-streaming** requests only, wrap the outbound call's context in a deadline of `Options.UpstreamTimeout` (default 10 minutes). Streaming requests get no added deadline.
-6. Call the routed provider via `Server.Upstream.Do(ctx, provider, body)`. A transport-level failure (DNS, connection refused, context deadline, etc.) → `502`.
-7. If the upstream responds with a status `>= 400`, forward it (see [Error shape](#error-shape) below) preserving the exact status code.
-8. Otherwise, translate the OpenAI-shaped upstream response back to Anthropic shape — buffered (`respondNonStreaming`) or streamed (`streamAnthropicSSE`) depending on the request's `"stream"` field — and write it to the client.
+1. `RequireAPIKey` middleware runs first (see [Authentication](#authentication)) — a no-op today on every CLI-launched gateway.
+2. Cap and read the request body (`http.MaxBytesReader`, 32MiB). Over the cap → `413`; otherwise unreadable → `400`.
+3. JSON-decode the body into an `AnthropicRequest` (`internal/translate.AnthropicRequest`). Invalid JSON → `400`.
+4. **Route** the request via `Server.Router.Route(&in)` to a `(config.Provider, model string)` pair — on a CLI-launched gateway this is `internal/router.Select`'s haiku-tier-aware policy (see `docs/FAQ.md` Q10). Failure (no route configured / route names an unknown provider) → `503`.
+5. **Translate** Anthropic → OpenAI via `translate.AnthropicToOpenAI`, with per-provider options derived from the routed provider's `transformer.use` list (`CleanCache`, `StreamOptions`) plus `EnsureToolParameters` **always on** and `Model` set to the routed model id. A translation failure (e.g. an unsupported/malformed image source, or a content shape that decodes as neither string nor block array) → `400`.
+6. JSON-encode the translated request. An encode failure → `500` (should not happen for a request that already parsed and translated successfully).
+7. For **non-streaming** requests only, wrap the outbound call's context in a deadline of `Options.UpstreamTimeout` (default 10 minutes) — this bounds every retry attempt below, not just one call. Streaming requests get no added deadline at this layer.
+8. **Call the routed provider with retries**, via `doUpstreamWithRetry` (`internal/gateway/messages.go:294-383`): up to `Options.MaxAttempts` total attempts (default 3). After each failed attempt, `internal/router.ClassifyStatus`/`ClassifyTransportError` decides whether it's worth retrying (`Retryable`: `429`/`5xx` status, or a timeout/connection-reset/connection-refused transport error) — a `Terminal` failure (e.g. `401`, `404`, a malformed-URL error) is forwarded immediately, never retried. Between retries it sleeps per `FallbackRetryDelayAfterStatus`/`...AfterNetworkError` (honouring a `Retry-After` header; exponential backoff otherwise, floored at 1s). A context that ends while an attempt is in flight or waiting to retry (client disconnect, or the non-streaming deadline from step 7) → `504`. A transport failure with no more retries left → `502`.
+9. If the upstream responds with a status `>= 400` on the final attempt, forward it (see [Error shape](#error-shape) below) preserving the exact status code.
+10. Otherwise, translate the OpenAI-shaped upstream response back to Anthropic shape — buffered (`respondNonStreaming`) or streamed (`streamAnthropicSSE`) depending on the request's `"stream"` field — and write it to the client. A streaming response only ever reaches this step after the retry loop has already produced its final answer, so a retry can never corrupt an SSE stream already in flight to the client.
 
 ### Request body
 
@@ -103,7 +130,7 @@ The same `AnthropicRequest` shape documented in `internal/translate/anthropic.go
 | `model` | string | Overridden on the outgoing upstream request by the model the router resolved — the client's own `model` value only affects **routing** (via the haiku-tier substring check, when the fuller router is wired in), not which upstream model id is actually requested. |
 | `max_tokens` | int | Passed through verbatim. |
 | `system` | string \| block array | Flattened to plain text and sent as a leading `role:"system"` message upstream. |
-| `messages[]` | array | `role` + `content` (string or content-block array: `text`, `tool_use`, `tool_result`; `image` is rejected — see `docs/FAQ.md` Q12). |
+| `messages[]` | array | `role` + `content` (string or content-block array: `text`, `tool_use`, `tool_result`, `image` — base64 or URL source, converted to an OpenAI `image_url` part; an unsupported media type or malformed source is a `400`, see `docs/FAQ.md` Q12). |
 | `tools[]` | array | `name`, `description`, `input_schema`. An empty/absent `input_schema` is backfilled to `{"type":"object","properties":{}}` before being sent upstream (always on for this endpoint). |
 | `temperature`, `top_p` | float, optional | Passed through. |
 | `stop_sequences` | []string, optional | Renamed to OpenAI's `stop` upstream. |
@@ -186,11 +213,11 @@ data: {"type":"message_stop"}
 | `message_delta` | Once, after the last content block closes | Carries the mapped `stop_reason` and the **final** cumulative `usage`, taken from whichever upstream chunk included a `usage` object (typically the last one). |
 | `message_stop` | Once, terminal event | Stream closes after this. |
 
-The upstream's `data: [DONE]` line ends the read loop (OpenAI convention); a malformed individual `data:` line from the upstream is silently skipped rather than aborting the stream — by the time a bad line arrives, `200` and headers have already been sent, so there is no status code left to change (`internal/gateway/messages.go:483-535`).
+The upstream's `data: [DONE]` line ends the read loop (OpenAI convention); a malformed individual `data:` line from the upstream is silently skipped rather than aborting the stream — by the time a bad line arrives, `200` and headers have already been sent, so there is no status code left to change (`internal/gateway/messages.go:643-695`).
 
 ### Error shape
 
-Every error response — from the gateway itself or forwarded from an upstream — uses the same body shape (`internal/gateway/messages.go:246-256`):
+Every error response — from the gateway itself, from the retry loop giving up, or forwarded from an upstream — uses the same body shape (`internal/gateway/messages.go:408-416`):
 
 ```json
 {
@@ -208,9 +235,12 @@ Verified end-to-end for both an upstream-mapped error and a malformed-upstream-b
 
 | Status | `error.type` | Cause |
 |---|---|---|
-| `400` | `invalid_request_error` | Unreadable request body, invalid request JSON, or a translation failure (e.g. an unsupported `image` content block) |
+| `400` | `invalid_request_error` | Unreadable request body, invalid request JSON, or a translation failure (e.g. an unsupported/malformed `image` source) |
+| `401` | `authentication_error` | `RequireAPIKey` rejected the request — only possible if `Options.APIKeys` is non-empty, which no CLI-launched gateway sets today (see [Authentication](#authentication)) |
+| `413` | `invalid_request_error` | Request body exceeded the 32MiB cap (`http.MaxBytesReader`) |
 | `503` | `not_found_error` | No route could be resolved (`Router.default` unset, or it names an unknown provider) |
-| `502` | `api_error` | Upstream transport failure (network error, DNS, timeout); or the upstream returned a `200` with malformed JSON, or with zero `choices` |
+| `502` | `api_error` | Upstream transport failure that exhausted its retry budget; or the upstream returned a `200` with malformed JSON, or with zero `choices` |
+| `504` | `api_error` | The request's context ended (client disconnect, or the non-streaming `UpstreamTimeout` deadline) while an attempt was in flight or the retry loop was waiting to retry |
 | `500` | `api_error` | Failed to JSON-encode the already-translated outgoing request (an internal encoding failure, not a client-input problem) |
 
 #### Status codes forwarded from the upstream
