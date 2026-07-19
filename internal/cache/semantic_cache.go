@@ -311,7 +311,24 @@ func (sc *SemanticCache) pruneCandidate(scope, key string) {
 // hit is preceded by an exact-tier miss, so the exact tier's Miss counter
 // counts it; SemanticHits() exposes the semantic-tier count the exact Stats
 // cannot see.
-func (sc *SemanticCache) Stats() Stats { return sc.exact.Stats() }
+func (sc *SemanticCache) Stats() Stats {
+	// Report THIS wrapper's own lookup accounting, not the exact tier's verbatim.
+	// A semantic hit does an exact miss FOLLOWED by an exact re-read (the
+	// liveness check), so returning sc.exact.Stats() would count one logical
+	// Lookup as two, plus a spurious Miss+Hit. Lookups/Hits/Misses here reflect
+	// SemanticCache.Lookup calls (Hits = exact + semantic); Entries/Evictions/
+	// Expirations come from the exact tier, which remains the authority for
+	// stored entries.
+	base := sc.exact.Stats()
+	return Stats{
+		Entries:     base.Entries,
+		Lookups:     sc.lookups.Load(),
+		Hits:        sc.exactHits.Load() + sc.semanticHits.Load(),
+		Misses:      sc.misses.Load(),
+		Evictions:   base.Evictions,
+		Expirations: base.Expirations,
+	}
+}
 
 // SemanticHits returns how many Lookups were satisfied by the semantic tier
 // (after an exact miss). Companion to Stats for observability.

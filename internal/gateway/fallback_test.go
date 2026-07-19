@@ -5,6 +5,7 @@ package gateway
 // primary advances immediately (no backoff), isolating the fallback behaviour.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -142,6 +143,34 @@ func TestFallbackAdvancesOnTransportError(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "from secondary") {
 		t.Errorf("client did not receive secondary's answer: %s", rec.Body.String())
+	}
+}
+
+// The gen_ai upstream metric is attributed to EACH provider actually tried, not
+// only the primary — the fix for the per-attempt-attribution Minor. A primary
+// 503 that falls back to a secondary must record BOTH providers.
+func TestFallbackMetricsAttributedPerProvider(t *testing.T) {
+	up := newFallbackUpstream()
+	up.status["primary"] = http.StatusServiceUnavailable // 503, Retryable
+	up.status["secondary"] = http.StatusOK
+	up.respBody["secondary"] = secondaryAnswer
+
+	s := New(fallbackCfg(true), Options{MaxAttempts: 1})
+	s.Upstream = up
+	if rec := postMessages(t, s); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var buf bytes.Buffer
+	s.Metrics.WriteExposition(&buf) // s.Metrics is the default non-nil recorder
+	out := buf.String()
+	for _, want := range []string{
+		`ccr_gen_ai_upstream_requests_total{provider="primary"`,
+		`ccr_gen_ai_upstream_requests_total{provider="secondary"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing per-attempt upstream metric %q in:\n%s", want, out)
+		}
 	}
 }
 

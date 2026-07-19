@@ -164,7 +164,7 @@ func relayOpenAIResponse(c *gin.Context, resp *http.Response, stream bool) {
 		relayRawStream(c.Writer, resp.Body)
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBytes))
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
 		return

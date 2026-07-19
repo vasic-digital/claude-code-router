@@ -28,6 +28,12 @@ import (
 // still bounding what a single client can force the gateway to allocate.
 const maxRequestBodyBytes = 32 << 20
 
+// maxUpstreamResponseBytes caps a buffered upstream completion body — the
+// symmetric read-side counterpart to maxRequestBodyBytes — applied wherever a
+// non-streaming upstream response is read fully into memory before it is
+// relayed or translated.
+const maxUpstreamResponseBytes = 32 << 20
+
 // ---------- Seams: Router and Upstream ----------
 //
 // These are narrow, LOCAL interfaces — not internal/router.Router or
@@ -307,23 +313,24 @@ func (s *Server) handleMessages(c *gin.Context) {
 		}
 	}
 
-	// One upstream request is about to be made for this (provider, model). A
-	// cache HIT returned above WITHOUT reaching here, so this counter cleanly
-	// excludes served-from-cache requests. It covers both the anthropic-native
-	// and the OpenAI (single-call or fallback) transports below.
-	if s.Metrics != nil {
-		s.Metrics.RecordUpstream(provider.Name, model)
-	}
-
 	// Cross-provider fallback (opt-in) applies ONLY to the non-streaming,
 	// OpenAI-provider path: streaming cannot fall back once bytes flush, and an
 	// Anthropic-native primary uses its own passthrough transport. When the
 	// flag is off (the default) this is byte-identical to the single call.
+	//
+	// The upstream metric is recorded per ATTEMPTED provider — a cache HIT
+	// returned above without reaching here, so served-from-cache is excluded.
+	// The single-provider branch records the one provider it calls;
+	// acquireOpenAIWithFallback records EACH plan attempt, so a fallback that
+	// tries several providers is attributed to each, not only the primary.
 	var resp *http.Response
 	var ok bool
 	if !anthropicNative && !in.Stream && s.cfg.Router.CrossProviderFallback {
 		resp, ok = s.acquireOpenAIWithFallback(c, ctx, &in, provider, model, anthropicResponder{})
 	} else {
+		if s.Metrics != nil {
+			s.Metrics.RecordUpstream(provider.Name, model)
+		}
 		resp, ok, _ = s.doUpstreamWithRetry(c, ctx, provider, outBody, anthropicResponder{}, false)
 	}
 	if !ok {
@@ -335,7 +342,7 @@ func (s *Server) handleMessages(c *gin.Context) {
 
 	if anthropicNative {
 		// Upstream already speaks Anthropic: relay verbatim, no re-translation.
-		relayAnthropicResponse(c, resp, in.Stream)
+		s.relayAnthropicResponse(c, resp, in.Stream, provider.Name, model)
 		return
 	}
 	if in.Stream {
@@ -345,7 +352,7 @@ func (s *Server) handleMessages(c *gin.Context) {
 
 	// Non-streaming OpenAI MISS: buffer the upstream body ONCE so the same
 	// bytes are both (optionally) stored and translated for the client.
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBytes))
 	if err != nil {
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
 		return
@@ -421,6 +428,9 @@ func (s *Server) acquireOpenAIWithFallback(c *gin.Context, ctx context.Context, 
 			er.writeError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 			return nil, false
 		}
+		if s.Metrics != nil {
+			s.Metrics.RecordUpstream(primary.Name, primaryModel)
+		}
 		resp, ok, _ := s.doUpstreamWithRetry(c, ctx, primary, body, er, false)
 		return resp, ok
 	}
@@ -432,6 +442,9 @@ func (s *Server) acquireOpenAIWithFallback(c *gin.Context, ctx context.Context, 
 			return nil, false
 		}
 		canFallback := i < len(attempts)-1
+		if s.Metrics != nil {
+			s.Metrics.RecordUpstream(at.prov.Name, at.model)
+		}
 		resp, ok, tryNext := s.doUpstreamWithRetry(c, ctx, at.prov, body, er, canFallback)
 		if ok {
 			return resp, true
@@ -680,19 +693,31 @@ func forwardUpstreamError(c *gin.Context, resp *http.Response) {
 // pins): the response is rebuilt from the upstream BODY alone, with only the
 // Content-Type this gateway itself sets. doUpstreamWithRetry has already
 // guaranteed resp.StatusCode < 400, so this only ever relays a success body.
-func relayAnthropicResponse(c *gin.Context, resp *http.Response, stream bool) {
+func (s *Server) relayAnthropicResponse(c *gin.Context, resp *http.Response, stream bool, provider, model string) {
 	if stream {
 		// Shared line-by-line SSE relay (see relayRawStream in
 		// openai_inbound.go); the upstream's Anthropic SSE events reach the
-		// client unchanged, as they arrive.
+		// client unchanged, as they arrive. Token usage is NOT recorded here:
+		// the SSE is relayed byte-for-byte without parsing, so the per-event
+		// message_delta usage is never decoded — a documented gap for streaming
+		// Anthropic-native traffic; the non-streaming path below IS recorded.
 		relayRawStream(c.Writer, resp.Body)
 		return
 	}
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBytes))
 	if err != nil {
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
 		return
+	}
+	// Record token usage for this Anthropic-native response. The body is already
+	// Anthropic-shaped, so its usage.{input,output}_tokens are read directly —
+	// best-effort: a body without a usage block simply records nothing.
+	if s.Metrics != nil {
+		var am anthropicMessage
+		if json.Unmarshal(raw, &am) == nil {
+			s.Metrics.RecordTokens(provider, model, am.Usage.InputTokens, am.Usage.OutputTokens)
+		}
 	}
 	// The Content-Type is the one this gateway chooses; the body is the
 	// upstream's Anthropic-shaped JSON, forwarded byte-for-byte.
@@ -704,7 +729,7 @@ func relayAnthropicResponse(c *gin.Context, resp *http.Response, stream bool) {
 // around respondNonStreamingBytes so a caller that only has the stream (and
 // does not need the buffered bytes for anything else) keeps a one-call path.
 func (s *Server) respondNonStreaming(c *gin.Context, body io.Reader, provider, model string) {
-	raw, err := io.ReadAll(io.LimitReader(body, 32<<20))
+	raw, err := io.ReadAll(io.LimitReader(body, maxUpstreamResponseBytes))
 	if err != nil {
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
 		return
