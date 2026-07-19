@@ -1,6 +1,6 @@
 # API Reference
 
-This is the non-interactive HTTP reference for the **gateway's** three routes, all registered in `internal/gateway/gateway.go:97-131` and served on `127.0.0.1:3456` by default. All three are unauthenticated and un-versioned in the URL path (the API version is implicit — `/v1/messages` mirrors Anthropic's own path).
+This is the non-interactive HTTP reference for the **gateway's** three routes, all registered in `internal/gateway/gateway.go:121-162` and served on `127.0.0.1:3456` by default — independently configurable via `--gateway-host`/`--gateway-port` (`CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT`), see `docs/USER_GUIDE.md` §4. All three are un-versioned in the URL path (the API version is implicit — `/v1/messages` mirrors Anthropic's own path). `GET /health` and `GET /ready` are always unauthenticated by design (a supervisor must be able to probe them regardless of auth configuration); `POST /v1/messages` has route-scoped API-key middleware mounted (`RequireAPIKey`, `internal/gateway/gateway.go:161`) but it is unconfigurable from `cmd/ccr` today, so it is unauthenticated too in practice — see "Authentication" below.
 
 > **Not covered here:** `cmd/ccr` also runs a second, separate HTTP server — the "management" interface, `127.0.0.1:3458` by default (`--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT`) — with its own, differently-shaped `GET /health` (`{"providers":N,"service":"ccr-management","status":"ok"}`) and a placeholder `GET /` HTML page. It is a separate `net/http.ServeMux` in `cmd/ccr/management.go`, described in its own code comment as deliberately minimal (a real web UI is out of scope for now). See `docs/USER_GUIDE.md` §4 and `docs/ADMIN_MANUAL.md` §8.
 
@@ -63,7 +63,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3456/ready
 
 ## `POST /v1/messages`
 
-The Anthropic Messages API-compatible endpoint Claude Code actually talks to. Implemented in `internal/gateway/messages.go:178-244` (`handleMessages`).
+The Anthropic Messages API-compatible endpoint Claude Code actually talks to. Implemented in `internal/gateway/messages.go:189-271` (`handleMessages`), which delegates the actual upstream call to a retry loop, `doUpstreamWithRetry` (`internal/gateway/messages.go:294-383` — see "Processing pipeline" below). Route-scoped middleware, `RequireAPIKey`, also sits in front of this handler (`internal/gateway/gateway.go:161`) — see "Authentication" below.
 
 ### Processing pipeline
 

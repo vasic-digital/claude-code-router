@@ -35,15 +35,16 @@ A clean-room Go reimplementation of [`@musistudio/claude-code-router`](https://g
 | Explicit per-request provider/model selector (`"provider,model"`/`"provider/model"` in the request `model` field) | `internal/router` | **Implemented**, live in `router.Select` |
 | Environment-variable outbound proxy (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) | `internal/proxy` | **Implemented**, live for every `proxy.Client` |
 | Authenticated custom outbound proxy | `internal/proxy` | Implemented as a library function (`proxy.NewWithUpstreamProxy`) — **not wired** into `WireDefaults`/CLI, no `config.json` section for it |
-| Retry/fallback on a failed upstream call | `internal/router` | Classification/backoff policy implemented and tested (`internal/router/fallback.go`) — **no caller drives an actual retry loop yet** |
-| Inbound gateway authentication | `internal/gateway` | Implemented as an opt-in library function (`gateway.RequireAPIKey`) — **not installed** on any route by default |
+| Retry/fallback on a failed upstream call | `internal/gateway`, `internal/router` | **Implemented and live**: `handleMessages` now drives a real retry loop (`doUpstreamWithRetry`, `internal/gateway/messages.go`) against `internal/router/fallback.go`'s classification/backoff policy — up to `Options.MaxAttempts` (default 3) upstream attempts per request, never retrying a `Terminal` failure. No CLI/config surface yet to change the attempt budget |
+| Inbound gateway authentication | `internal/gateway` | `gateway.RequireAPIKey` is now **mounted** on `POST /v1/messages` (route-scoped; `/health`/`/ready` stay always-open) — but `cmd/ccr` never populates `Options.APIKeys` (no CLI flag or `config.json` field exists yet), so the accepted-key list is always empty and a CLI-launched gateway remains **unauthenticated by default**, same as before |
+| Image (vision) content blocks | `internal/translate` | **Implemented**: base64 or URL image sources convert to OpenAI `image_url` content parts, including inside `tool_result` content (computer-use screenshots); an unsupported media type or malformed source is a named error, not a silent drop |
 | Multi-protocol (OpenAI Responses/Gemini) support, ToolHub/MCP, billing, rules DSL, hosted web search | — | **Out of scope by design**, not merely unimplemented — see `test/PORTING-MATRIX.md` and `docs/FAQ.md` |
 
-`internal/gateway/messages.go` deliberately does **not** import `internal/router` or `internal/proxy` directly — it defines its own narrow `Router`/`Upstream` interfaces with minimal in-package default implementations, so the gateway package compiles and serves correctly standalone (`internal/gateway/messages.go:19-27`). A **separate** file, `internal/gateway/wiring.go`, adapts the real `internal/router.Select` and `internal/proxy.Client` onto those same interfaces and exposes `Server.WireDefaults(timeout)` to install them. **`cmd/ccr` calls `WireDefaults` on every gateway it starts** (`cmd/ccr/serve.go:44-51`) — so a gateway launched via `ccr start`/`ui`/`serve` gets the full haiku-tier-aware routing and streaming-safe upstream client, not the minimal built-ins. The minimal built-ins only matter if you construct `gateway.New` directly as a library, without also calling `WireDefaults` — see `docs/ARCHITECTURE.md` for the full picture.
+`internal/gateway/messages.go` deliberately does **not** import `internal/router` or `internal/proxy` directly — it defines its own narrow `Router`/`Upstream` interfaces with minimal in-package default implementations, so the gateway package compiles and serves correctly standalone (`internal/gateway/messages.go:30-50`). A **separate** file, `internal/gateway/wiring.go`, adapts the real `internal/router.Select` and `internal/proxy.Client` onto those same interfaces and exposes `Server.WireDefaults(timeout)` to install them. **`cmd/ccr` calls `WireDefaults` on every gateway it starts** (`cmd/ccr/serve.go:44-51`) — so a gateway launched via `ccr start`/`ui`/`serve` gets the full haiku-tier-aware routing and streaming-safe upstream client, not the minimal built-ins. The minimal built-ins only matter if you construct `gateway.New` directly as a library, without also calling `WireDefaults` — see `docs/ARCHITECTURE.md` for the full picture.
 
 ## Install
 
-Build the `ccr` binary from source (no published release yet, so `go install ...@latest` against a tagged version is not yet possible):
+`v0.1.0` is tagged and published as a [GitHub release](https://github.com/vasic-digital/claude-code-router/releases/tag/v0.1.0) (cross-compiled `linux`/`darwin`/`windows` × `amd64`/`arm64` archives + checksums — see `docs/RELEASE.md`). Either download an artifact from that release, or build from source:
 
 ```bash
 git clone https://github.com/vasic-digital/claude-code-router.git
@@ -111,7 +112,7 @@ See `docs/USER_GUIDE.md` for a full provider walkthrough and `docs/FAQ.md` for t
 
 ## CLI grammar
 
-`cmd/ccr` is a clean-room reimplementation of the upstream `@musistudio/claude-code-router` **v3.0.6** CLI grammar (`cmd/ccr/main.go:1-19`) — `claude_toolkit` shells out to this binary and greps `ccr --help` for the exact substrings `ccr start` and `ccr serve` to confirm it's talking to a compatible router, so this usage text is load-bearing, not decorative, and is reproduced verbatim from `cmd/ccr/main.go:28-52`:
+`cmd/ccr` is a clean-room reimplementation of the upstream `@musistudio/claude-code-router` **v3.0.6** CLI grammar (`cmd/ccr/main.go:1-19`) — `claude_toolkit` shells out to this binary and greps `ccr --help` for the exact substrings `ccr start` and `ccr serve` to confirm it's talking to a compatible router, so this usage text is load-bearing, not decorative, and is reproduced verbatim from `cmd/ccr/main.go:28-61`:
 
 ```
 ccr - Claude Code Router
@@ -136,54 +137,84 @@ Flags (start, ui, serve, web):
   --open, --no-open        Open (or don't open) the management UI in a browser
   --gateway, --no-gateway  Start (or don't start) the Anthropic-compatible gateway
                             (default: on, port 3456)
+  --gateway-port <port>    Gateway port (default 3456, env CCR_GATEWAY_PORT).
+                            Distinct from --port, which sets the management
+                            interface. Use this when 3456 is already taken.
+  --gateway-host <host>    Gateway bind address (default 127.0.0.1, env
+                            CCR_GATEWAY_HOST). Loopback-only by default
+                            because the gateway holds live provider API keys.
+                            Set 0.0.0.0 inside a container, where 127.0.0.1
+                            is the container's own loopback and a published
+                            port can never reach it.
 
   -h, --help                Show this help
 ```
 
 Notes, all grounded in `cmd/ccr/*.go`:
 
-- **`--host`/`--port` configure the *management* control-plane server**, not the Anthropic-compatible gateway — the gateway's bind address is fixed at `127.0.0.1:3456` today (`cmd/ccr/flags.go:20-27`; `defaultGatewayPort` is not exposed via a flag, "because existing toolkit configs already assume 3456"). `CCR_WEB_HOST`/`CCR_WEB_PORT` set the same values via environment; an explicit flag wins over the environment (`cmd/ccr/flags.go:33-49`, tested at `cmd/ccr/flags_test.go:46-65`).
+- **`--host`/`--port` configure the *management* control-plane server**; **`--gateway-host`/`--gateway-port` configure the Anthropic-compatible gateway** — the two servers have always been independent, but until this pass the gateway's address was hardcoded (`cmd/ccr/flags.go:9-43`). `CCR_WEB_HOST`/`CCR_WEB_PORT` and `CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT` set the same values via environment; an explicit flag always wins over its environment variable (`cmd/ccr/flags.go:50-129`, tested at `cmd/ccr/flags_test.go:46-65`, `cmd/ccr/gatewayhost_test.go`, `cmd/ccr/gatewayport_test.go`).
+  - **Why the gateway defaults to loopback (`127.0.0.1`) and not `0.0.0.0`:** it holds live provider API keys in `config.json` and sends them upstream on every request — binding it to every interface must be a deliberate, explicit act, never the default (`cmd/ccr/flags.go:38-43`).
+  - **Why a container needs `--gateway-host 0.0.0.0`:** inside a container, `127.0.0.1` is the *container's own* loopback interface — a published port (`docker run -p 3456:3456`) can never reach a process bound only to that address, no matter how the port is published. Pass `--gateway-host 0.0.0.0` (or `-e CCR_GATEWAY_HOST=0.0.0.0`) explicitly when the gateway needs to be reachable from outside its container; see `docs/ADMIN_MANUAL.md` §1.2 for the full picture, including the stock `Dockerfile`'s current `CMD`, which does **not** pass this yet.
+  - **`--gateway-host`/`--gateway-port` are not yet forwarded by `ccr start`/`ui`.** Those two commands re-exec themselves as `ccr serve` in a detached child process, and the code that builds the child's argument list (`cmd/ccr/service.go:104-114`) only forwards `--host`, `--port`, `--gateway`/`--no-gateway`, and `--open`/`--no-open` — **not** `--gateway-host`/`--gateway-port`. The flags are still parsed and validated by `start`/`ui` itself, then silently dropped. The **environment-variable** form does survive, because the detached child inherits the parent's environment (`cmd/ccr/spawn_unix.go`, `spawn_windows.go` set no explicit `Env`, and Go's `os/exec` inherits the current process's environment in that case) — so `CCR_GATEWAY_HOST=0.0.0.0 ccr start` works today, while `ccr start --gateway-host 0.0.0.0` does not reach the actual gateway. Use `ccr serve`/`web` directly (see `docs/ADMIN_MANUAL.md` §1's supervisor guidance, which already recommends `serve` over `start`/`ui` for exactly this kind of foreground/background distinction) or the environment-variable form until this is fixed.
 - **`start`/`ui`** re-exec the current binary as `serve` in a fully detached child process (new session via `setsid` on Unix — `cmd/ccr/spawn_unix.go`), record its PID/host/port/gateway-flag/start-time in `~/.claude-code-router/service.json`, and return immediately; the child's stdout/stderr go to `~/.claude-code-router/service.log` (`cmd/ccr/service.go:16-27`, `77-143`). Running `start` a second time while already running is refused with the running PID reported, not silently started twice (`cmd/ccr/service.go:93-96`).
 - **`stop`** reads that pidfile, sends `SIGTERM`, waits up to 5 seconds (polling every 100 ms), then `SIGKILL`s if it hasn't exited, and removes the pidfile either way; a stale pidfile pointing at a dead process is cleaned up and reported rather than claimed as a successful stop (`cmd/ccr/service.go:145-184`).
 - **`serve`/`web`** run in the foreground: start the gateway (unless `--no-gateway`) with `WireDefaults` applied, start the management server (always), optionally open a browser at the management URL (`--open`), then block until `SIGINT`/`SIGTERM` and shut both servers down gracefully within a 10-second grace period (`cmd/ccr/serve.go:16-96`).
-- **Any other first argument is treated as a profile name/id.** Since this reimplementation does not (yet) carry a profile store, every such invocation prints `Profile "<name>" was not found or is disabled.` to stderr and exits `1` — this is a deliberate, tested match for the upstream CLI's observed behaviour on an unknown profile, not an oversight (`cmd/ccr/main.go:79-85`, tested at `cmd/ccr/main_test.go:43-65`).
-- `-h`, `--help`, `help`, and no arguments at all all print the same usage text and exit `0` (`cmd/ccr/main.go:62-70`, tested at `cmd/ccr/main_test.go:26-37`).
+- **Any other first argument is treated as a profile name/id.** Since this reimplementation does not (yet) carry a profile store, every such invocation prints `Profile "<name>" was not found or is disabled.` to stderr and exits `1` — this is a deliberate, tested match for the upstream CLI's observed behaviour on an unknown profile, not an oversight (`cmd/ccr/main.go:88-94`, tested at `cmd/ccr/main_test.go:43-65`).
+- `-h`, `--help`, `help`, and no arguments at all all print the same usage text and exit `0` (`cmd/ccr/main.go:71-79`, tested at `cmd/ccr/main_test.go:26-37`).
 
-The gateway's own transport knobs (TLS, HTTP/3, upstream timeout) exist as `internal/gateway.Options` (`internal/gateway/gateway.go:35-47`) but are **not yet exposed as CLI flags** — `cmdServe` constructs `gateway.Options{Port: defaultGatewayPort}` only (`cmd/ccr/serve.go:46`), so TLS/HTTP-3 are only reachable today by using `internal/gateway` as a library directly:
+The gateway's remaining transport knobs (TLS, HTTP/3, upstream timeout, retry attempts, inbound API keys) exist as `internal/gateway.Options` (`internal/gateway/gateway.go:35-63`) but are **not yet exposed as CLI flags** — `cmdServe` constructs `gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort}` only (`cmd/ccr/serve.go:46`), so TLS/HTTP-3/custom retry budgets/inbound auth are only reachable today by using `internal/gateway` as a library directly:
 
 | `internal/gateway.Options` field | Default | CLI-exposed? |
 |---|---|---|
-| `Host` | `127.0.0.1` | No — always `127.0.0.1` via `cmdServe` |
-| `Port` | `3456` | No — fixed at `defaultGatewayPort` (also 3456) |
+| `Host` | `127.0.0.1` | **Yes** — `--gateway-host` / `CCR_GATEWAY_HOST` |
+| `Port` | `3456` | **Yes** — `--gateway-port` / `CCR_GATEWAY_PORT` |
 | `CertFile`, `KeyFile` | unset | **No** — PLANNED |
 | `EnableHTTP3` | `false` | **No** — PLANNED |
 | `UpstreamTimeout` | 10 minutes | **No** — PLANNED (also see the differing streaming/non-streaming semantics note in `docs/FAQ.md` Q18) |
+| `MaxAttempts` | 3 (1 initial try + 2 retries) | **No** — the retry loop itself is implemented (see "Known limitations" and the Feature table below) but its attempt budget has no flag/env/config surface yet |
+| `APIKeys` | empty (auth disabled) | **No** — `RequireAPIKey` is now mounted on `POST /v1/messages`, but nothing populates this list; see "Known limitations" |
 
 ## Feature table
 
 | Feature | Status | Where |
 |---|---|---|
-| Anthropic Messages request → OpenAI chat-completions translation | Implemented | `internal/translate/anthropic.go:182-295` |
-| System prompt (top-level → leading `system` message) | Implemented | `internal/translate/anthropic.go:199-209` |
-| Polymorphic content (string or block array) flattening | Implemented | `internal/translate/anthropic.go:146-161` |
-| `tool_use` → `message.tool_calls` (string-encoded arguments) | Implemented | `internal/translate/anthropic.go:230-238` |
-| `tool_result` → separate `role:"tool"` message | Implemented | `internal/translate/anthropic.go:239-259` |
-| Image content blocks | **Explicit error, not translated** | `internal/translate/anthropic.go:260-265` |
-| `cache_control` stripping at every JSON depth (number-literal-safe via `json.Number`) | Implemented | `internal/translate/anthropic.go:297-325` |
-| `stream_options.include_usage` injection | Implemented | `internal/translate/anthropic.go:195-197` |
-| Empty tool-parameter-schema backfill (`EnsureToolParameters`) | Implemented — always on in the live handler | `internal/translate/anthropic.go:282-293`, `internal/gateway/messages.go:200-204` |
+| Anthropic Messages request → OpenAI chat-completions translation | Implemented | `internal/translate/anthropic.go:338-473` |
+| System prompt (top-level → leading `system` message) | Implemented | `internal/translate/anthropic.go:355-365` |
+| Polymorphic content (string or block array) flattening | Implemented | `internal/translate/anthropic.go:167-180` |
+| `tool_use` → `message.tool_calls` (string-encoded arguments) | Implemented | `internal/translate/anthropic.go:392-400` |
+| `tool_result` → separate `role:"tool"` message | Implemented | `internal/translate/anthropic.go:291-335`, `401-408` |
+| Image content blocks (base64 or URL, incl. inside `tool_result`) → OpenAI `image_url` parts | Implemented | `internal/translate/anthropic.go:237-335`, `409-416` |
+| `cache_control` stripping at every JSON depth (number-literal-safe via `json.Number`) | Implemented | `internal/translate/anthropic.go:495-547` |
+| `stream_options.include_usage` injection | Implemented | `internal/translate/anthropic.go:351-353` |
+| Empty tool-parameter-schema backfill (`EnsureToolParameters`) | Implemented — always on in the live handler | `internal/translate/anthropic.go:441-464`, `internal/gateway/messages.go:231-234` |
 | Provider/model routing incl. haiku-tier background routing | Implemented, wired into the CLI-launched gateway via `WireDefaults` | `internal/router/router.go:40-63`, `internal/gateway/wiring.go:29-44` |
 | Upstream HTTP client, streaming-safe timeout, no-secret-leak errors | Implemented, wired into the CLI-launched gateway via `WireDefaults` | `internal/proxy/proxy.go:65-84`, `internal/gateway/wiring.go:46-71` |
-| HTTP/1.1, HTTP/2 | Implemented | `internal/gateway/gateway.go:135-168` |
-| HTTP/3 (QUIC), TLS-gated | Implemented (library); not yet exposed as a CLI flag | `internal/gateway/gateway.go:142-152` |
+| Retry loop on a failed upstream call (respects `Retryable`/`Terminal` classification and backoff) | Implemented and live | `internal/gateway/messages.go:294-383` (`doUpstreamWithRetry`), `internal/router/fallback.go` |
+| HTTP/1.1, HTTP/2 | Implemented | `internal/gateway/gateway.go:166-199` |
+| HTTP/3 (QUIC), TLS-gated | Implemented (library); not yet exposed as a CLI flag | `internal/gateway/gateway.go:173-183` |
 | brotli → gzip → identity content negotiation | Implemented | `internal/gateway/compress.go:39-81` |
-| `GET /health`, `GET /ready` | Implemented | `internal/gateway/gateway.go:105-127` |
-| `POST /v1/messages`: non-streaming request/response translation | Implemented | `internal/gateway/messages.go:178-244`, `322-382` |
-| `POST /v1/messages`: SSE streaming (OpenAI chunks → Anthropic events) | Implemented | `internal/gateway/messages.go:384-547` |
-| `POST /v1/messages`: upstream error → Anthropic error-shape mapping, preserving status code | Implemented | `internal/gateway/messages.go:258-318` |
+| `GET /health`, `GET /ready` | Implemented | `internal/gateway/gateway.go:129-151` |
+| `POST /v1/messages`: non-streaming request/response translation | Implemented | `internal/gateway/messages.go:189-271`, `482-542` |
+| `POST /v1/messages`: SSE streaming (OpenAI chunks → Anthropic events) | Implemented | `internal/gateway/messages.go:544-707` |
+| `POST /v1/messages`: upstream error → Anthropic error-shape mapping, preserving status code | Implemented | `internal/gateway/messages.go:422-478` |
+| `POST /v1/messages`: inbound API-key check (`RequireAPIKey`, route-scoped) | Mounted, but unconfigurable — accepted-key list is always empty | `internal/gateway/gateway.go:161`, `internal/gateway/auth.go` |
 | CLI (`start`/`ui`/`serve`/`web`/`stop`, pidfile service management) | Implemented | `cmd/ccr/*.go` |
 | Separate management control-plane server (own `/health`) | Implemented, deliberately minimal | `cmd/ccr/management.go` |
 | Structured logging | **PLANNED** | `internal/logging` (empty) |
+
+## Known limitations
+
+An honest, current accounting of what does not yet work the way you might expect, kept in sync with the code (see `docs/DOC-AUDIT.md` for how this list was derived and re-verified):
+
+- **Inbound gateway authentication has no operator-facing switch yet.** `gateway.RequireAPIKey` is mounted as route-scoped middleware on `POST /v1/messages` (`internal/gateway/gateway.go:161`) — `GET /health`/`GET /ready` are deliberately never gated, so liveness/readiness probing keeps working regardless of auth configuration. But `cmd/ccr` never populates `Options.APIKeys` — there is no `--api-key` flag, no `CCR_API_KEYS` environment variable, and no `config.json` field for it — so the accepted-key list is always empty, which `RequireAPIKey`'s own documented behaviour treats as "authentication disabled." **A CLI-launched gateway is therefore still unauthenticated by default today**, exactly as before; only the internal wiring changed. Anyone who can reach the gateway's port can send it requests billed to your configured provider keys. Mitigate by keeping the gateway on loopback (the default) or putting an authenticating reverse proxy in front — see `docs/ADMIN_MANUAL.md` §5.
+- **One upstream GAP deliberately unported: ambiguous bare-model resolution.** Upstream Node CCR's `ModelRegistry.resolve` treats every request's *bare* (non-prefixed) model id as a lookup key across **all** configured providers, and refuses to serve it if more than one provider lists that model. This router's `router.Select` does not do that search — a bare model id always resolves via `Router.default`/`Router.background` (or the haiku-tier check), never by scanning every provider's `Models` list. Closing this would mean bare-model requests could silently bypass `Router.default` whenever exactly one provider happens to list a matching model — a change to default routing behaviour this project's own backward-compatibility requirement rules out (see `internal/router/explicit_provider_selector_port_test.go`'s `TestModelRegistryAmbiguousBareModelRejection_GAP`). Explicit `"provider,model"`/`"provider/model"` selectors in the request body are unaffected by this and work today (see `docs/FAQ.md` Q10).
+- **`--gateway-host`/`--gateway-port` are not forwarded by `ccr start`/`ui`.** The flags exist and work with `ccr serve`/`web`; `start`/`ui` parse them but silently drop them when re-execing the detached `serve` child (`cmd/ccr/service.go:104-114`). Use the `CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT` environment variables instead if you need `start`/`ui`, since environment variables are inherited by the child process.
+- **`Router.think`/`Router.longContext`** are accepted and validated in `config.json` but not yet consulted by `router.Select` — **PLANNED**.
+- **Structured logging** (`internal/logging`) is an empty package — **PLANNED**.
+- **An authenticated, explicitly-configured outbound proxy** (`proxy.NewWithUpstreamProxy`) is implemented and tested but not wired into `WireDefaults`/`cmd/ccr`, and `config.json` has no `proxy` section to configure it from. (Automatic `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` support from the environment *is* live for every request.)
+- **The retry loop's attempt budget (`MaxAttempts`, default 3) has no CLI flag or config field.** The retry loop itself is implemented and live (see the Feature table above).
+
+Two of the four items originally tracked here — the fallback/retry classifiers not being driven by a retry loop, and vision/image content blocks returning an explicit error — were closed while this documentation pass was in progress; the retry loop and image-to-`image_url` conversion described throughout this README are the result.
 
 ## Documentation
 
@@ -192,6 +223,7 @@ The gateway's own transport knobs (TLS, HTTP/3, upstream timeout) exist as `inte
 - [`docs/FAQ.md`](docs/FAQ.md) — 20+ code-grounded Q&A.
 - [`docs/API.md`](docs/API.md) — endpoint reference, schemas, status codes, headers.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — component/data-flow diagrams (Mermaid).
+- [`docs/DOC-AUDIT.md`](docs/DOC-AUDIT.md) — the documentation-accuracy audit behind this pass: every claim checked against the code, with verdicts and evidence.
 - [`web/index.html`](web/index.html) — self-contained interactive micro-site (open directly from disk).
 
 ## Upstream attribution

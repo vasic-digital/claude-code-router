@@ -85,6 +85,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdServe(args[1:], stdout, stderr)
 	case "stop":
 		return cmdStop(args[1:], stdout, stderr)
+	case "config":
+		return cmdConfig(args[1:], stdout, stderr)
 	default:
 		// Unknown positionals are profile names/ids, per the grammar's last
 		// line. The real ccr prints this exact message and exits non-zero;
