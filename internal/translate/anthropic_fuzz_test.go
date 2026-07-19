@@ -1,6 +1,7 @@
 package translate
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -112,23 +113,25 @@ func FuzzAnthropicToOpenAI(f *testing.F) {
 //     can represent, the output is always valid JSON too.
 //  3. The substring "cache_control" never survives in the output.
 //
-// A REAL FUZZER FINDING narrowed invariant 2 to "encoding/json-representable"
-// rather than merely "RFC 8259 syntactically valid": the very first `go test
-// -fuzz=FuzzStripCacheControl` run found that the one-token body `1E700` is
-// syntactically valid JSON (json.Valid returns true) yet StripCacheControl
-// returns an error for it — "json: cannot unmarshal number 1E700 into Go
-// value of type float64" — because a bare top-level number whose magnitude
-// exceeds float64's range cannot be decoded into the `any` StripCacheControl
-// unmarshals into. This is not a panic and not data loss (the WHOLE request
-// is rejected, not silently truncated), but it is a genuine, if narrow,
-// robustness gap: StripCacheControl's `json.Unmarshal(raw, &v)` with `v any`
-// hard-fails on ANY numeric literal anywhere in the body that overflows
-// float64, even deep inside an unrelated field having nothing to do with
-// cache_control. A real Claude Code request is exceedingly unlikely to embed
-// such a literal, so this was left as-is rather than patched (translate.go
-// is outside this task's remit), but it is reproducible with the minimized
-// input `1E700` and is recorded as a permanent regression case in
-// testdata/fuzz/FuzzStripCacheControl/9e76694541809c1e.
+// A REAL FUZZER FINDING, since FIXED in the implementation.
+//
+// The first `go test -fuzz=FuzzStripCacheControl` run flagged the one-token
+// body `1E700`: syntactically valid JSON, yet StripCacheControl returned
+// "cannot unmarshal number 1E700 into Go value of type float64". The original
+// implementation decoded with json.Unmarshal into `any`, which turns every
+// number into a float64.
+//
+// Investigating showed the rejection was only the visible half. The same
+// float64 conversion also SILENTLY rounded 12345678901234567890 to
+// 12345678901234567000 — a proxy corrupting a value it was only ever meant to
+// forward, with no error at all. That was the more dangerous defect.
+//
+// StripCacheControl now decodes with json.Decoder + UseNumber(), so literals
+// survive verbatim. Both the probe and the output decode below use UseNumber
+// to match; probing with plain json.Unmarshal would re-pin the old lossy
+// behaviour as if it were the specification. numbers_test.go carries explicit
+// regression cases, and the minimized input is kept as a permanent corpus
+// entry at testdata/fuzz/FuzzStripCacheControl/9e76694541809c1e.
 func FuzzStripCacheControl(f *testing.F) {
 	seeds := []string{
 		`{"model":"m","system":[{"type":"text","text":"s","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}],"tools":[{"name":"t","cache_control":{"type":"ephemeral"}}]}`,
@@ -161,24 +164,36 @@ func FuzzStripCacheControl(f *testing.F) {
 		}()
 
 		raw := []byte(body)
-		// The real precondition for StripCacheControl to succeed is not mere
-		// RFC 8259 syntactic validity (json.Valid) but decodability into the
-		// generic `any` StripCacheControl itself unmarshals into — see the
-		// `1E700` finding documented above for exactly where those two
-		// notions diverge.
-		var probe any
-		wasDecodable := json.Unmarshal(raw, &probe) == nil
+		// The probe must mirror what StripCacheControl actually does — a
+		// json.Decoder with UseNumber() — not a plain json.Unmarshal.
+		//
+		// This originally probed with plain json.Unmarshal, which converts
+		// every JSON number to float64, and on that basis the fuzzer flagged
+		// "1E700" as a StripCacheControl bug. Investigation showed the
+		// opposite: float64 decoding WAS the defect. It rejected 1E700
+		// outright and, worse, silently rounded 12345678901234567890 to
+		// 12345678901234567000 — a proxy corrupting a value it only had to
+		// forward. StripCacheControl now uses UseNumber so literals survive
+		// verbatim (see numbers_test.go). Had this probe been left as-is, it
+		// would have pinned that lossy behaviour in place as the spec.
+		probeDecodable := func(b []byte) bool {
+			d := json.NewDecoder(bytes.NewReader(b))
+			d.UseNumber()
+			var probe any
+			return d.Decode(&probe) == nil
+		}
+		wasDecodable := probeDecodable(raw)
 
 		out, err := StripCacheControl(raw)
 		if err != nil {
 			// Non-decodable input -> error out is fine.
 			if wasDecodable {
-				t.Fatalf("StripCacheControl errored on encoding/json-decodable input %q: %v", body, err)
+				t.Fatalf("StripCacheControl errored on decodable input %q: %v", body, err)
 			}
 			return
 		}
 		if !wasDecodable {
-			t.Fatalf("StripCacheControl succeeded on input %q that encoding/json itself cannot decode into `any`; output: %q", body, out)
+			t.Fatalf("StripCacheControl succeeded on input %q that its own decoder cannot decode; output: %q", body, out)
 		}
 
 		// Invariant 2: decodable input implies valid JSON out.
@@ -194,8 +209,13 @@ func FuzzStripCacheControl(f *testing.F) {
 		// data, not a key, and must survive untouched. A substring check
 		// cannot tell the two apart and would flag that correct behaviour as
 		// a bug.
+		// UseNumber here too: the output legitimately contains literals such
+		// as 1E700 that a plain float64-based decode cannot represent, and
+		// preserving those verbatim is the point of the fix.
+		outDec := json.NewDecoder(bytes.NewReader(out))
+		outDec.UseNumber()
 		var decoded any
-		if err := json.Unmarshal(out, &decoded); err != nil {
+		if err := outDec.Decode(&decoded); err != nil {
 			t.Fatalf("decode stripped output for input %q: %v", body, err)
 		}
 		if path, found := findCacheControlKey(decoded, ""); found {

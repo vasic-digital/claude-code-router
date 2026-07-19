@@ -21,6 +21,7 @@
 package translate
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 )
@@ -299,9 +300,25 @@ func AnthropicToOpenAI(in *AnthropicRequest, opt Options) (*OpenAIRequest, error
 // cache_control can appear at several nesting levels (system blocks, message
 // content blocks, tool definitions), and an upstream that does not recognise
 // the field rejects the ENTIRE request — so none may be missed.
+// Decoding uses UseNumber() rather than a plain json.Unmarshal into `any`.
+// Plain unmarshalling converts every JSON number to float64, which has two
+// real consequences for a passthrough proxy:
+//
+//   - Any literal whose magnitude overflows float64 (found by fuzzing:
+//     "1E700") makes the WHOLE request fail with "cannot unmarshal number
+//     into Go value of type float64" — a request Claude Code sent in good
+//     faith would be rejected outright.
+//   - Worse because it is silent: a large integer id such as
+//     12345678901234567890 would be re-encoded as 1.2345678901234567e+19,
+//     corrupting a value we were only ever meant to pass through untouched.
+//
+// json.Number keeps the original literal verbatim, so this function now only
+// removes cache_control and changes nothing else about the document.
 func StripCacheControl(raw []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
 	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
+	if err := dec.Decode(&v); err != nil {
 		return nil, err
 	}
 	return json.Marshal(stripKey(v, "cache_control"))
