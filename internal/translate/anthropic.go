@@ -324,17 +324,44 @@ func StripCacheControl(raw []byte) ([]byte, error) {
 	return json.Marshal(stripKey(v, "cache_control"))
 }
 
+// stripKey removes every occurrence of key from the JSON tree, EXCEPT where
+// the key is user data rather than Anthropic metadata.
+//
+// The exception matters. A tool's input_schema is a JSON Schema, and inside
+// its "properties" object the map keys are property NAMES chosen by whoever
+// wrote the tool. A tool may legitimately declare a property called
+// "cache_control". Deleting blindly produced a self-contradictory schema:
+//
+//	"properties": {}                     <- the property was removed
+//	"required":   ["cache_control"]      <- but the requirement remained
+//
+// silently, with no error, corrupting a tool definition we only had to pass
+// through. Found by the challenges suite.
+//
+// inProperties tracks whether the current map is a JSON Schema "properties"
+// object. Its keys are skipped for deletion, but their VALUES are still
+// walked, so an Anthropic cache_control nested deeper inside a property's own
+// schema is still removed.
 func stripKey(v any, key string) any {
+	return stripKeyIn(v, key, false)
+}
+
+func stripKeyIn(v any, key string, inProperties bool) any {
 	switch t := v.(type) {
 	case map[string]any:
-		delete(t, key)
+		if !inProperties {
+			delete(t, key)
+		}
 		for k, sub := range t {
-			t[k] = stripKey(sub, key)
+			// A child map named "properties" is a JSON Schema property bag:
+			// its immediate keys are user-chosen names, not metadata.
+			t[k] = stripKeyIn(sub, key, k == "properties")
 		}
 		return t
 	case []any:
 		for i, sub := range t {
-			t[i] = stripKey(sub, key)
+			// Array elements are never property-name positions.
+			t[i] = stripKeyIn(sub, key, false)
 		}
 		return t
 	}
