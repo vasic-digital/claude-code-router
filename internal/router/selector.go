@@ -102,3 +102,55 @@ func containsString(list []string, s string) bool {
 	}
 	return false
 }
+
+// resolveBareModel searches every configured provider for one whose Models
+// list contains model verbatim. It is a LAST-RESORT resolution path: Select
+// calls it only when no Router route applies at all (neither Router.Default
+// nor, for a haiku request, Router.Background is set — see Select), so it can
+// never override an explicitly-configured route. Within that no-route window
+// it deliberately refuses to guess, porting the safe half of upstream's
+// ModelRegistry.resolve ambiguity rule (see
+// explicit_provider_selector_port_test.go):
+//
+//   - exactly one provider lists model  -> matched=true, that provider, no error.
+//     A bare model id served by a single provider resolves to it instead of the
+//     blind first-provider guess firstProviderFallback would otherwise make.
+//   - two or more providers list model   -> matched=true, a named ambiguity
+//     error. An ambiguous bare id must fail loudly, never resolve to whichever
+//     provider happens to be listed first — the exact "guessing" upstream
+//     forbids, and the billing/correctness hazard router.Select's doc comment
+//     already warns about for the wrong-account case.
+//   - no provider lists model            -> matched=false, no error, and Select
+//     falls through to its existing first-provider fallback unchanged.
+//
+// Crucially this runs only in the no-route branch, so a configured
+// Router.Default always wins over it: an ambiguous OR unambiguous bare model
+// under a set Default is resolved by Default and never reaches this function.
+func resolveBareModel(cfg *config.Config, model string) (p *config.Provider, matched bool, err error) {
+	if model == "" {
+		return nil, false, nil
+	}
+
+	var found []*config.Provider
+	for i := range cfg.Providers {
+		if containsString(cfg.Providers[i].Models, model) {
+			found = append(found, &cfg.Providers[i])
+		}
+	}
+
+	switch len(found) {
+	case 0:
+		return nil, false, nil
+	case 1:
+		return found[0], true, nil
+	default:
+		names := make([]string, 0, len(found))
+		for _, pr := range found {
+			names = append(names, pr.Name)
+		}
+		return nil, true, fmt.Errorf(
+			"router: bare model %q is ambiguous: served by %d providers (%s); "+
+				"pin one with an explicit \"provider/model\" selector or configure Router.Default",
+			model, len(found), strings.Join(names, ", "))
+	}
+}

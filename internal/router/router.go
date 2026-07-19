@@ -34,9 +34,15 @@ import (
 //     cfg.Router.Background when it is set.
 //  2. Otherwise, and whenever Background is unset, use cfg.Router.Default.
 //  3. If the resulting route string is empty (operator configured providers
-//     but never wrote a Router block), fall back to the first provider and
-//     the first model in its Models list, so a minimal single-provider
-//     config still works.
+//     but never wrote a Router block), and req names a bare model that
+//     EXACTLY ONE provider lists, route to that provider (resolveBareModel).
+//     This is a last-resort resolution that runs ONLY in the no-route window,
+//     so a configured Router.Default always wins over it; a bare model served
+//     by two or more providers is a loud ambiguity error, never a silent
+//     arbitrary pick.
+//  4. If still unresolved (no route and no unambiguous bare match), fall back
+//     to the first provider and the first model in its Models list, so a
+//     minimal single-provider config still works.
 //
 // Every failure to resolve a concrete provider is returned as an error
 // rather than silently picking something arbitrary — routing a request to
@@ -64,6 +70,18 @@ func Select(cfg *config.Config, req *translate.AnthropicRequest) (*config.Provid
 	}
 
 	if route == "" {
+		// No route configured at all. Before the blind first-provider
+		// fallback, try to honour a bare model that unambiguously names a
+		// single provider. This never overrides Router.Default (we only reach
+		// here when Default — and, for haiku, Background — is empty); an
+		// ambiguous bare model fails loudly rather than being guessed.
+		if req != nil {
+			if p, matched, err := resolveBareModel(cfg, req.Model); err != nil {
+				return nil, "", err
+			} else if matched {
+				return p, req.Model, nil
+			}
+		}
 		return firstProviderFallback(cfg)
 	}
 

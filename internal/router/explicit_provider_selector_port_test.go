@@ -37,20 +37,33 @@ package router
 // silently falling back to Default (which would route to an upstream the
 // caller never asked for).
 //
-// GAP REMAINS OPEN (TestModelRegistryAmbiguousBareModelRejection_GAP
-// below): upstream's ModelRegistry.resolve treats EVERY request's bare
-// (non-prefixed) model id as a lookup key across ALL configured providers,
-// erroring when more than one provider lists it. Porting that would mean
-// router.Select no longer only ever resolving a bare, non-haiku model via
-// Router.Default — it would first have to search every provider's Models
-// list on every request, and (for the common case where exactly one
-// provider happens to list a match) route directly to that provider,
-// bypassing Default entirely. That is a strictly larger behaviour change
-// than "detect an explicit selector": it changes what "default routing"
-// means for ordinary Claude Code requests, which this port's own
-// requirement — "existing Select() behaviour (haiku->background, default,
-// first-provider fallback) must not change" — rules out. See that test for
-// the full reasoning.
+// GAP CLOSED SAFELY (was TestModelRegistryAmbiguousBareModelRejection_GAP;
+// now the real tests TestSelectResolvesUnambiguousBareModelWhenNoDefault,
+// TestSelectRejectsAmbiguousBareModelWhenNoDefault,
+// TestSelectDefaultWinsOverBareModelResolution and
+// TestSelectExplicitSelectorDisambiguatesAndWins below): upstream's
+// ModelRegistry.resolve treats EVERY request's bare (non-prefixed) model id
+// as a lookup key across ALL configured providers, erroring when more than
+// one provider lists it. A FAITHFUL port would search every provider's
+// Models list on every request and, for an unambiguous match, route directly
+// to that provider — bypassing Router.Default even when the operator set one.
+// That would change "default routing" for ordinary Claude Code requests and
+// is exactly the silent-Default-bypass this port must not introduce.
+//
+// So the ambiguity rule is ported as a SUBORDINATE resolution path instead of
+// a supreme one (see selector.go's resolveBareModel, wired into router.Select
+// rule 3): bare-model lookup runs ONLY in the no-route window — when neither
+// Router.Default nor (for haiku) Router.Background is set, i.e. exactly where
+// Select previously did a blind first-provider guess. There it (a) resolves a
+// bare model that EXACTLY ONE provider lists to that provider, and (b) refuses
+// an ambiguous bare model with a loud named error rather than guessing —
+// upstream's core safety property. A configured Router.Default always wins
+// over both, so "default routing" for real Claude Code traffic is unchanged
+// and no request can silently bypass an explicit Default. The unambiguous
+// pass is a strict improvement on the old blind first-model fallback for the
+// no-route case (it now honours the provider that actually serves the model);
+// the terminal first-provider fallback is preserved for the no-match case.
+// (upstream: test/unit/gateway/routing-architecture.test.mjs)
 
 import (
 	"strings"
@@ -186,36 +199,144 @@ func TestSelectBareModelStillUsesDefaultRouting(t *testing.T) {
 	}
 }
 
-// TestModelRegistryAmbiguousBareModelRejection_GAP documents the sibling
-// upstream assertion that a bare model name present under more than one
-// provider must be refused rather than silently resolved to whichever
-// provider happens to be listed first.
-//
-// This GAP remains open. Closing TestSelectIgnoresExplicitProviderModelSelector_GAP
-// (see TestSelectHonoursExplicitProviderModelSelector above) only taught
-// Select to recognise EXPLICIT "Provider/model" / "Provider,model"
-// selectors — a new, additive code path that a bare model id never enters.
-// Porting upstream's ambiguity check faithfully would require Select to
-// search every provider's Models list for a plain, non-prefixed model on
-// EVERY request (not just when an explicit selector is present), and, for
-// the unambiguous case, route directly to whichever single provider
-// matched — bypassing Router.Default even when the caller never asked for
-// that. That would change "default" routing for ordinary Claude Code
-// requests (whose model ids sometimes coincide with a configured Models
-// entry purely by chance), which conflicts directly with this task's
-// explicit backward-compatibility requirement: "existing Select() behaviour
-// (haiku->background, default, first-provider fallback) must not change."
-// Implementing it correctly and safely — e.g. behind an opt-in config flag
-// — is a config.Config surface change outside internal/router/, which this
-// task is scoped not to touch. (upstream: test/unit/gateway/routing-architecture.test.mjs)
-func TestModelRegistryAmbiguousBareModelRejection_GAP(t *testing.T) {
-	t.Skip("GAP: closing this would require router.Select to search every " +
-		"provider's Models list for a bare (non-prefixed) model on EVERY " +
-		"request and route directly to an unambiguous single match, bypassing " +
-		"Router.Default — a change to \"default\" routing behaviour this task's " +
-		"backward-compatibility requirement explicitly rules out. The additive " +
-		"explicit-selector path (TestSelectHonoursExplicitProviderModelSelector) " +
-		"does not touch bare models at all, so this remains genuinely unresolved " +
-		"within internal/router/'s existing Select surface. (upstream: " +
-		"test/unit/gateway/routing-architecture.test.mjs)")
+// bareModelCfg is the fixture for bare-model resolution: two providers that
+// share a common "shared" model and each own one unique model, with NO
+// Router.Default. The absence of a Default is the whole point — bare-model
+// resolution runs only in that no-route window (see resolveBareModel), so
+// these tests exercise the resolution path itself; the sibling
+// TestSelectDefaultWinsOverBareModelResolution proves a set Default preempts
+// it. Primary's first model is "alpha" so the terminal first-provider
+// fallback (first provider, first model) is unambiguous in assertions.
+func bareModelCfg() *config.Config {
+	return &config.Config{
+		Providers: []config.Provider{
+			{Name: "Primary", APIBaseURL: "https://primary/x", Models: []string{"alpha", "shared"}},
+			{Name: "Secondary", APIBaseURL: "https://secondary/x", Models: []string{"beta", "shared"}},
+		},
+		// Router intentionally left zero-valued (no Default, no Background).
+	}
+}
+
+// TestSelectResolvesUnambiguousBareModelWhenNoDefault ports the upstream
+// "canonicalizes a bare model to its single owning provider" assertion,
+// scoped to the no-route window: with no Router.Default configured, a bare
+// model that exactly one provider serves resolves to that provider, and a
+// bare model no provider serves falls through to the pre-existing
+// first-provider fallback unchanged.
+func TestSelectResolvesUnambiguousBareModelWhenNoDefault(t *testing.T) {
+	cases := []struct {
+		name     string
+		model    string
+		wantProv string
+		wantMod  string
+	}{
+		{"bare model unique to Primary resolves to Primary", "alpha", "Primary", "alpha"},
+		{"bare model unique to Secondary resolves to Secondary", "beta", "Secondary", "beta"},
+		// No provider lists this ordinary Claude Code id: the terminal
+		// first-provider fallback (first provider, first model) still applies,
+		// proving bare resolution is additive, not a replacement.
+		{"unmatched bare model falls back to first provider+model", "claude-3-7-sonnet-20250219", "Primary", "alpha"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := bareModelCfg()
+			got, gotModel, err := Select(cfg, &translate.AnthropicRequest{Model: tc.model})
+			if err != nil {
+				t.Fatalf("Select(%q): %v", tc.model, err)
+			}
+			if got.Name != tc.wantProv || gotModel != tc.wantMod {
+				t.Fatalf("Select(%q) = (%q,%q), want (%q,%q)", tc.model, got.Name, gotModel, tc.wantProv, tc.wantMod)
+			}
+		})
+	}
+}
+
+// TestSelectRejectsAmbiguousBareModelWhenNoDefault is the direct port of
+// upstream's core safety assertion: a bare model present under more than one
+// provider must be REFUSED, not silently resolved to whichever provider is
+// listed first. Here "shared" is served by both providers and no Default is
+// set, so Select must return a loud, named ambiguity error — the exact
+// "silent arbitrary pick" this whole gap exists to forbid.
+func TestSelectRejectsAmbiguousBareModelWhenNoDefault(t *testing.T) {
+	cfg := bareModelCfg()
+	got, gotModel, err := Select(cfg, &translate.AnthropicRequest{Model: "shared"})
+	if err == nil {
+		t.Fatalf("Select(%q) = (%q,%q), want an ambiguity error; a silent arbitrary pick is exactly what must not happen",
+			"shared", got.Name, gotModel)
+	}
+	for _, want := range []string{"Primary", "Secondary", "shared"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("ambiguity error should mention %q, got: %v", want, err)
+		}
+	}
+}
+
+// TestSelectDefaultWinsOverBareModelResolution is the load-bearing safety
+// test for the way this gap was closed: bare-model resolution must NEVER
+// override an explicitly-configured Router.Default. With Default pinned to
+// "Primary,alpha", every bare model — ambiguous, unambiguous, or unmatched —
+// must resolve to Default, never erroring and never picking a provider bare
+// resolution alone would have chosen.
+func TestSelectDefaultWinsOverBareModelResolution(t *testing.T) {
+	cases := []struct {
+		name  string
+		model string
+	}{
+		// "shared" is ambiguous across providers; WITHOUT a Default it errors
+		// (previous test). WITH a Default it must resolve to Default instead —
+		// "fall through to Default", never an arbitrary pick, never an error.
+		{"ambiguous bare model yields to Default", "shared"},
+		// "beta" is UNAMBIGUOUS (only Secondary lists it); bare resolution
+		// alone would route to Secondary. Default must still win — the
+		// strongest proof bare resolution never bypasses a configured Default.
+		{"unambiguous bare model still yields to Default", "beta"},
+		// An ordinary id no provider lists: Default wins as it always has.
+		{"unmatched bare model yields to Default", "claude-3-7-sonnet-20250219"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := explicitSelectorCfg() // Router.Default = "Primary,alpha"
+			got, gotModel, err := Select(cfg, &translate.AnthropicRequest{Model: tc.model})
+			if err != nil {
+				t.Fatalf("Select(%q): %v", tc.model, err)
+			}
+			if got.Name != "Primary" || gotModel != "alpha" {
+				t.Fatalf("Select(%q) = (%q,%q), want (Primary,alpha) via Router.Default; Default must win over bare-model resolution",
+					tc.model, got.Name, gotModel)
+			}
+		})
+	}
+}
+
+// TestSelectExplicitSelectorDisambiguatesAndWins proves the explicit
+// "provider/model" / "provider,model" selector remains the top-precedence
+// path: it disambiguates a model that a BARE lookup would reject as
+// ambiguous, and it still wins over a configured Router.Default.
+func TestSelectExplicitSelectorDisambiguatesAndWins(t *testing.T) {
+	cases := []struct {
+		name     string
+		cfg      *config.Config
+		model    string
+		wantProv string
+		wantMod  string
+	}{
+		// A bare "shared" is an ambiguity error (no Default); an explicit
+		// selector for the same model pins one provider deterministically.
+		{"slash selector disambiguates shared (no Default)", bareModelCfg(), "Secondary/shared", "Secondary", "shared"},
+		{"comma selector disambiguates shared (no Default)", bareModelCfg(), "Primary,shared", "Primary", "shared"},
+		// An explicit selector still overrides a configured Default (the
+		// sibling gap this file already closed, re-pinned here in-table).
+		{"explicit selector beats Default", explicitSelectorCfg(), "Secondary/beta", "Secondary", "beta"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gotModel, err := Select(tc.cfg, &translate.AnthropicRequest{Model: tc.model})
+			if err != nil {
+				t.Fatalf("Select(%q): %v", tc.model, err)
+			}
+			if got.Name != tc.wantProv || gotModel != tc.wantMod {
+				t.Fatalf("Select(%q) = (%q,%q), want (%q,%q)", tc.model, got.Name, gotModel, tc.wantProv, tc.wantMod)
+			}
+		})
+	}
 }
