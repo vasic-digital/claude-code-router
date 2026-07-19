@@ -281,6 +281,25 @@ func AnthropicToOpenAI(in *AnthropicRequest, opt Options) (*OpenAIRequest, error
 
 	for _, t := range in.Tools {
 		params := t.InputSchema
+		// CleanCache must be applied HERE, not only to the typed fields.
+		//
+		// Text and system blocks lose cache_control automatically, because
+		// they are decoded into typed structs that simply have no such field.
+		// A tool's input_schema is different: it is json.RawMessage and is
+		// forwarded VERBATIM, so any cache_control inside it travelled all the
+		// way to the upstream. The transformer was therefore a no-op, and
+		// providers that reject unknown fields rejected the whole request —
+		// precisely the failure cleancache exists to prevent.
+		//
+		// StripCacheControl is schema-aware: it will not delete a schema
+		// property legitimately NAMED cache_control (see stripKey).
+		if opt.CleanCache && len(params) > 0 {
+			if cleaned, err := StripCacheControl(params); err == nil {
+				params = cleaned
+			}
+			// On error the original schema is kept: a tool definition we
+			// cannot re-encode is better sent as-is than dropped.
+		}
 		if opt.EnsureToolParameters && len(params) == 0 {
 			params = json.RawMessage(`{"type":"object","properties":{}}`)
 		}
