@@ -32,7 +32,12 @@ A clean-room Go reimplementation of [`@musistudio/claude-code-router`](https://g
 | Separate management HTTP control-plane server (`--host`/`--port`, default `127.0.0.1:3458`) | `cmd/ccr` | **Implemented**, deliberately minimal (own `/health`, a placeholder `/` page) — see `docs/ADMIN_MANUAL.md` |
 | Structured logging | `internal/logging` | **PLANNED** — directory exists, empty |
 | `Router.think` / `Router.longContext` routing behaviour | `internal/router` | Config fields exist and validate (`internal/config/config.go:65-70`, `139-153`); `internal/router.Select` does not branch on them (`internal/router/router.go:40-63`) — **PLANNED** |
-| Explicit per-request provider/model selector, retry/fallback on failure, corporate outbound proxy, inbound gateway authentication, multi-protocol (OpenAI Responses/Gemini) support | — | **Out of scope by design**, not merely unimplemented — see `test/PORTING-MATRIX.md` and `docs/FAQ.md` |
+| Explicit per-request provider/model selector (`"provider,model"`/`"provider/model"` in the request `model` field) | `internal/router` | **Implemented**, live in `router.Select` |
+| Environment-variable outbound proxy (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) | `internal/proxy` | **Implemented**, live for every `proxy.Client` |
+| Authenticated custom outbound proxy | `internal/proxy` | Implemented as a library function (`proxy.NewWithUpstreamProxy`) — **not wired** into `WireDefaults`/CLI, no `config.json` section for it |
+| Retry/fallback on a failed upstream call | `internal/router` | Classification/backoff policy implemented and tested (`internal/router/fallback.go`) — **no caller drives an actual retry loop yet** |
+| Inbound gateway authentication | `internal/gateway` | Implemented as an opt-in library function (`gateway.RequireAPIKey`) — **not installed** on any route by default |
+| Multi-protocol (OpenAI Responses/Gemini) support, ToolHub/MCP, billing, rules DSL, hosted web search | — | **Out of scope by design**, not merely unimplemented — see `test/PORTING-MATRIX.md` and `docs/FAQ.md` |
 
 `internal/gateway/messages.go` deliberately does **not** import `internal/router` or `internal/proxy` directly — it defines its own narrow `Router`/`Upstream` interfaces with minimal in-package default implementations, so the gateway package compiles and serves correctly standalone (`internal/gateway/messages.go:19-27`). A **separate** file, `internal/gateway/wiring.go`, adapts the real `internal/router.Select` and `internal/proxy.Client` onto those same interfaces and exposes `Server.WireDefaults(timeout)` to install them. **`cmd/ccr` calls `WireDefaults` on every gateway it starts** (`cmd/ccr/serve.go:44-51`) — so a gateway launched via `ccr start`/`ui`/`serve` gets the full haiku-tier-aware routing and streaming-safe upstream client, not the minimal built-ins. The minimal built-ins only matter if you construct `gateway.New` directly as a library, without also calling `WireDefaults` — see `docs/ARCHITECTURE.md` for the full picture.
 
@@ -43,11 +48,13 @@ Build the `ccr` binary from source (no published release yet, so `go install ...
 ```bash
 git clone https://github.com/vasic-digital/claude-code-router.git
 cd claude-code-router
-go build -o bin/ccr ./cmd/ccr
-go test ./...
+make build      # or: go build -o bin/ccr ./cmd/ccr
+make test        # or: go test ./...
 ```
 
-`.gitignore` reserves `/bin/` and `/dist/` for build output (`.gitignore:1-2`), matching the `go build -o bin/ccr` convention above.
+A `Makefile` at the repository root wraps the common local workflows — `make help` lists them all (build, test, test-race, fuzz, bench, lint, cover, cross-compile, install, clean). There is deliberately no hosted CI/CD in this repository; every target is meant to be run locally or from a git hook (`Makefile:1-21`). `.gitignore` reserves `/bin/` and `/dist/` for build output (`.gitignore:1-2`), matching `make build`'s and `make cross-compile`'s output locations.
+
+A multi-stage `Dockerfile` also ships at the repository root — see `docs/ADMIN_MANUAL.md` §1.2 for build/run instructions and its important loopback-binding caveat.
 
 ## Quick start
 

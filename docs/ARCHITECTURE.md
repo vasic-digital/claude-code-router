@@ -251,7 +251,17 @@ This is a deliberate seam, not an oversight, and worth calling out architectural
 
 ## Explicitly out of scope (not merely unimplemented)
 
-`test/PORTING-MATRIX.md` — produced by porting the *behavioural intent* of the upstream Node router's own test suites into this Go module — draws a hard line between "missing but wanted" (**GAP**, tracked by a skipped Go test) and "an entire upstream subsystem this router never intended to replicate" (**N/A**). The N/A list is architecturally significant: no Electron-style core/gateway process split, no billing telemetry, no ToolHub/MCP runtime, no OAuth provider-plugin auth, no router rules DSL / `ModelRegistry` / `RoutePolicyEngine`, no "Fusion" vendor-specific routing, no hosted web-search bridging, and no protocols beyond Anthropic Messages → OpenAI chat-completions (no OpenAI Responses, no Gemini). The tracked GAPs that *are* in scope but not yet built: explicit per-request provider/model selectors, retry/fallback on a failed upstream call, corporate outbound-proxy support, inbound gateway authentication, and a provider protocol/type field (every configured provider is currently treated as OpenAI-chat-completions-shaped, unconditionally). See `docs/FAQ.md` Q28/Q29 for the operator-facing version of this.
+`test/PORTING-MATRIX.md` — produced by porting the *behavioural intent* of the upstream Node router's own test suites into this Go module — draws a hard line between "missing but wanted" (**GAP**, tracked by a Go test) and "an entire upstream subsystem this router never intended to replicate" (**N/A**). The N/A list is architecturally significant and unchanged: no Electron-style core/gateway process split, no billing telemetry, no ToolHub/MCP runtime, no OAuth provider-plugin auth, no router rules DSL / `ModelRegistry` / `RoutePolicyEngine`, no "Fusion" vendor-specific routing, no hosted web-search bridging, and no protocols beyond Anthropic Messages → OpenAI chat-completions (no OpenAI Responses, no Gemini).
+
+Several GAPs the matrix file originally tracked as missing have since landed, at least partially — the file's own prose predates this and is stale on these specific rows; trust the code:
+
+- **Explicit per-request provider/model selector** — landed and **live**: `router.Select` resolves a `"provider,model"`/`"provider/model"`-shaped request `model` field before any other routing rule (`internal/router/selector.go`, `internal/router/router.go:26-30`, `50-58`).
+- **Corporate/authenticated outbound proxy** — landed, **partially wired**: environment-variable proxying (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) is automatic for every `proxy.Client` (`internal/proxy/upstream_proxy.go`); an authenticated custom proxy (`proxy.NewWithUpstreamProxy`) is implemented and tested but not wired into `WireDefaults`, and `config.json` has no `proxy` section to configure it from.
+- **Retry/fallback on a failed upstream call** — the classification/backoff *policy* is implemented and tested (`internal/router/fallback.go`: `ClassifyStatus`, `ClassifyTransportError`, `BuildExecutionPlan`, `NextFallbackProvider`, `FallbackRetryDelayAfterStatus`/`...AfterNetworkError`), but nothing calls these to actually drive a multi-attempt retry loop yet — a failed upstream call still just fails once.
+- **Inbound gateway authentication** — `gateway.RequireAPIKey(keys []string)` is implemented and tested (`internal/gateway/auth.go`) but is an opt-in `gin.HandlerFunc` factory that neither `gateway.go`'s route table nor `cmd/ccr` installs anywhere — the CLI-launched gateway remains unauthenticated by default.
+- **Provider protocol/type field** — still genuinely unimplemented: every configured provider is treated as OpenAI-chat-completions-shaped, unconditionally.
+
+See `docs/FAQ.md` Q10, Q28, Q29 for the operator-facing version of this.
 
 ## Summary: implemented vs. planned
 
@@ -269,5 +279,10 @@ This is a deliberate seam, not an oversight, and worth calling out architectural
 | Same, for `internal/gateway` used as a **library** without calling `WireDefaults` | Falls back to minimal built-ins — a real, permanent seam, not a gap to be closed |
 | `Router.think` / `Router.longContext` routing behaviour | PLANNED (config accepts and validates the fields; nothing consumes them) |
 | Structured logging (`internal/logging`) | PLANNED (empty directory) |
-| Explicit provider/model selector, retry/fallback, corporate outbound proxy, inbound auth, provider protocol/type field | GAP — tracked in `test/PORTING-MATRIX.md`, in scope but not built |
+| Explicit per-request provider/model selector (`"provider,model"`/`"provider/model"` in the request `model` field) | Implemented and live (`internal/router/selector.go`, wired into `router.Select`) |
+| Environment-variable outbound proxy (`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`) | Implemented and live for every `proxy.Client` (`internal/proxy/upstream_proxy.go`) |
+| Authenticated custom outbound proxy | Implemented as a library function (`proxy.NewWithUpstreamProxy`); not wired into `WireDefaults`; no `config.json` section to configure it |
+| Retry/fallback classification policy (which failures to retry, backoff schedule, execution planning) | Implemented and tested (`internal/router/fallback.go`); nothing calls it to drive an actual retry loop yet |
+| Inbound gateway authentication | Implemented as an opt-in library function (`gateway.RequireAPIKey`); not installed on any route by `gateway.go` or `cmd/ccr` — unauthenticated by default |
+| Provider protocol/type field (every provider currently treated as OpenAI-chat-completions-shaped) | GAP — not built |
 | Multi-protocol (OpenAI Responses, Gemini), ToolHub/MCP, billing, rules DSL, hosted web search, Electron core/gateway split | **N/A — out of scope by design**, not merely unimplemented |

@@ -1,0 +1,25 @@
+# Keep the build context small and avoid leaking local/dev-only files into
+# the image or the build cache. Dockerfile only COPYs go.mod, go.sum, cmd/,
+# internal/ explicitly, so most of this is belt-and-braces for `docker build`
+# context upload time rather than anything that would otherwise land in a
+# layer.
+.git/
+.gitignore
+
+# Build/test output (also gitignored — see .gitignore).
+/bin/
+/dist/
+*.test
+coverage.out
+
+# Not needed to build the ccr binary; excluding keeps context upload fast.
+test/
+docs/
+web/
+*.md
+
+# Local editor/OS cruft.
+.idea/
+.vscode/
+*.swp
+.DS_Store

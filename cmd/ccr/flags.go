@@ -15,6 +15,9 @@ type commonFlags struct {
 	// GatewayPort is the Anthropic-compatible endpoint's port, separate from
 	// Port (the management interface).
 	GatewayPort int
+	// GatewayHost is the gateway's bind address, separate from Host (the
+	// management interface). Defaults to 127.0.0.1.
+	GatewayHost string
 }
 
 // defaultManagementHost/Port match the Node implementation's management
@@ -32,6 +35,12 @@ const (
 	// the gateway could not bind, yet `serve` still reported success — the
 	// failure only surfaced later as connection-refused from Claude Code.
 	defaultGatewayPort = 3456
+	// defaultGatewayHost keeps the gateway loopback-only by default. It holds
+	// live provider API keys, so binding it to every interface must be a
+	// deliberate act, never the default. Override with --gateway-host or
+	// CCR_GATEWAY_HOST — required inside a container, where 127.0.0.1 is the
+	// container's own loopback and a published port can never reach it.
+	defaultGatewayHost = "127.0.0.1"
 )
 
 // parseCommonFlags parses the flags shared by start/ui/serve/web out of args,
@@ -45,6 +54,7 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 		Open:        defaultOpen,
 		Gateway:     defaultGateway,
 		GatewayPort: defaultGatewayPort,
+		GatewayHost: defaultGatewayHost,
 	}
 	if h := os.Getenv("CCR_WEB_HOST"); h != "" {
 		f.Host = h
@@ -57,6 +67,9 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 		f.Port = port
 	}
 
+	if h := os.Getenv("CCR_GATEWAY_HOST"); h != "" {
+		f.GatewayHost = h
+	}
 	if p := os.Getenv("CCR_GATEWAY_PORT"); p != "" {
 		port, err := strconv.Atoi(p)
 		if err != nil {
@@ -68,6 +81,12 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--gateway-host":
+			i++
+			if i >= len(args) {
+				return f, nil, fmt.Errorf("--gateway-host requires a value")
+			}
+			f.GatewayHost = args[i]
 		case "--gateway-port":
 			i++
 			if i >= len(args) {

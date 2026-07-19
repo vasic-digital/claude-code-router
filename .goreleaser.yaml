@@ -1,0 +1,93 @@
+# .goreleaser.yaml — claude-code-router (Go)
+#
+# Local-only artifact builder: produces cross-compiled `ccr` binaries,
+# archives, and a checksums file under dist/. `release.disable: true` below
+# is deliberate — this repo has no CI/CD (see docs/RELEASE.md "No-CI
+# constraint") and two independent git remotes (GitHub + GitLab), so
+# goreleaser's own single-host publish step is not used. Publishing is a
+# separate, explicit step with `gh release create` / `glab release create`
+# uploading the artifacts goreleaser built — see docs/RELEASE.md.
+#
+# Usage (build only, never publishes anything):
+#   goreleaser check                          # validate this file
+#   goreleaser build --snapshot --clean       # build dist/ without a tag
+#   goreleaser release --snapshot --clean     # full local dry run (archives
+#                                              # + checksums, still no publish)
+#   goreleaser release --clean                # same, using the real git tag
+#                                              # (still no publish: see below)
+#
+# Requires a real annotated tag (see docs/RELEASE.md "Version scheme") for
+# any non---snapshot invocation; --snapshot is what CI-less local builds and
+# this task's own verification used, since no tag has been cut yet.
+version: 2
+
+project_name: claude-code-router
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: ccr
+    main: ./cmd/ccr
+    binary: ccr
+    env:
+      # Static binary: no libc dependency, matches the Dockerfile's
+      # distroless/scratch-compatible build and the Makefile's cross-compile
+      # target.
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      # cmd/ccr/main.go does not expose a version symbol to inject via -X
+      # (verified against the source — see docs/RELEASE.md); -s -w still
+      # strips debug info for smaller release binaries.
+      - -s -w
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: ccr-archive
+    ids:
+      - ccr
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - NOTICE
+      - LICENSE-UPSTREAM-MIT
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# No compressed-binary snapshot naming surprises: keep the snapshot build's
+# version string obviously non-release (goreleaser's default already does
+# this via the git-describe distance suffix; spelled out here so
+# `goreleaser build --snapshot` output is self-explanatory in docs/RELEASE.md
+# examples).
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  # CHANGELOG.md is hand-maintained in Keep-a-Changelog format (see that
+  # file and docs/RELEASE.md); goreleaser's own commit-log changelog feature
+  # is switched off so it never overwrites or duplicates that curated file.
+  disable: true
+
+release:
+  # No goreleaser-native publish step — see the file header. Artifacts are
+  # built here, then uploaded to both GitHub and GitLab explicitly via
+  # `gh release create` / `glab release create` (docs/RELEASE.md "Cutting a
+  # release"). This also sidesteps goreleaser's single-SCM assumption, which
+  # doesn't cleanly fit this repo's two independent remotes.
+  disable: true

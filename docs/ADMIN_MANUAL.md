@@ -50,33 +50,29 @@ systemctl status claude-code-router
 
 ### 1.2 Docker
 
-```dockerfile
-# syntax=docker/dockerfile:1
-FROM golang:1.26 AS build
-WORKDIR /src
-COPY . .
-RUN go build -o /out/ccr ./cmd/ccr
-
-FROM gcr.io/distroless/base-debian12
-COPY --from=build /out/ccr /usr/local/bin/ccr
-USER nonroot:nonroot
-EXPOSE 3456 3458
-ENTRYPOINT ["/usr/local/bin/ccr", "serve", "--host", "0.0.0.0", "--port", "3458"]
-```
+A real, multi-stage `Dockerfile` ships at the repository root — this is not a hypothetical example. It builds a static `ccr` binary (`CGO_ENABLED=0`, `-trimpath`, stripped) on `golang:1.26-bookworm`, then copies it into `gcr.io/distroless/static-debian12:nonroot` (no shell, runs as the built-in `65532:65532` non-root user, ships the CA bundle `ccr` needs for outbound HTTPS calls to providers) alongside a static `busybox` applet used only to give the shell-less final image a `wget` for `HEALTHCHECK` (`Dockerfile:35-118`).
 
 ```bash
-docker build -t claude-code-router .
-docker run -d --name ccr \
-  -p 127.0.0.1:3456:3456 \
-  -p 127.0.0.1:3458:3458 \
-  -v "$HOME/.claude-code-router:/home/nonroot/.claude-code-router" \
-  claude-code-router
+docker build -t claude-code-router:local .
+docker run --rm -p 3458:3458 \
+  -v ccr-config:/home/nonroot/.claude-code-router \
+  claude-code-router:local
 ```
 
+The image's own comment block (`Dockerfile:16-33`) documents the same loopback constraint called out in §1's intro, in more detail, and is worth reading in full before you publish `-p 3456:3456` expecting it to work:
+
+- The gateway is hard-bound to `127.0.0.1:3456` by `cmd/ccr` today — `-p 3456:3456` does **not** make it reachable from outside the container, because nothing inside the container listens on a non-loopback interface on that port.
+- The in-container `HEALTHCHECK` still works correctly regardless, since it runs inside the container's own network namespace, where `127.0.0.1` *is* the gateway.
+- The management server (3458) **does** honour `--host`/`CCR_WEB_HOST`, so `-e CCR_WEB_HOST=0.0.0.0 -p 3458:3458` exposes its `/health` and placeholder UI page externally today.
+- Use `--network host` (Linux) if you need the gateway itself reachable from outside the container before a `--host` flag for it lands.
+
+The `ENTRYPOINT`/`CMD` run `ccr serve --host 0.0.0.0` (foreground, matching §1's "use `serve`, not `start`, under a supervisor" guidance) — `Dockerfile:114-118`. `EXPOSE 3456 3458` and `VOLUME ["/home/nonroot/.claude-code-router"]` are declared for documentation/tooling purposes; actual port publishing and volume mounting still need explicit `-p`/`-v` flags at `docker run` time, as above.
+
 Notes:
-- `--host 0.0.0.0` above is required inside the container so the **management** interface is reachable from the host's port mapping (a container's loopback is not the host's loopback) — the gateway itself always binds `127.0.0.1:3456` regardless of `--host`/`--port` (those flags only affect the management server; see `docs/USER_GUIDE.md` §4). Publish both container ports only to `127.0.0.1` on the host unless you specifically intend to expose them beyond localhost — see §5.
-- The config volume is mounted **read-write** here (not read-only): `cmd/ccr` writes `service.json`/`service.log` into the same `config.Dir()` (`cmd/ccr/service.go:26-27`), even though `config.json` itself is only ever read (`internal/config/config.go:102-118`). If you want a hard read-only guarantee on `config.json` specifically, mount it as an individual read-only file bind-mount instead of the whole directory.
+- Publish container ports only to `127.0.0.1` on the host unless you specifically intend to expose them beyond localhost — see §5.
+- The config volume is mounted **read-write**: `cmd/ccr` writes `service.json`/`service.log` into the same `config.Dir()` (`cmd/ccr/service.go:26-27`), even though `config.json` itself is only ever read (`internal/config/config.go:102-118`). If you want a hard read-only guarantee on `config.json` specifically, mount it as an individual read-only file bind-mount instead of the whole volume.
 - `POST /v1/messages` reads provider API keys from `config.json` at request time and sends them upstream as `Authorization: Bearer <key>` (`internal/gateway/messages.go:73-76`) — see §6 on key handling before deciding whether the config volume, a secrets manager injecting the file, or an alternative mechanism fits your threat model.
+- A `Makefile` also ships at the repository root with local build/test/release targets (`make build`, `make test`, `make cross-compile`, `make install`, etc. — run `make help` for the full list); it explicitly documents that there is no hosted CI/CD in this repository by design, so every target is meant to be run by a human or a local git hook (`Makefile:1-21`).
 
 ## 2. TLS certificates
 
@@ -134,7 +130,7 @@ Until structured logging lands, operators should:
   - `internal/proxy.Client.Do` is specifically tested to **never** leak the API key or the `Authorization` header contents into any returned error, across connection-refused, malformed-URL, and unresolvable-host failure modes (`internal/proxy/proxy_test.go:175-217`) — so error logs are safe to forward to normal aggregation, but the config file itself is not.
 - **HTTP/3 requires TLS, always** — there is no cleartext QUIC mode, and the code refuses to start otherwise (`internal/gateway/gateway.go:142-147`). Don't attempt to work around this.
 - **Recovery middleware**: the Gin engine runs with `gin.Recovery()` (`internal/gateway/gateway.go:82`), so a panic in a single request handler is converted to a 500 rather than crashing the whole process — but this is not a substitute for input validation upstream of the handler.
-- **No built-in authentication** on `/health`, `/ready`, or `POST /v1/messages` — none of the three routes registered in `internal/gateway/gateway.go:97-131` require credentials. If the gateway is reachable from anywhere other than trusted local processes, put an authenticating reverse proxy in front of it.
+- **No built-in authentication is active by default** on `/health`, `/ready`, or `POST /v1/messages` — none of the three routes registered in `internal/gateway/gateway.go:97-131` require credentials, and `cmd/ccr` does not install any. The capability exists as an opt-in library function, `gateway.RequireAPIKey(keys []string)` (`internal/gateway/auth.go`) — it accepts `Authorization: Bearer <key>` or `x-api-key: <key>`, using a constant-time comparison so response timing cannot leak key material, and rejects with a fixed `401` message that never echoes what the client sent. It is not wired into the route table by `gateway.go` or `cmd/ccr` today, so using it currently means embedding `internal/gateway` as a library and installing it yourself. Until then, if the gateway is reachable from anywhere other than trusted local processes, put an authenticating reverse proxy in front of it.
 - **The management interface is also unauthenticated, and cannot be disabled** — `cmdServe` always starts it, regardless of `--gateway`/`--no-gateway` (`cmd/ccr/serve.go:59-70`); only its host/port are configurable, not whether it runs at all. Its code comment describes it as deliberately minimal and "out of scope" for now (`cmd/ccr/management.go:16-20`) — treat it the same as the gateway for exposure purposes: default it to loopback, and put an authenticating reverse proxy in front if you need it reachable beyond that.
 - **Provider API keys travel in the clear over your configured transport** unless you enable TLS yourself: both the CLI-wired `internal/proxy.Client` (`internal/proxy/proxy.go:70`) and the library-only built-in `defaultUpstream` (`internal/gateway/messages.go:73-76`) set `Authorization: Bearer <key>` on the outgoing upstream request — but neither one is the thing to secure; the *inbound* leg from Claude Code to the gateway is what §2's TLS guidance covers.
 

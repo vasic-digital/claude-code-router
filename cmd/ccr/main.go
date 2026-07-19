@@ -50,6 +50,12 @@ Flags (start, ui, serve, web):
   --gateway-port <port>    Gateway port (default 3456, env CCR_GATEWAY_PORT).
                             Distinct from --port, which sets the management
                             interface. Use this when 3456 is already taken.
+  --gateway-host <host>    Gateway bind address (default 127.0.0.1, env
+                            CCR_GATEWAY_HOST). Loopback-only by default
+                            because the gateway holds live provider API keys.
+                            Set 0.0.0.0 inside a container, where 127.0.0.1
+                            is the container's own loopback and a published
+                            port can never reach it.
 
   -h, --help                Show this help
 `
