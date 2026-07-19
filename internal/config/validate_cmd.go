@@ -31,6 +31,14 @@ func Redacted(c *Config) *Config {
 		p.APIKey = RedactedMarker
 		out.Providers[i] = p
 	}
+	// Carry the Cache block through (deep-copied). It holds no credential — only
+	// enable/backend/path/ttl — so it needs no redaction, but it MUST appear in
+	// `config show` so an operator can see their cache settings. Dropping it
+	// (the pre-v0.3.0 behaviour) hid the whole feature from show.
+	if c.Cache != nil {
+		cc := *c.Cache
+		out.Cache = &cc
+	}
 	return out
 }
 

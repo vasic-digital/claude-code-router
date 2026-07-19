@@ -67,6 +67,20 @@ type SemanticCache struct {
 	index *SemanticIndex
 
 	maxSalientRunes int
+	// minSalientRunes is the floor below which a request's salient text is too
+	// short to be a reliable near-duplicate signal: a bare "yes"/"continue" is
+	// lexically identical across UNRELATED conversations in the same scope and
+	// would cross-serve a wrong (though live) answer. Such requests skip the
+	// semantic tier entirely — neither queried nor registered.
+	minSalientRunes int
+	// maxCandidatesPerScope bounds the per-scope candidate registry. The registry
+	// is pruned only LAZILY (when a semantic hit ranks an already-evicted entry),
+	// so without a cap an expired/evicted entry that is never re-queried would
+	// linger forever, pinning its embedding + response body — an unbounded leak
+	// in a long-running gateway. When the cap is exceeded the OLDEST candidates
+	// are dropped (the exact tier remains the authority, so a dropped candidate
+	// only forgoes a future semantic hit, never a correct exact hit).
+	maxCandidatesPerScope int
 
 	mu sync.RWMutex
 	// candidates maps a scope id (SystemHash) to the entries in that scope that
@@ -84,6 +98,15 @@ type SemanticCache struct {
 // few thousand runes is plenty to characterise a request's intent while keeping
 // the embed step cheap and bounding memory.
 const DefaultMaxSalientRunes = 4096
+
+// DefaultMinSalientRunes is the floor for semantic-tier participation (see
+// SemanticCache.minSalientRunes): ~16 runes keeps out bare "yes"/"continue"
+// turns that would cross-serve, while admitting any real question.
+const DefaultMinSalientRunes = 16
+
+// DefaultMaxCandidatesPerScope bounds the per-scope candidate registry (see
+// SemanticCache.maxCandidatesPerScope) so a long-running gateway cannot leak.
+const DefaultMaxCandidatesPerScope = 1024
 
 // HitKind distinguishes how a Lookup was satisfied, so the caller (and metrics)
 // can tell an exact replay apart from a similarity match — the two carry
@@ -122,10 +145,12 @@ func NewSemanticCache(exact Cache, emb Embedder, threshold float64) *SemanticCac
 		emb = NopEmbedder()
 	}
 	return &SemanticCache{
-		exact:           exact,
-		index:           &SemanticIndex{Embedder: emb, Threshold: threshold},
-		maxSalientRunes: DefaultMaxSalientRunes,
-		candidates:      make(map[string][]*Entry),
+		exact:                 exact,
+		index:                 &SemanticIndex{Embedder: emb, Threshold: threshold},
+		maxSalientRunes:       DefaultMaxSalientRunes,
+		minSalientRunes:       DefaultMinSalientRunes,
+		maxCandidatesPerScope: DefaultMaxCandidatesPerScope,
+		candidates:            make(map[string][]*Entry),
 	}
 }
 
@@ -165,7 +190,9 @@ func (sc *SemanticCache) semanticLookup(req *translate.AnthropicRequest) (*Entry
 		return nil, false
 	}
 	text := salientText(req, sc.maxSalientRunes)
-	if text == "" {
+	if text == "" || len([]rune(text)) < sc.minSalientRunes {
+		// Empty, or too short to be a reliable near-duplicate signal (see
+		// minSalientRunes): a clean miss, never a cross-served wrong answer.
 		return nil, false
 	}
 
@@ -216,7 +243,10 @@ func (sc *SemanticCache) Store(key string, req *translate.AnthropicRequest, e *E
 	}
 
 	text := salientText(req, sc.maxSalientRunes)
-	if text == "" {
+	if text == "" || len([]rune(text)) < sc.minSalientRunes {
+		// Too short (or absent) to register as a reliable near-duplicate
+		// candidate — mirrors the semanticLookup guard so short turns never
+		// cross-serve.
 		return nil
 	}
 	vec, err := sc.index.Embedder.Embed(context.Background(), text)
@@ -250,7 +280,17 @@ func (sc *SemanticCache) registerLocked(scope, key string, cand *Entry) {
 			return
 		}
 	}
-	sc.candidates[scope] = append(list, cand)
+	list = append(list, cand)
+	// Bound per-scope growth: drop the oldest beyond the cap. Copy into a fresh
+	// slice (rather than reslice) so the dropped candidates — and the response
+	// bodies they pin — are actually released, not just hidden behind a moved
+	// slice header on the same backing array.
+	if sc.maxCandidatesPerScope > 0 && len(list) > sc.maxCandidatesPerScope {
+		trimmed := make([]*Entry, sc.maxCandidatesPerScope)
+		copy(trimmed, list[len(list)-sc.maxCandidatesPerScope:])
+		list = trimmed
+	}
+	sc.candidates[scope] = list
 }
 
 // pruneCandidate drops the candidate with key from scope. Used when the exact

@@ -26,10 +26,11 @@ type fallbackUpstream struct {
 	bodies   map[string][]byte
 	status   map[string]int
 	respBody map[string]string
+	errs     map[string]error // per-provider transport error (returned instead of a response)
 }
 
 func newFallbackUpstream() *fallbackUpstream {
-	return &fallbackUpstream{calls: map[string]int{}, bodies: map[string][]byte{}, status: map[string]int{}, respBody: map[string]string{}}
+	return &fallbackUpstream{calls: map[string]int{}, bodies: map[string][]byte{}, status: map[string]int{}, respBody: map[string]string{}, errs: map[string]error{}}
 }
 
 func (u *fallbackUpstream) Do(_ context.Context, p config.Provider, body []byte) (*http.Response, error) {
@@ -37,6 +38,9 @@ func (u *fallbackUpstream) Do(_ context.Context, p config.Provider, body []byte)
 	defer u.mu.Unlock()
 	u.calls[p.Name]++
 	u.bodies[p.Name] = append([]byte(nil), body...)
+	if e := u.errs[p.Name]; e != nil {
+		return nil, e
+	}
 	st := u.status[p.Name]
 	if st == 0 {
 		st = http.StatusOK
@@ -112,6 +116,30 @@ func TestFallbackAdvancesOnRetryableFailure(t *testing.T) {
 		t.Errorf("secondary model = %v, want m", sent["model"])
 	}
 	// The client received the secondary's answer, translated to Anthropic shape.
+	if !strings.Contains(rec.Body.String(), "from secondary") {
+		t.Errorf("client did not receive secondary's answer: %s", rec.Body.String())
+	}
+}
+
+// A RETRYABLE TRANSPORT error on the primary (a timeout — see
+// router.ClassifyTransportError) advances to the next provider, exactly like a
+// retryable status. This covers the transport half of the tryNext contract.
+func TestFallbackAdvancesOnTransportError(t *testing.T) {
+	up := newFallbackUpstream()
+	up.errs["primary"] = timeoutError{} // net.Error, Timeout()==true => Retryable
+	up.status["secondary"] = http.StatusOK
+	up.respBody["secondary"] = secondaryAnswer
+
+	s := New(fallbackCfg(true), Options{MaxAttempts: 1})
+	s.Upstream = up
+	rec := postMessages(t, s)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a retryable transport error must fall back); body: %s", rec.Code, rec.Body.String())
+	}
+	if up.callsFor("primary") != 1 || up.callsFor("secondary") != 1 {
+		t.Errorf("calls primary=%d secondary=%d, want 1 and 1", up.callsFor("primary"), up.callsFor("secondary"))
+	}
 	if !strings.Contains(rec.Body.String(), "from secondary") {
 		t.Errorf("client did not receive secondary's answer: %s", rec.Body.String())
 	}
