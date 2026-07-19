@@ -77,10 +77,48 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Wire config hot-reload. The claude_toolkit provider-alias launcher
+	// rewrites ~/.claude-code-router/config.json on EVERY launch, so a
+	// long-running service must not go blind to it. The watcher validates each
+	// change and, on any rejection, keeps the previous good config and never
+	// serves a half-parsed one.
+	//
+	// Honesty note (see configReloader's doc for the full boundary): the
+	// running gateway captured its *config.Config at startup and exposes no
+	// public seam to swap it in place, and we deliberately do not restart the
+	// listener here. So a validated reload is logged and kept as the latest
+	// known-good config (Current()), but the live gateway keeps serving its
+	// startup config until the process is restarted. onReload is the single
+	// place to hook a real in-place swap once internal/gateway offers one.
+	reloader, _, err := newConfigReloader(config.Path(), config.DefaultPollInterval,
+		func(newCfg *config.Config) {
+			names := make([]string, 0, len(newCfg.Providers))
+			for _, p := range newCfg.Providers {
+				names = append(names, p.Name)
+			}
+			fmt.Fprintf(stdout, "config reloaded and validated: %d provider(s) %v, default route %q "+
+				"(kept as latest known-good; running gateway is not swapped in place — restart to apply)\n",
+				len(newCfg.Providers), names, newCfg.Router.Default)
+		},
+		func(reloadErr error) {
+			fmt.Fprintf(stderr, "config reload rejected, keeping previous good config: %v\n", reloadErr)
+		},
+	)
+	if err != nil {
+		// The initial Load above already succeeded, so this is unlikely (a TOCTOU
+		// with the file being replaced mid-startup). If it does happen, serve
+		// without hot-reload rather than tearing down a working service.
+		fmt.Fprintf(stderr, "hot-reload disabled: %v\n", err)
+	}
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	<-sigCh
 	fmt.Fprintln(stdout, "shutting down...")
+
+	if reloader != nil {
+		reloader.Stop()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
