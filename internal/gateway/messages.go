@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/vasic-digital/claude-code-router/internal/cache"
 	"github.com/vasic-digital/claude-code-router/internal/config"
 	"github.com/vasic-digital/claude-code-router/internal/router"
 	"github.com/vasic-digital/claude-code-router/internal/translate"
@@ -275,6 +276,27 @@ func (s *Server) handleMessages(c *gin.Context) {
 		defer cancel()
 	}
 
+	// Response-cache lookup (exact tier). ONLY the non-streaming, OpenAI-shaped
+	// path participates: anthropic-native passthrough is relayed verbatim (its
+	// body is not the OpenAI shape an Entry stores) and streaming replay is not
+	// a Phase-1 capability, so both bypass the cache entirely. A nil s.Cache
+	// (the default) makes this whole block inert — the code below is then
+	// byte-identical to the pre-cache gateway. cacheKey stays "" whenever the
+	// request-side gate (cache.Cacheable — temperature>0 etc.) refuses, which
+	// also suppresses the store on the miss path.
+	var cacheKey string
+	if s.Cache != nil && !anthropicNative && !in.Stream {
+		if ok, _ := cache.Cacheable(&in); ok {
+			cacheKey = cache.Fingerprint(&in, provider.Name, model)
+			if entry, hit := s.Cache.Lookup(cacheKey); hit {
+				// HIT: serve from the buffered upstream body through the SAME
+				// translation the miss path uses. No upstream call is made.
+				respondNonStreamingBytes(c, entry.OpenAIBody, model)
+				return
+			}
+		}
+	}
+
 	resp, ok := s.doUpstreamWithRetry(c, ctx, provider, outBody, anthropicResponder{})
 	if !ok {
 		// A terminal failure, an exhausted retry budget, or a cancelled
@@ -292,7 +314,28 @@ func (s *Server) handleMessages(c *gin.Context) {
 		streamAnthropicSSE(c, resp.Body, model)
 		return
 	}
-	respondNonStreaming(c, resp.Body, model)
+
+	// Non-streaming OpenAI MISS: buffer the upstream body ONCE so the same
+	// bytes are both (optionally) stored and translated for the client.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
+		return
+	}
+	if cacheKey != "" {
+		// Response-side gate (error/tool shapes) decides storability; a refusal
+		// or a Store error must NEVER fail the request — it only forgoes a
+		// future hit.
+		if storeOK, _ := cache.ResponseCacheable(raw, s.CacheAllowToolResponses); storeOK {
+			_ = s.Cache.Store(cacheKey, &cache.Entry{
+				Key:          cacheKey,
+				ProviderName: provider.Name,
+				Model:        model,
+				OpenAIBody:   raw,
+			})
+		}
+	}
+	respondNonStreamingBytes(c, raw, model)
 }
 
 // ---------- Retry loop ----------
@@ -533,15 +576,26 @@ func relayAnthropicResponse(c *gin.Context, resp *http.Response, stream bool) {
 	c.Data(http.StatusOK, "application/json", raw)
 }
 
-// respondNonStreaming decodes a complete OpenAI chat-completion response and
-// re-encodes it as a single Anthropic message.
+// respondNonStreaming reads a complete OpenAI chat-completion response and
+// re-encodes it as a single Anthropic message. It is a thin reader wrapper
+// around respondNonStreamingBytes so a caller that only has the stream (and
+// does not need the buffered bytes for anything else) keeps a one-call path.
 func respondNonStreaming(c *gin.Context, body io.Reader, model string) {
 	raw, err := io.ReadAll(io.LimitReader(body, 32<<20))
 	if err != nil {
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
 		return
 	}
+	respondNonStreamingBytes(c, raw, model)
+}
 
+// respondNonStreamingBytes decodes an already-buffered OpenAI chat-completion
+// body and re-encodes it as a single Anthropic message. This is the ONE
+// translate-from-bytes path shared by both cache outcomes: a MISS buffers the
+// fresh upstream body and translates it here (after optionally storing it), and
+// a HIT translates the replayed entry.OpenAIBody through this exact same code —
+// so a cached reply is byte-for-byte what the client would have received live.
+func respondNonStreamingBytes(c *gin.Context, raw []byte, model string) {
 	var oa openAIChatResponse
 	// A malformed body must produce a clean typed error, not a panic — the
 	// upstream is an untrusted third party and can send anything.

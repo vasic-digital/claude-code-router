@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vasic-digital/claude-code-router/internal/cache"
 	"github.com/vasic-digital/claude-code-router/internal/config"
 	"github.com/vasic-digital/claude-code-router/internal/gateway"
 )
@@ -42,6 +43,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var gw *gateway.Server
+	var responseCache cache.Cache
 	if flags.Gateway {
 		gw = gateway.New(cfg, gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort})
 		// Install the real router and upstream client. Without this the
@@ -49,8 +51,23 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		// Router.default — so haiku-tier background requests would be sent to
 		// the expensive model instead of the configured cheap one.
 		gw.WireDefaults(0)
+		// Optional response cache. Default OFF (cfg.Cache nil/disabled →
+		// BuildCache returns nil, gateway behaves exactly as before). A sqlite
+		// build error must NEVER crash serve: log it and continue with caching
+		// disabled rather than refuse to boot over a cache path problem.
+		if built, cerr := gateway.BuildCache(cfg.Cache); cerr != nil {
+			fmt.Fprintf(stderr, "response cache disabled (build failed): %v\n", cerr)
+		} else if built != nil {
+			responseCache = built
+			gw.Cache = built
+			gw.CacheAllowToolResponses = cfg.Cache.AllowToolResponses
+			fmt.Fprintf(stdout, "response cache enabled (backend %q)\n", cfg.Cache.Backend)
+		}
 		if err := gw.Start(); err != nil {
 			fmt.Fprintf(stderr, "start gateway: %v\n", err)
+			if responseCache != nil {
+				_ = responseCache.Close()
+			}
 			return 1
 		}
 		fmt.Fprintf(stdout, "gateway listening on %s\n", gw.Addr())
@@ -63,6 +80,9 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 			ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 			_ = gw.Shutdown(ctx)
 			cancel()
+		}
+		if responseCache != nil {
+			_ = responseCache.Close()
 		}
 		return 1
 	}
@@ -129,6 +149,11 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	}
 	if err := mgmt.Shutdown(ctx); err != nil {
 		fmt.Fprintf(stderr, "management shutdown: %v\n", err)
+	}
+	if responseCache != nil {
+		if err := responseCache.Close(); err != nil {
+			fmt.Fprintf(stderr, "response cache close: %v\n", err)
+		}
 	}
 	return 0
 }

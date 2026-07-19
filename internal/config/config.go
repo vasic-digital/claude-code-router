@@ -20,6 +20,7 @@ package config
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -141,7 +142,44 @@ type Route struct {
 type Config struct {
 	Providers []Provider `json:"Providers"`
 	Router    Route      `json:"Router"`
+	// Cache configures the optional response cache (see internal/cache). It is
+	// OMITEMPTY and a POINTER: an ABSENT/nil Cache means caching is disabled —
+	// exactly today's behaviour — so every config already on disk (none of
+	// which carries this key) serialises and behaves byte-for-byte unchanged.
+	Cache *CacheConfig `json:"Cache,omitempty"`
 }
+
+// CacheConfig configures the gateway's response cache. The whole feature is
+// off unless Enabled is true; a nil *CacheConfig on Config is likewise off.
+type CacheConfig struct {
+	// Enabled turns the response cache on. False (the zero value) leaves the
+	// gateway's request path byte-identical to a build with no cache at all.
+	Enabled bool `json:"enabled"`
+	// Backend selects the store: "" or "memory" (in-process LRU, the default)
+	// or "sqlite" (persistent, survives restart).
+	Backend string `json:"backend,omitempty"`
+	// Path is the SQLite database path. REQUIRED when Backend == "sqlite";
+	// ignored for the memory backend.
+	Path string `json:"path,omitempty"`
+	// TTLSeconds bounds an entry's life. 0 means "no expiry".
+	TTLSeconds int `json:"ttl_seconds,omitempty"`
+	// MaxEntries bounds the in-memory LRU. 0 means "use a sane default".
+	MaxEntries int `json:"max_entries,omitempty"`
+	// AllowToolResponses opts the response-side gate into caching tool-call
+	// responses (off by default, since a tool answer depends on live state).
+	AllowToolResponses bool `json:"allow_tool_responses,omitempty"`
+}
+
+// Cache validation errors, exported so callers (and tests) can match them with
+// errors.Is rather than string-comparing.
+var (
+	// ErrCacheBackendUnknown is returned when an enabled cache names a backend
+	// other than "", "memory", or "sqlite".
+	ErrCacheBackendUnknown = errors.New(`cache backend must be "", "memory", or "sqlite"`)
+	// ErrCacheSQLitePathRequired is returned when an enabled cache selects the
+	// sqlite backend without a path.
+	ErrCacheSQLitePathRequired = errors.New(`cache path is required when backend is "sqlite"`)
+)
 
 // Dir returns the platform configuration directory, matching the Node
 // implementation: ~/.claude-code-router on Unix, %APPDATA% on Windows.
@@ -227,6 +265,18 @@ func (c *Config) Validate() error {
 		}
 		if !seen[name] {
 			return fmt.Errorf("Router.%s references unknown provider %q", label, name)
+		}
+	}
+	// An absent/nil Cache is always valid (caching disabled). A disabled Cache
+	// is likewise unconstrained — its fields are inert until Enabled flips on.
+	if c.Cache != nil && c.Cache.Enabled {
+		switch c.Cache.Backend {
+		case "", "memory", "sqlite":
+		default:
+			return fmt.Errorf("Cache.backend %q: %w", c.Cache.Backend, ErrCacheBackendUnknown)
+		}
+		if c.Cache.Backend == "sqlite" && c.Cache.Path == "" {
+			return fmt.Errorf("Cache: %w", ErrCacheSQLitePathRequired)
 		}
 	}
 	return nil

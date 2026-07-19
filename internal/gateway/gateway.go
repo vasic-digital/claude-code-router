@@ -29,6 +29,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/quic-go/quic-go/http3"
 
+	"github.com/vasic-digital/claude-code-router/internal/cache"
 	"github.com/vasic-digital/claude-code-router/internal/config"
 )
 
@@ -96,6 +97,55 @@ type Server struct {
 	// Start.
 	Router   Router
 	Upstream Upstream
+
+	// Cache is the optional response cache (see internal/cache). It is a seam
+	// like Router/Upstream: New leaves it NIL, in which case the request path
+	// is byte-identical to a build with no cache — no lookup, no store. A
+	// caller that wants caching builds a store with BuildCache and assigns it
+	// (serve.go does this from Config.Cache), before Start.
+	Cache cache.Cache
+	// CacheAllowToolResponses mirrors Config.Cache.AllowToolResponses: it is the
+	// argument handed to cache.ResponseCacheable on the store side, so a
+	// tool-call response is only ever cached when the operator opted in. It is
+	// inert when Cache is nil.
+	CacheAllowToolResponses bool
+}
+
+// defaultCacheMaxEntries bounds the in-memory LRU when Config.Cache.MaxEntries
+// is left at 0 ("use a sane default").
+const defaultCacheMaxEntries = 1024
+
+// BuildCache constructs the Cache described by c, or (nil, nil) when caching is
+// disabled (c == nil or c.Enabled == false). It is the single place that turns
+// a validated *config.CacheConfig into a live store:
+//
+//   - "" / "memory": an in-process LRU (cache.NewMemoryLRU), bounded by
+//     MaxEntries (defaulting to defaultCacheMaxEntries) and TTLSeconds.
+//   - "sqlite": a persistent store (cache.NewSQLiteCache) at Path.
+//
+// New never calls this (it must not fail, and must not touch the filesystem);
+// the caller does, so a sqlite open error is surfaced to a place that can log
+// it and fall back to caching-disabled rather than crash the process.
+func BuildCache(c *config.CacheConfig) (cache.Cache, error) {
+	if c == nil || !c.Enabled {
+		return nil, nil
+	}
+	ttl := time.Duration(c.TTLSeconds) * time.Second
+	switch c.Backend {
+	case "", "memory":
+		maxEntries := c.MaxEntries
+		if maxEntries <= 0 {
+			maxEntries = defaultCacheMaxEntries
+		}
+		return cache.NewMemoryLRU(cache.MemoryOptions{MaxEntries: maxEntries, TTL: ttl}), nil
+	case "sqlite":
+		if c.Path == "" {
+			return nil, fmt.Errorf("cache: sqlite backend requires a path")
+		}
+		return cache.NewSQLiteCache(c.Path, ttl)
+	default:
+		return nil, fmt.Errorf("cache: unknown backend %q", c.Backend)
+	}
 }
 
 // New builds a Server. It does not listen until Start is called.
