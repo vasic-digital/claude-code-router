@@ -1,0 +1,11 @@
+claude-code-router (Go)
+Copyright (c) 2026 Vasic Digital
+
+This project is a clean-room Go reimplementation of the behaviour of
+@musistudio/claude-code-router (Node.js), which is distributed under the
+MIT License. No source code was copied; the wire formats, CLI grammar,
+configuration file layout and default ports are reproduced deliberately so
+that existing installations remain compatible.
+
+The upstream MIT licence text is retained in LICENSE-UPSTREAM-MIT.
+Upstream project: https://github.com/musistudio/claude-code-router
