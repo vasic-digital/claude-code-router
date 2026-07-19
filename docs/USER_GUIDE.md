@@ -2,26 +2,20 @@
 
 This guide covers installing, configuring, and running `claude-code-router` (Go), plus troubleshooting. It is grounded entirely in the code present in this repository as of the state described below; anything not yet implemented is marked **PLANNED**.
 
-> **Read this first.** `internal/gateway/messages.go` — the handler for `POST /v1/messages`, which decodes an Anthropic request, routes it, translates it to OpenAI shape, calls the upstream, and translates the response back (buffered or streamed) — is implemented and tested (`internal/gateway/messages.go`, `internal/gateway/messages_test.go`). What is **still absent** is `cmd/ccr`, the CLI entrypoint — so there is no way to launch the gateway as a standalone process today; everything below that talks about invoking a `ccr` binary describes the **target, PLANNED** shape, built from the `Options`/`Config` types that already exist and are tested. One more nuance worth knowing before you configure anything: the live `POST /v1/messages` handler currently uses its own **minimal built-in** routing/upstream-call logic (`Router.default` only, no haiku-tier awareness; a plain `net/http` call with no special timeout handling) rather than the fuller, independently-tested `internal/router`/`internal/proxy` packages — see §4.1.
+> **Read this first.** `internal/gateway/messages.go` — the handler for `POST /v1/messages`, which decodes an Anthropic request, routes it, translates it to OpenAI shape, calls the upstream, and translates the response back (buffered or streamed) — is implemented and tested (`internal/gateway/messages.go`, `internal/gateway/messages_test.go`). `cmd/ccr` is a real, tested CLI (`start`/`ui`/`serve`/`web`/`stop`) — see §4. It launches the gateway with `Server.WireDefaults()` applied (`cmd/ccr/serve.go:44-51`), which installs the full haiku-tier-aware `internal/router.Select` and the streaming-safe `internal/proxy.Client` — so a CLI-launched gateway gets the fuller routing/upstream behaviour, not the gateway package's own minimal built-in defaults. See §4.1 for what that distinction means if you use `internal/gateway` as a library directly instead of through the CLI.
 
 ## 1. Install
 
-### 1.1 PLANNED: `go install`
-
-Once `cmd/ccr` contains a `main` package:
-
-```bash
-go install github.com/vasic-digital/claude-code-router/cmd/ccr@latest
-```
-
-### 1.2 Available today: build from source
+No published release yet, so build from source:
 
 ```bash
 git clone https://github.com/vasic-digital/claude-code-router.git
 cd claude-code-router
-go build ./...      # compiles every package that currently has one (no cmd/ccr binary yet)
-go test ./...        # runs the full test suite
+go build -o bin/ccr ./cmd/ccr   # the CLI binary
+go test ./...                    # full test suite
 ```
+
+Once built, `bin/ccr --help` prints the full command grammar (reproduced in §4).
 
 Requires Go **1.26.4** or compatible (`go.mod:3`). Direct dependencies: `github.com/gin-gonic/gin` v1.12.0 (HTTP routing), `github.com/quic-go/quic-go` v0.60.0 (HTTP/3), `github.com/andybalholm/brotli` v1.2.2 (compression) (`go.mod:5-9`).
 
@@ -104,64 +98,98 @@ Claude Code sends a different, cheaper model id for background work (summarisati
 
 ### 3.2 `claude_toolkit` compatibility
 
-If you already run [`claude_toolkit`](https://github.com/vasic-digital)'s multi-account setup, `claude-providers.sh`'s `cma_run_provider` already writes `config.json` in exactly the shape this router expects — that shape is the literal fixture pinned by `internal/config/config_test.go:18-35`. No config changes should be required to point an existing toolkit-managed provider alias at this Go gateway instead of the Node one, once the gateway's `POST /v1/messages` endpoint exists.
+If you already run [`claude_toolkit`](https://github.com/vasic-digital)'s multi-account setup, `claude-providers.sh`'s `cma_run_provider` already writes `config.json` in exactly the shape this router expects — that shape is the literal fixture pinned by `internal/config/config_test.go:18-35`. No config changes should be required to point an existing toolkit-managed provider alias at this Go gateway instead of the Node one.
 
-## 4. Running the gateway (PLANNED — pending `cmd/ccr`)
+## 4. Running the gateway
 
-There is no CLI in the repository yet — `cmd/ccr` is an empty directory. The gateway's HTTP surface itself, though, is fully implemented and independently runnable from within the module (e.g. from a test, or a temporary `main.go` during development):
-
-```go
-cfg, err := config.Load(config.Path())
-if err != nil { /* handle */ }
-srv := gateway.New(cfg, gateway.Options{})
-if err := srv.Start(); err != nil { /* handle */ }
-// srv now serves GET /health, GET /ready, POST /v1/messages on 127.0.0.1:3456.
-```
-
-### 4.1 The gateway's built-in routing/upstream logic (important)
-
-`internal/gateway/messages.go` intentionally does **not** import `internal/router` or `internal/proxy` — those packages are owned and tested separately. Instead it defines two small local interfaces and wires in minimal default implementations so the gateway works standalone (`internal/gateway/messages.go:19-82`):
-
-- **`Router`** — `defaultRouter` resolves `cfg.Router.Default` only. It does **not** implement the haiku-tier/background-route heuristic that `internal/router.Select` provides (`internal/router/router.go:26-34`) — every request, including Claude Code's cheap background-tier calls, is routed to `Router.default` regardless of `Router.background`.
-- **`Upstream`** — `defaultUpstream` is a plain `net/http.Client` call with no `ResponseHeaderTimeout` set (it falls back to `http.DefaultClient` when no client is supplied) and none of `internal/proxy.Client`'s explicit no-secret-leak error handling beyond what the standard library already gives you.
-
-Both fields are exported on `*gateway.Server` (`Server.Router`, `Server.Upstream`) precisely so a caller who wants the fuller behaviour can swap them in after `gateway.New` and before `Start()`:
-
-```go
-srv := gateway.New(cfg, gateway.Options{})
-// srv.Router = <adapter around internal/router.Select>   // PLANNED wiring
-// srv.Upstream = <adapter around internal/proxy.Client>  // PLANNED wiring
-srv.Start()
-```
-
-Whether `cmd/ccr` performs this swap once it exists is unconfirmed — it does not exist yet. Until it does (or until you wire it yourself), a live gateway only routes to `Router.default` and never to `Router.background`, `Router.think`, or `Router.longContext`.
-
-### 4.2 Target CLI shape (PLANNED)
-
-Once `cmd/ccr` exists, the intended shape (built from `internal/gateway.Options`, `internal/gateway/gateway.go:35-47`) is expected to be something like:
+`cmd/ccr` is a real, tested CLI. Build it once (`go build -o bin/ccr ./cmd/ccr`), then:
 
 ```bash
-ccr start                     # binds 127.0.0.1:3456 by default
-ccr start --host 0.0.0.0 --port 8787
-ccr start --cert server.crt --key server.key            # enables TLS (h1/h2)
-ccr start --cert server.crt --key server.key --http3     # + HTTP/3 over QUIC
+bin/ccr start          # background: gateway on 127.0.0.1:3456 + management on 127.0.0.1:3458
+bin/ccr ui              # same as start, but also opens the management UI in a browser
+bin/ccr serve            # foreground (blocks until Ctrl-C / SIGTERM) — alias: web
+bin/ccr stop            # stops what "start"/"ui" started
 ```
 
-**Do not treat these flag names as final** — they are inferred from the `Options` struct fields, not read from `cmd/ccr` source, which does not exist yet. `internal/gateway.New` applies these defaults when the corresponding option is zero (`internal/gateway/gateway.go:70-89`):
+Full grammar (verbatim from `bin/ccr --help`, sourced from `cmd/ccr/main.go:28-52`):
 
-| Option | Default |
-|---|---|
-| `Host` | `127.0.0.1` |
-| `Port` | `3456` (matches the Node implementation and every existing toolkit config — `internal/gateway/gateway_test.go:194-201`) |
-| `UpstreamTimeout` | 10 minutes (bounds only the wait for upstream response headers, never a streaming body — see §5) |
+```
+ccr - Claude Code Router
 
-Once started, point Claude Code's base URL at the gateway (exact env var/flag TBD until `cmd/ccr`/Claude Code integration is finalised):
+Usage:
+  ccr start [--host <host>] [--port <port>] [--open|--no-open] [--gateway|--no-gateway]
+  ccr ui    [--host <host>] [--port <port>] [--open|--no-open] [--gateway|--no-gateway]
+  ccr serve [--host <host>] [--port <port>] [--open|--no-open] [--gateway|--no-gateway]
+  ccr stop
+  ccr <profile-name-or-id> [cli|app] [-- <agent args>]
+```
+
+Worked examples:
+
+```bash
+# Start in the background, without opening a browser.
+bin/ccr start --no-open
+
+# Run in the foreground under a process supervisor (see docs/ADMIN_MANUAL.md).
+bin/ccr serve
+
+# Run the router service but skip the Anthropic gateway (management UI only).
+bin/ccr serve --no-gateway
+
+# Put the management interface on a different host/port (e.g. to expose it
+# on the LAN — think carefully about this, see docs/ADMIN_MANUAL.md §5).
+bin/ccr start --host 0.0.0.0 --port 9000
+
+# Same, via environment variables instead of flags (flags still win if both
+# are given).
+CCR_WEB_HOST=0.0.0.0 CCR_WEB_PORT=9000 bin/ccr start
+
+# Stop the background service.
+bin/ccr stop
+```
+
+Once running, point Claude Code at the gateway:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:3456 claude
 ```
 
+**Important — two separate HTTP servers, two separate ports:**
+
+| Server | Default address | Purpose | Endpoints |
+|---|---|---|---|
+| **Gateway** (`internal/gateway.Server`) | `127.0.0.1:3456`, fixed — not exposed via `--port` | The Anthropic-compatible API Claude Code talks to | `GET /health`, `GET /ready`, `POST /v1/messages` |
+| **Management** (`cmd/ccr`'s own tiny server) | `127.0.0.1:3458` by default, configurable via `--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT` | Control-plane placeholder — a real web UI is out of scope for now | `GET /health` (own shape, see below), `GET /` (placeholder HTML page) |
+
+`--host`/`--port` configure the **management** server only (`cmd/ccr/flags.go:20-27`) — the gateway always binds `127.0.0.1:3456` today, because that's what every existing toolkit config assumes. `--gateway`/`--no-gateway` controls whether the gateway starts at all; `--open`/`--no-open` controls whether a browser is launched at the management URL.
+
+The management server's `/health` has its **own**, differently-shaped body — don't confuse it with the gateway's:
+
+```json
+{"providers": 2, "service": "ccr-management", "status": "ok"}
+```
+
+(Verified live: `curl http://127.0.0.1:3458/health`, source `cmd/ccr/management.go:34-41`. Key order shown alphabetically because it's Go's `encoding/json` marshaling a `map[string]any`, which always sorts map keys.)
+
+### 4.1 Background service lifecycle (`start`/`ui`/`stop`)
+
+`start` and `ui` don't run the server themselves — they re-exec the same binary as `ccr serve` in a **fully detached** child process (`setsid` on Unix), then return immediately (`cmd/ccr/service.go:77-143`):
+
+- The child's PID, host, port, `--gateway` flag, and start time are recorded in `~/.claude-code-router/service.json`.
+- The child's stdout/stderr are redirected to `~/.claude-code-router/service.log` — check this file if something goes wrong after `start` reports success, since there is no other way to see the child's own output.
+- Running `start`/`ui` again while a tracked process is still alive is refused, reporting the existing PID and management URL, rather than starting a second instance (`cmd/ccr/service.go:93-96`).
+- `stop` sends `SIGTERM`, polls for up to 5 seconds, then `SIGKILL`s if the process hasn't exited, and always removes the pidfile — including when the pidfile pointed at an already-dead process (a "stale pidfile", cleaned up and reported rather than silently ignored) (`cmd/ccr/service.go:145-184`).
+- `stop` with no service running exits non-zero and prints `ccr is not running.` (verified: `internal/... cmd/ccr/main_test.go:67-77`).
+
+### 4.2 The routing/upstream wiring, and when it matters
+
+`internal/gateway/messages.go` defines its own narrow `Router`/`Upstream` interfaces with minimal in-package default implementations (`defaultRouter`/`defaultUpstream`), so the gateway package compiles and serves correctly on its own (`internal/gateway/messages.go:19-82`). A separate file, `internal/gateway/wiring.go`, adapts the real `internal/router.Select` (haiku-tier-aware routing) and `internal/proxy.Client` (streaming-safe timeout, secret-safe errors) onto those same interfaces via `Server.WireDefaults(timeout)`.
+
+**`cmd/ccr` always calls `WireDefaults`** before starting the gateway (`cmd/ccr/serve.go:44-51`) — so every gateway started through the CLI (`start`/`ui`/`serve`/`web`) gets the fuller behaviour: haiku-tier requests route to `Router.background` when set, and the upstream client bounds only the wait for response headers rather than the whole call. This only matters to you if you use `internal/gateway` as a **library** directly (your own `main.go`, not `cmd/ccr`) and forget to call `srv.WireDefaults(0)` after `gateway.New` and before `Start()` — in that case you'd silently get the minimal built-ins instead (`Router.default`-only routing, a plain `net/http` call with no special timeout handling).
+
 ## 5. TLS and HTTP/3
+
+`internal/gateway.Options` supports TLS and HTTP/3 (`internal/gateway/gateway.go:35-47`), but `cmd/ccr` does **not** currently expose `--cert`/`--key`/`--http3` flags — `cmdServe` always constructs `gateway.Options{Port: defaultGatewayPort}` with no TLS fields set (`cmd/ccr/serve.go:46`). Reaching TLS/HTTP-3 today means using `internal/gateway` as a library directly, calling `gateway.New(cfg, gateway.Options{CertFile: ..., KeyFile: ..., EnableHTTP3: true})` yourself. Treat CLI flags for this as **PLANNED**.
 
 - Plain HTTP on `127.0.0.1` is the default because that is what Claude Code and the existing toolkit expect out of the box; TLS/HTTP-3 are opt-in (`internal/gateway/gateway.go:12-16`).
 - Setting **both** `CertFile` and `KeyFile` enables TLS for the HTTP/1.1 and HTTP/2 listener (`internal/gateway/gateway.go:142`, `154-160`).
@@ -200,9 +228,15 @@ No client action is required — this happens for every response, including `/he
 | `POST /v1/messages` returns `503` with `{"error":{"type":"not_found_error",...}}` | No route resolvable — `Router.default` empty, or it names a provider not in `Providers[]` (`internal/gateway/messages.go:47-60`, `191-195`) | Fix `Router.default` |
 | `POST /v1/messages` returns `502` (`api_error`) | Upstream transport failure, malformed upstream JSON, or an upstream response with zero `choices` (`internal/gateway/messages.go:227-244`, `332-339`) | Check the named provider's `api_base_url` and reachability |
 | `POST /v1/messages` returns the upstream's own 4xx/5xx | The gateway preserves the upstream's exact status code rather than collapsing everything to a generic error, so Claude Code's retry/backoff logic sees the real signal (`internal/gateway/messages.go:258-262`) | Treat it like a normal upstream API error for that provider |
-| Upstream call fails but the error never shows the API key | Verified behaviour of the standalone `internal/proxy.Client` (`internal/proxy/proxy.go:61-64`, `internal/proxy/proxy_test.go:175-217`). The live gateway's built-in `defaultUpstream` (`internal/gateway/messages.go:62-82`) is a much smaller code path with no equivalent dedicated test — treat its error-safety as unconfirmed until `internal/proxy.Client` is wired in as `Server.Upstream` (see §4.1) | Check the provider name/base URL named in the error, then verify the key out-of-band |
+| Upstream call fails but the error never shows the API key | If launched via `cmd/ccr` (which calls `WireDefaults`), this is the verified behaviour of `internal/proxy.Client` (`internal/proxy/proxy.go:61-64`, `internal/proxy/proxy_test.go:175-217`). If you construct `gateway.New` as a library **without** calling `WireDefaults`, you get the smaller built-in `defaultUpstream` (`internal/gateway/messages.go:62-82`) instead, which has no equivalent dedicated key-leak test — treat its error-safety as unconfirmed in that case | Check the provider name/base URL named in the error, then verify the key out-of-band |
 | A vision/image request fails immediately with an explicit error | Image content blocks are not translated yet — a deliberate hard failure, not a silent drop, so the model is never asked to answer about a picture it never saw (`internal/translate/anthropic.go:260-265`) | Not supported yet; see `docs/FAQ.md` |
-| A **streaming** response never times out, even against a wedged upstream | By design in the live handler: `handleMessages` only applies `UpstreamTimeout` to the request context for **non-streaming** calls; a streaming call's context carries no added deadline at all (`internal/gateway/messages.go:217-225`) | Expected; rely on the upstream's own behaviour or a network-level timeout if you need one |
-| A **non-streaming** request is cut off after `UpstreamTimeout`, even though headers came back quickly | Also by design, but note this differs from the standalone `internal/proxy.Client`: the live handler's `UpstreamTimeout` bounds the *entire* non-streaming call via `context.WithTimeout` (`internal/gateway/messages.go:222-224`), not just the wait for response headers the way `internal/proxy.New`'s `ResponseHeaderTimeout` does (`internal/proxy/proxy.go:26-44`) | Raise `UpstreamTimeout` if your provider's non-streaming responses are slow to fully arrive |
+| A **streaming** response never times out against a wedged upstream that never sends anything at all | Depends on wiring: `handleMessages` itself only applies `UpstreamTimeout` to the request context for **non-streaming** calls, never for streaming (`internal/gateway/messages.go:217-225`). If launched via `cmd/ccr`, `internal/proxy.Client`'s `ResponseHeaderTimeout` (also set from `UpstreamTimeout`, default 10 minutes) separately bounds the wait for the upstream's *response headers* on a streaming call too — so a CLI-launched gateway times out a streaming call that never even gets headers, but once headers (and therefore the SSE stream) start, the body can keep flowing indefinitely (`internal/gateway/wiring.go:65-71`, `internal/proxy/proxy.go:26-44`). A gateway built as a library without `WireDefaults` has no such protection at all | Expected once streaming has started; if a request never gets a first byte back, expect it to fail after `UpstreamTimeout` when CLI-launched |
+| A **non-streaming** request is cut off after `UpstreamTimeout`, even though headers came back quickly | By design: `handleMessages`'s `UpstreamTimeout` bounds the *entire* non-streaming call via `context.WithTimeout` (`internal/gateway/messages.go:222-224`) regardless of wiring — this is stricter than `internal/proxy.Client`'s own `ResponseHeaderTimeout`, which only bounds the header wait (`internal/proxy/proxy.go:26-44`); the context deadline from `messages.go` is what actually governs a non-streaming call's total duration | Raise the gateway's `UpstreamTimeout` (currently not CLI-exposed — see §4.2/§5) if your provider's non-streaming responses are slow to fully arrive |
+
+| `ccr start`/`ui` prints "ccr is already running (pid …)" | A tracked service is already alive per `~/.claude-code-router/service.json` | Use that instance, or `ccr stop` it first |
+| `ccr stop` prints "ccr is not running." and exits non-zero | No pidfile, or the pidfile's process is already dead (a stale pidfile is cleaned up automatically either way) | Nothing to do — it's already stopped |
+| `ccr start` reports success but the gateway/management server isn't actually reachable | The detached child's own errors (e.g. a port already in use by something else) go to `~/.claude-code-router/service.log`, not to `ccr start`'s own stdout, since the parent only confirms the child *process* launched, not that it bound successfully | Check `~/.claude-code-router/service.log` |
+| Unsure whether you're hitting the gateway or the management interface | They're two different servers on two different ports/response shapes by default — see the table in §4 | `curl :3456/health` (gateway: `{"status":"ok","providers":N}`) vs. `curl :3458/health` (management: `{"status":"ok","service":"ccr-management","providers":N}`) |
+| `ccr <name>` (anything not `start`/`ui`/`serve`/`web`/`stop`/`help`) prints `Profile "<name>" was not found or is disabled.` | This reimplementation has no profile store yet — every non-command first argument hits this path by design, matching the upstream CLI's own behaviour for an unknown profile | Use `start`/`ui`/`serve`/`web`/`stop` |
 
 For the underlying reasoning behind each of these behaviours, see `docs/FAQ.md`. For deployment concerns (systemd, Docker, firewalling, backups), see `docs/ADMIN_MANUAL.md`.

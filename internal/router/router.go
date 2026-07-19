@@ -23,6 +23,11 @@ import (
 // Rule order, matching the Node implementation's routing behaviour so an
 // operator's existing config.json continues to route the same way:
 //
+//  0. If req's model is an explicit "provider,model" or "provider/model"
+//     selector (see resolveExplicitSelector), that pins the exact upstream
+//     the caller asked for and wins over every rule below — including the
+//     haiku heuristic, since a caller that names a provider by hand has
+//     already made a more specific choice than any tier-based default could.
 //  1. If req's model is literally "haiku" or contains "haiku" (Claude Code's
 //     cheap/background tier — ids like "claude-3-5-haiku-20241022" wrap the
 //     tier name rather than equalling it, hence a substring match), prefer
@@ -40,6 +45,17 @@ import (
 func Select(cfg *config.Config, req *translate.AnthropicRequest) (*config.Provider, string, error) {
 	if cfg == nil {
 		return nil, "", fmt.Errorf("router: nil config")
+	}
+
+	if req != nil {
+		if p, model, matched, err := resolveExplicitSelector(cfg, req.Model); matched {
+			// matched is true whenever req.Model USED explicit-selector
+			// syntax at all, whether or not it resolved cleanly — a
+			// malformed or unknown selector must fail loudly rather than
+			// silently falling through to Default, which would route the
+			// request to an upstream the caller never asked for.
+			return p, model, err
+		}
 	}
 
 	route := cfg.Router.Default

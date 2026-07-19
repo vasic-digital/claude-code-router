@@ -1,59 +1,57 @@
 # Architecture
 
-This document describes the components and data flow of `claude-code-router` (Go), as they exist in the repository today, plus the PLANNED pieces needed to make it a runnable service. Every diagram distinguishes **Implemented** components/edges from **PLANNED** ones (dashed, labelled).
+This document describes the components and data flow of `claude-code-router` (Go), as they exist in the repository today, plus the remaining PLANNED pieces. Every diagram distinguishes **Implemented** components/edges from **PLANNED** ones (dashed, labelled).
 
 ## Component graph
 
 ```mermaid
 graph TD
     CC["Claude Code<br/>(Anthropic Messages API client)"]
-    CCR["cmd/ccr<br/>PLANNED — empty directory,<br/>no main package"]
+    CCR["cmd/ccr<br/>start / ui / serve / web / stop<br/>(Implemented)"]
+    MGMT["cmd/ccr management server<br/>127.0.0.1:3458 default<br/>own /health, placeholder /<br/>(Implemented, minimal)"]
 
     subgraph gw["internal/gateway (Implemented)"]
         Server["Server<br/>gateway.go"]
         Compress["compressionMiddleware<br/>+ altSvcMiddleware<br/>compress.go"]
         Handler["handleMessages<br/>messages.go"]
-        DefRouter["defaultRouter<br/>(Router.default only,<br/>no haiku/background)"]
-        DefUpstream["defaultUpstream<br/>(plain net/http)"]
+        Seams["Router / Upstream seams<br/>(narrow local interfaces)<br/>messages.go:29-39"]
+        Wiring["wiring.go: WireDefaults()<br/>routerAdapter + upstreamAdapter"]
     end
 
     Config["internal/config<br/>Config / Provider / Route<br/>(Implemented)"]
     Translate["internal/translate<br/>AnthropicToOpenAI<br/>StripCacheControl<br/>(Implemented)"]
-    Router["internal/router<br/>Select() — haiku-tier aware<br/>(Implemented, standalone)"]
-    Proxy["internal/proxy<br/>Client.Do() — streaming-safe<br/>timeout, no-secret-leak errors<br/>(Implemented, standalone)"]
+    Router["internal/router<br/>Select() — haiku-tier aware<br/>(Implemented)"]
+    Proxy["internal/proxy<br/>Client.Do() — streaming-safe<br/>timeout, no-secret-leak errors<br/>(Implemented)"]
     Logging["internal/logging<br/>PLANNED — empty directory"]
     Upstream["Upstream provider<br/>(OpenAI-compatible<br/>chat-completions API)"]
 
     CC -- "HTTP/1.1, HTTP/2, or HTTP/3" --> Server
-    CCR -. "PLANNED: config.Load + gateway.New + Start" .-> Server
+    CCR -- "config.Load + gateway.New(Options{Port:3456})<br/>+ WireDefaults(0) + Start()" --> Server
+    CCR --> MGMT
     Server --> Compress
     Compress --> Handler
     Server -- "reads at boot" --> Config
-    Handler -- "Server.Router (interface)" --> DefRouter
-    Handler -- "Server.Upstream (interface)" --> DefUpstream
+    Handler -- "Server.Router" --> Seams
+    Handler -- "Server.Upstream" --> Seams
     Handler -- "AnthropicToOpenAI /<br/>response translation" --> Translate
-    DefUpstream -- "POST, Authorization: Bearer" --> Upstream
-    DefRouter -. "config.SplitRoute /<br/>ProviderByName" .-> Config
-
-    Router -. "PLANNED: swap in as<br/>Server.Router before Start()" .-> Handler
-    Proxy -. "PLANNED: swap in as<br/>Server.Upstream before Start()" .-> Handler
+    Seams -- "installed by" --> Wiring
+    Wiring -- "routerAdapter wraps" --> Router
+    Wiring -- "upstreamAdapter wraps" --> Proxy
+    Proxy -- "POST, Authorization: Bearer" --> Upstream
     Router --> Config
     Router --> Translate
-    Proxy --> Config
 
     Logging -. "PLANNED: not called from<br/>any package yet" .-> Server
 
     classDef implemented fill:#1f6f43,stroke:#0f3d25,color:#fff;
     classDef planned fill:#6b6b6b,stroke:#333,color:#fff,stroke-dasharray: 4 3;
-    class Server,Compress,Handler,DefRouter,DefUpstream,Config,Translate,Router,Proxy implemented;
-    class CCR,Logging planned;
+    class Server,Compress,Handler,Seams,Wiring,Config,Translate,Router,Proxy,CCR,MGMT implemented;
+    class Logging planned;
 ```
 
-**Reading this diagram:** the solid box around `internal/gateway` is the only thing that runs end-to-end today. `internal/router` and `internal/proxy` are fully implemented and independently tested, but the gateway package deliberately does not import them (`internal/gateway/messages.go:19-27`) — it defines its own minimal `Router`/`Upstream` interfaces (`DefRouter`/`DefUpstream` above) so it works standalone. `Server.Router`/`Server.Upstream` are exported fields a caller can overwrite before `Start()` to get the fuller behaviour; whether `cmd/ccr` does that once it exists is unconfirmed. `internal/logging` is not called from anywhere yet.
+**Reading this diagram:** `internal/gateway/messages.go` declares its own narrow `Router`/`Upstream` interfaces plus minimal in-package default implementations, so the gateway package compiles and serves correctly on its own, without importing `internal/router`/`internal/proxy` directly (`internal/gateway/messages.go:19-27`, `29-39`). A separate file in the *same* package, `internal/gateway/wiring.go`, adapts the real `internal/router.Select` and `internal/proxy.Client` onto those seams via `Server.WireDefaults(timeout)`. **`cmd/ccr` always calls `WireDefaults`** before starting a gateway (`cmd/ccr/serve.go:44-51`), so a CLI-launched gateway gets the full haiku-tier-aware routing and streaming-safe upstream client — the minimal built-ins (`defaultRouter`/`defaultUpstream`) only matter if `internal/gateway` is used as a library directly, without also calling `WireDefaults`. `internal/logging` is not called from anywhere yet. `cmd/ccr` also runs a second, much smaller HTTP server (the "management" interface, fixed default `127.0.0.1:3458`) alongside the gateway — it is a separate `net/http.ServeMux` in `cmd/ccr/management.go`, not part of `internal/gateway` at all.
 
-## Request sequence (implemented path)
-
-This is the sequence for the code that exists and is tested today — `POST /v1/messages` served through `defaultRouter`/`defaultUpstream`.
+## Request sequence: `POST /v1/messages`, as launched via `cmd/ccr`
 
 ```mermaid
 sequenceDiagram
@@ -61,15 +59,16 @@ sequenceDiagram
     participant CC as Claude Code
     participant MW as compressionMiddleware
     participant H as handleMessages
-    participant R as Server.Router<br/>(defaultRouter)
+    participant R as routerAdapter<br/>(wraps router.Select)
     participant T as translate.AnthropicToOpenAI
-    participant U as Server.Upstream<br/>(defaultUpstream)
+    participant U as upstreamAdapter<br/>(wraps proxy.Client.Do)
     participant P as Upstream provider
 
     CC->>MW: POST /v1/messages<br/>(Anthropic JSON, Accept-Encoding)
     MW->>H: forward (wraps response writer<br/>if compression negotiated)
     H->>H: decode body -> AnthropicRequest<br/>[400 on bad JSON]
     H->>R: Route(req)
+    Note over R: model contains "haiku" AND<br/>Router.background set?<br/>-> Router.background<br/>else -> Router.default<br/>else -> fallback: first provider,<br/>first model
     R-->>H: (Provider, model) or error<br/>[503 if no route]
     H->>T: AnthropicToOpenAI(req, Options{<br/>CleanCache, StreamOptions,<br/>EnsureToolParameters:true, Model})
     T-->>H: OpenAIRequest or error<br/>[400 e.g. unsupported image block]
@@ -77,10 +76,11 @@ sequenceDiagram
     alt non-streaming request
         H->>H: ctx = context.WithTimeout(UpstreamTimeout)
     else streaming request
-        H->>H: ctx = request context, no added deadline
+        H->>H: ctx = request context, no context deadline added here
     end
     H->>U: Do(ctx, provider, body)
-    U->>P: POST provider.APIBaseURL<br/>Authorization: Bearer key<br/>Accept: text/event-stream if streaming
+    Note over U: proxy.Client's Transport.ResponseHeaderTimeout<br/>bounds only the header wait — for a streaming<br/>call this is the ONLY timeout in play
+    U->>P: POST provider.APIBaseURL<br/>Authorization: Bearer key<br/>(Authorization never echoed into any error)
     P-->>U: HTTP response (2xx or error)
     U-->>H: *http.Response or transport error<br/>[502 on transport error]
     alt upstream status >= 400
@@ -98,34 +98,34 @@ sequenceDiagram
     end
 ```
 
-Sources: `internal/gateway/messages.go:178-244` (orchestration), `258-318` (error mapping), `322-382` (non-streaming), `384-547` (streaming). Verified end-to-end by `internal/gateway/messages_test.go`.
+Sources: `internal/gateway/messages.go:178-244` (orchestration), `258-318` (error mapping), `322-382` (non-streaming), `384-547` (streaming); `internal/gateway/wiring.go` (adapters); `cmd/ccr/serve.go:44-51` (the `WireDefaults` call). Verified end-to-end by `internal/gateway/messages_test.go`, `internal/router/router_test.go`, `internal/proxy/proxy_test.go`.
 
-## Request sequence (PLANNED — full routing/proxy wiring)
+## Request sequence: `internal/gateway` used as a library, without `WireDefaults`
 
-If `cmd/ccr` (or any caller) swaps `Server.Router`/`Server.Upstream` for adapters around `internal/router.Select` and `internal/proxy.Client` before calling `Start()`, the sequence gains haiku-tier-aware routing and header-only upstream timeouts:
+If you build `gateway.New(cfg, opt)` yourself and skip `srv.WireDefaults(0)`, you get the package's own minimal built-ins instead — this is what `internal/gateway` falls back to on its own, and is **not** what `cmd/ccr` does:
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant CC as Claude Code
     participant H as handleMessages
-    participant R as internal/router.Select
-    participant U as internal/proxy.Client.Do
+    participant R as defaultRouter
+    participant U as defaultUpstream
     participant P as Upstream provider
 
-    CC->>H: POST /v1/messages (model id may<br/>contain "haiku")
-    H->>R: Select(cfg, req)
-    Note over R: model contains "haiku" AND<br/>Router.background set?<br/>-> Router.background<br/>else -> Router.default<br/>else -> fallback: first provider,<br/>first model
-    R-->>H: (Provider, model)
-    H->>U: Do(ctx, provider, body, stream)
-    Note over U: Transport.ResponseHeaderTimeout<br/>bounds only the header wait —<br/>never the streaming body
-    U->>P: POST (Authorization never<br/>echoed into any error)
+    CC->>H: POST /v1/messages
+    H->>R: Route(req)
+    Note over R: resolves Router.default ONLY —<br/>no haiku-tier check, no fallback<br/>to a first-provider default
+    R-->>H: (Provider, model) or error
+    H->>U: Do(ctx, provider, body)
+    Note over U: plain net/http call, http.DefaultClient<br/>if none supplied — no ResponseHeaderTimeout,<br/>so a streaming call has NO timeout protection at all
+    U->>P: POST (Authorization: Bearer key)
     P-->>U: response
     U-->>H: *http.Response
-    H-->>CC: (as in the implemented sequence)
+    H-->>CC: (translation/streaming/error handling identical<br/>to the CLI-wired path — only routing/timeout differ)
 ```
 
-This diagram is a **design projection**, not a description of running code — no file in this repository currently performs this wiring. Sources for the individual behaviours: `internal/router/router.go:40-63`, `internal/proxy/proxy.go:26-84`.
+Sources: `internal/gateway/messages.go:41-82` (`defaultRouter`, `defaultUpstream`).
 
 ## Transport negotiation
 
@@ -150,7 +150,7 @@ stateDiagram-v2
     Serving --> [*]: Shutdown(ctx)
 ```
 
-Source: `internal/gateway/gateway.go:135-168` (`Start`), `internal/gateway/compress.go:120-128` (`altSvcMiddleware`, registered only when `EnableHTTP3`). Tested at `internal/gateway/gateway_test.go:165-192`.
+Source: `internal/gateway/gateway.go:135-168` (`Start`), `internal/gateway/compress.go:120-128` (`altSvcMiddleware`, registered only when `EnableHTTP3`). Tested at `internal/gateway/gateway_test.go:165-192`. **Note:** `cmd/ccr` always calls `gateway.New(cfg, gateway.Options{Port: defaultGatewayPort})` with no TLS fields set (`cmd/ccr/serve.go:46`) — so in practice, a CLI-launched gateway always takes the `ServePlainHTTP` branch today. `CertFile`/`KeyFile`/`EnableHTTP3` are only reachable via direct library use; see `docs/USER_GUIDE.md` §5.
 
 ### Content-encoding negotiation (evaluated per-request)
 
@@ -181,7 +181,25 @@ stateDiagram-v2
     Close --> [*]
 ```
 
-Source: `internal/gateway/compress.go:39-118` (`negotiate`, `compressionMiddleware`). Negotiation matrix tested exhaustively at `internal/gateway/gateway_test.go:27-47` (e.g. `"br;q=0.1, gzip;q=0.9"` still resolves to brotli — preference is by capability, not `q`).
+Source: `internal/gateway/compress.go:39-118` (`negotiate`, `compressionMiddleware`). Negotiation matrix tested exhaustively at `internal/gateway/gateway_test.go:27-47` (e.g. `"br;q=0.1, gzip;q=0.9"` still resolves to brotli — preference is by capability, not `q`). This middleware wraps **every** response on the gateway (3456) — the separate management server (3458, `cmd/ccr/management.go`) does not use it and sends plain, uncompressed responses.
+
+## `cmd/ccr` process/service lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> NotRunning
+    NotRunning --> Detaching: ccr start / ccr ui
+    Detaching --> Running: spawnDetached (setsid) launches<br/>"ccr serve" as a child;<br/>PID/host/port written to<br/>~/.claude-code-router/service.json
+    NotRunning --> RunningForeground: ccr serve / ccr web<br/>(blocks this terminal)
+    RunningForeground --> NotRunning: SIGINT/SIGTERM -><br/>graceful shutdown (10s grace)
+
+    Running --> Running: ccr start / ui again while<br/>tracked PID is alive -> refused,<br/>reports existing PID (exit 1)
+    Running --> NotRunning: ccr stop -> SIGTERM,<br/>poll up to 5s, SIGKILL if still alive,<br/>pidfile removed
+    Running --> StaleTracked: tracked process dies<br/>on its own (crash, OOM, ...)
+    StaleTracked --> NotRunning: ccr stop (or a new start)<br/>detects dead PID, cleans up<br/>the stale pidfile
+```
+
+Source: `cmd/ccr/service.go` (pidfile read/write/remove, `processAlive` via signal 0, `spawnDetached` via `setsid` on Unix), `cmd/ccr/serve.go:80-95` (signal handling + graceful shutdown). Tested at `cmd/ccr/main_test.go:67-86`.
 
 ## Config data model
 
@@ -221,15 +239,19 @@ classDiagram
     Route ..> SplitRoute : default/background/think/longContext\nparsed as "provider,model"
     Provider ..> SplitRoute : referenced by name
 
-    note for Route "Only Default/Background currently\ndrive routing behaviour (internal/router\nand the gateway's defaultRouter).\nThink/LongContext are validated but\nunconsumed — PLANNED."
-    note for Transformer "Known values: \"cleancache\", \"streamoptions\".\nMapped to translate.Options by\nrouter.TransformerOptions (standalone,\nnot wired into the live gateway) and,\nseparately, inline in messages.go\nvia Provider.Has(...)."
+    note for Route "Default/Background drive routing\n(internal/router.Select, wired in by\ncmd/ccr). Think/LongContext are\nvalidated but unconsumed — PLANNED."
+    note for Transformer "Known values: \"cleancache\", \"streamoptions\".\nstreamoptions is fully wired end-to-end.\ncleancache is read into Options.CleanCache\nbut nothing currently consumes that field —\nsee docs/FAQ.md Q5."
 ```
 
 Source: `internal/config/config.go:31-76` (types), `internal/config/config.go:122-172` (`Validate`, `SplitRoute`), `internal/config/config.go:174-182` (`ProviderByName`).
 
-## Why the gateway package doesn't import `internal/router`/`internal/proxy`
+## Why the gateway package doesn't import `internal/router`/`internal/proxy` directly
 
-This is a deliberate seam, not an oversight, and worth calling out architecturally: three packages (`internal/router`, `internal/proxy`, `internal/gateway`) were built in parallel by separate efforts against the same `internal/config`/`internal/translate` foundations. Rather than have `internal/gateway` depend on the exact API shape `internal/router`/`internal/proxy` might settle on, `internal/gateway/messages.go` defines its **own** narrow interfaces (`Router`, `Upstream` — `internal/gateway/messages.go:29-39`) and ships minimal working default implementations, so the gateway is independently testable and functional before those integration decisions are finalised. The cost of this seam is that, as shipped, the live gateway's routing is `Router.default`-only (no haiku-tier awareness) and its upstream timeout semantics differ from `internal/proxy.Client`'s (a whole-call context deadline for non-streaming requests, vs. a response-header-only deadline) — see `docs/FAQ.md` Q10, Q10a, and Q18 for the exact behavioural differences, and `docs/USER_GUIDE.md` §4.1 for how to close the gap by assigning `Server.Router`/`Server.Upstream` before `Start()`.
+This is a deliberate seam, not an oversight, and worth calling out architecturally: `internal/router`, `internal/proxy`, and `internal/gateway` were built in parallel by separate efforts against the same `internal/config`/`internal/translate` foundations. Rather than have `internal/gateway` depend on the exact API shape `internal/router`/`internal/proxy` might settle on, `internal/gateway/messages.go` defines its **own** narrow interfaces (`Router`, `Upstream` — `internal/gateway/messages.go:29-39`) and ships minimal working default implementations, so the gateway package is independently testable and functional on its own. A later file in the same package, `internal/gateway/wiring.go`, adapts the real packages onto those seams (`routerAdapter`, `upstreamAdapter`, `Server.WireDefaults`), and `cmd/ccr` always calls it (`cmd/ccr/serve.go:44-51`). The seam still matters for anyone using `internal/gateway` as a library directly: skip the `WireDefaults` call and you silently get `Router.default`-only routing and an upstream client with no header-timeout protection — see `docs/FAQ.md` Q10/Q10a for the exact behavioural differences, and `docs/USER_GUIDE.md` §4.2 for how the CLI closes the gap.
+
+## Explicitly out of scope (not merely unimplemented)
+
+`test/PORTING-MATRIX.md` — produced by porting the *behavioural intent* of the upstream Node router's own test suites into this Go module — draws a hard line between "missing but wanted" (**GAP**, tracked by a skipped Go test) and "an entire upstream subsystem this router never intended to replicate" (**N/A**). The N/A list is architecturally significant: no Electron-style core/gateway process split, no billing telemetry, no ToolHub/MCP runtime, no OAuth provider-plugin auth, no router rules DSL / `ModelRegistry` / `RoutePolicyEngine`, no "Fusion" vendor-specific routing, no hosted web-search bridging, and no protocols beyond Anthropic Messages → OpenAI chat-completions (no OpenAI Responses, no Gemini). The tracked GAPs that *are* in scope but not yet built: explicit per-request provider/model selectors, retry/fallback on a failed upstream call, corporate outbound-proxy support, inbound gateway authentication, and a provider protocol/type field (every configured provider is currently treated as OpenAI-chat-completions-shaped, unconditionally). See `docs/FAQ.md` Q28/Q29 for the operator-facing version of this.
 
 ## Summary: implemented vs. planned
 
@@ -238,11 +260,14 @@ This is a deliberate seam, not an oversight, and worth calling out architectural
 | Config load/validate | Implemented (`internal/config`) |
 | Request translation (Anthropic → OpenAI) | Implemented (`internal/translate`) |
 | Response translation (OpenAI → Anthropic, buffered + SSE) | Implemented, but lives in `internal/gateway/messages.go`, not `internal/translate` |
-| `cache_control` stripping | Implemented as a function (`translate.StripCacheControl`); not observed to be called from `internal/gateway/messages.go` — `cleancache` is passed to `AnthropicToOpenAI` via `Options.CleanCache`, but that field is not read inside `AnthropicToOpenAI` itself (see `docs/FAQ.md` and the field's doc comment) |
-| Gateway transport (HTTP/1.1, HTTP/2, HTTP/3, compression) | Implemented |
+| `cache_control` stripping | Implemented as a function (`translate.StripCacheControl`, `json.Number`-safe); not called from `internal/gateway/messages.go` — `cleancache` reaches `Options.CleanCache`, but nothing currently reads that field (`docs/FAQ.md` Q5) |
+| Gateway transport (HTTP/1.1, HTTP/2, HTTP/3, compression) | Implemented; TLS/HTTP-3 not yet CLI-exposed |
 | `GET /health`, `GET /ready`, `POST /v1/messages` | Implemented |
-| Full haiku-aware routing live in the gateway | PLANNED (library exists, not wired) |
-| Streaming-safe/secret-safe upstream client live in the gateway | PLANNED (library exists, not wired) |
+| CLI (`cmd/ccr`: `start`/`ui`/`serve`/`web`/`stop`, pidfile service management) | Implemented |
+| Separate management control-plane server | Implemented, deliberately minimal (own `/health`, placeholder `/`) |
+| Full haiku-aware routing + streaming-safe upstream client, live in the CLI-launched gateway | Implemented, via `Server.WireDefaults` (always called by `cmd/ccr`) |
+| Same, for `internal/gateway` used as a **library** without calling `WireDefaults` | Falls back to minimal built-ins — a real, permanent seam, not a gap to be closed |
 | `Router.think` / `Router.longContext` routing behaviour | PLANNED (config accepts and validates the fields; nothing consumes them) |
-| CLI (`cmd/ccr`) | PLANNED (empty directory) |
 | Structured logging (`internal/logging`) | PLANNED (empty directory) |
+| Explicit provider/model selector, retry/fallback, corporate outbound proxy, inbound auth, provider protocol/type field | GAP — tracked in `test/PORTING-MATRIX.md`, in scope but not built |
+| Multi-protocol (OpenAI Responses, Gemini), ToolHub/MCP, billing, rules DSL, hosted web search, Electron core/gateway split | **N/A — out of scope by design**, not merely unimplemented |

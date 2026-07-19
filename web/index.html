@@ -293,14 +293,14 @@
   </p>
   <div class="badgerow">
     <span class="badge ok">●&nbsp; POST /v1/messages implemented</span>
+    <span class="badge ok">●&nbsp; CLI (ccr start/ui/serve/stop) implemented</span>
     <span class="badge ok">●&nbsp; HTTP/1.1 · HTTP/2 · HTTP/3</span>
     <span class="badge ok">●&nbsp; brotli → gzip → identity</span>
-    <span class="badge planned">◐&nbsp; CLI (cmd/ccr) planned</span>
     <span class="badge planned">◐&nbsp; structured logging planned</span>
   </div>
 
   <div class="diagram-wrap">
-    <div class="diagram" role="img" aria-label="Component diagram: Claude Code connects to the gateway, which reads config, translates requests via internal/translate, routes via a built-in default router, and calls the upstream provider. The fuller internal/router and internal/proxy packages exist but are not yet wired in by default. The CLI (cmd/ccr) and structured logging are planned.">
+    <div class="diagram" role="img" aria-label="Component diagram: Claude Code connects to the gateway, which reads config, translates requests via internal/translate, routes via internal/router and internal/proxy (wired in by cmd/ccr via WireDefaults), and calls the upstream provider. cmd/ccr also runs a separate management server. Structured logging is planned.">
       <div class="dbox impl"><b>Claude Code</b><span>Anthropic Messages API client</span></div>
       <div class="darrow">→</div>
       <div class="dbox impl"><b>internal/gateway</b><span>Server · compress · messages.go</span></div>
@@ -312,23 +312,24 @@
   </div>
   <div class="diagram-wrap">
     <div class="diagram" style="margin-top:2px;">
-      <div class="dbox planned"><b>cmd/ccr</b><span>CLI — PLANNED, empty dir</span></div>
+      <div class="dbox impl"><b>cmd/ccr</b><span>CLI — start/ui/serve/stop</span></div>
       <div class="darrow">⇢</div>
       <div class="dbox impl"><b>internal/config</b><span>Load · Validate</span></div>
       <div class="darrow">⇢</div>
-      <div class="dbox planned"><b>internal/router</b><span>haiku-aware Select() — not wired by default</span></div>
+      <div class="dbox impl"><b>internal/router</b><span>haiku-aware Select() — wired via WireDefaults</span></div>
       <div class="darrow">⇢</div>
-      <div class="dbox planned"><b>internal/proxy</b><span>streaming-safe client — not wired by default</span></div>
+      <div class="dbox impl"><b>internal/proxy</b><span>streaming-safe client — wired via WireDefaults</span></div>
     </div>
   </div>
   <div class="diagram-legend">
-    <span><span class="sw" style="background:var(--ok)"></span>Implemented &amp; wired into the running gateway</span>
-    <span><span class="sw" style="background:var(--planned)"></span>Implemented as a library but not yet wired in, or not yet started (PLANNED)</span>
+    <span><span class="sw" style="background:var(--ok)"></span>Implemented &amp; wired into the CLI-launched gateway</span>
+    <span><span class="sw" style="background:var(--planned)"></span>Not yet started (PLANNED)</span>
   </div>
+  <p class="cite">Library note: <code class="inline">internal/gateway</code> used directly (not via <code class="inline">cmd/ccr</code>) without calling <code class="inline">Server.WireDefaults()</code> falls back to minimal built-in routing/upstream logic — see docs/ARCHITECTURE.md and docs/FAQ.md Q10a.</p>
 
   <div class="cards">
     <div class="card"><h3>Byte-compatible config</h3><p>Same capitalised <code class="inline">Providers</code>/<code class="inline">Router</code> JSON shape as the Node original — an existing install, including <code class="inline">claude_toolkit</code>-managed ones, needs no changes.</p></div>
-    <div class="card"><h3>No Node.js runtime</h3><p>A single Go binary (once <code class="inline">cmd/ccr</code> lands) instead of a <code class="inline">node</code>/<code class="inline">npm</code> dependency.</p></div>
+    <div class="card"><h3>No Node.js runtime</h3><p>A single Go binary, <code class="inline">ccr</code> (built from <code class="inline">cmd/ccr</code>), instead of a <code class="inline">node</code>/<code class="inline">npm</code> dependency.</p></div>
     <div class="card"><h3>Modern transport</h3><p>Gin, optional HTTP/3 over QUIC (TLS-gated), and brotli-first content negotiation, all covered by table-driven tests.</p></div>
     <div class="card"><h3>Honest streaming &amp; errors</h3><p>SSE events flushed individually; upstream status codes preserved and re-shaped into the Anthropic error envelope, never collapsed to a generic 502.</p></div>
   </div>
@@ -428,13 +429,15 @@
       <tr><td>Anthropic → OpenAI request translation</td><td><span class="badge ok">Implemented</span></td><td>internal/translate</td></tr>
       <tr><td>OpenAI → Anthropic response translation (buffered + SSE)</td><td><span class="badge ok">Implemented</span></td><td>internal/gateway/messages.go, not internal/translate</td></tr>
       <tr><td>GET /health, GET /ready, POST /v1/messages</td><td><span class="badge ok">Implemented</span></td><td>internal/gateway</td></tr>
-      <tr><td>HTTP/1.1 · HTTP/2 · HTTP/3 (QUIC) · brotli/gzip</td><td><span class="badge ok">Implemented</span></td><td>internal/gateway</td></tr>
-      <tr><td>Haiku-tier-aware routing (internal/router.Select)</td><td><span class="badge planned">Library done, not wired</span></td><td>live gateway uses Router.default only</td></tr>
-      <tr><td>Streaming-safe upstream client (internal/proxy)</td><td><span class="badge planned">Library done, not wired</span></td><td>live gateway uses a plain net/http call</td></tr>
+      <tr><td>HTTP/1.1 · HTTP/2 · HTTP/3 (QUIC) · brotli/gzip</td><td><span class="badge ok">Implemented</span></td><td>internal/gateway; TLS/HTTP-3 not yet CLI-exposed</td></tr>
+      <tr><td>CLI: start / ui / serve / web / stop</td><td><span class="badge ok">Implemented</span></td><td>cmd/ccr, pidfile-based background service</td></tr>
+      <tr><td>Haiku-tier-aware routing (internal/router.Select)</td><td><span class="badge ok">Implemented, wired by default</span></td><td>cmd/ccr calls Server.WireDefaults()</td></tr>
+      <tr><td>Streaming-safe upstream client (internal/proxy)</td><td><span class="badge ok">Implemented, wired by default</span></td><td>cmd/ccr calls Server.WireDefaults()</td></tr>
+      <tr><td>Management control-plane server</td><td><span class="badge ok">Implemented</span></td><td>127.0.0.1:3458 default; own /health; cannot be disabled</td></tr>
       <tr><td>Router.think / Router.longContext routing behaviour</td><td><span class="badge planned">PLANNED</span></td><td>fields validate, nothing consumes them</td></tr>
       <tr><td>cleancache transformer, full effect</td><td><span class="badge planned">PLANNED</span></td><td>flag is read but StripCacheControl is never called</td></tr>
-      <tr><td>CLI (cmd/ccr)</td><td><span class="badge planned">PLANNED</span></td><td>empty directory</td></tr>
       <tr><td>Structured logging (internal/logging)</td><td><span class="badge planned">PLANNED</span></td><td>empty directory</td></tr>
+      <tr><td>Explicit provider selector, retry/fallback, inbound auth, corporate proxy</td><td><span class="badge planned">GAP</span></td><td>in scope, not built — see test/PORTING-MATRIX.md</td></tr>
     </tbody>
   </table>
 </section>

@@ -1,6 +1,8 @@
 # API Reference
 
-This is the non-interactive HTTP reference for the gateway's three routes, all registered in `internal/gateway/gateway.go:97-131`. All three are unauthenticated and un-versioned in the URL path (the API version is implicit — `/v1/messages` mirrors Anthropic's own path).
+This is the non-interactive HTTP reference for the **gateway's** three routes, all registered in `internal/gateway/gateway.go:97-131` and served on `127.0.0.1:3456` by default. All three are unauthenticated and un-versioned in the URL path (the API version is implicit — `/v1/messages` mirrors Anthropic's own path).
+
+> **Not covered here:** `cmd/ccr` also runs a second, separate HTTP server — the "management" interface, `127.0.0.1:3458` by default (`--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT`) — with its own, differently-shaped `GET /health` (`{"providers":N,"service":"ccr-management","status":"ok"}`) and a placeholder `GET /` HTML page. It is a separate `net/http.ServeMux` in `cmd/ccr/management.go`, described in its own code comment as deliberately minimal (a real web UI is out of scope for now). See `docs/USER_GUIDE.md` §4 and `docs/ADMIN_MANUAL.md` §8.
 
 | Method | Path | Purpose | Status |
 |---|---|---|---|
@@ -37,7 +39,7 @@ curl -s http://127.0.0.1:3456/health | jq
 
 ## `GET /ready`
 
-Readiness: green only when the gateway's own built-in router (see [`POST /v1/messages`](#post-v1messages) → *Routing*) could actually resolve a request today (`internal/gateway/gateway.go:113-127`).
+Readiness: green only when the router could actually resolve a request today (`internal/gateway/gateway.go:113-127`).
 
 **Request:** no body, no parameters.
 
@@ -55,7 +57,7 @@ Readiness: green only when the gateway's own built-in router (see [`POST /v1/mes
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3456/ready
 ```
 
-> This check specifically mirrors the gateway's own built-in `defaultRouter` (`Router.default`-only, no fallback — `internal/gateway/messages.go:41-60`), so it's an accurate live predictor of whether `POST /v1/messages` will route successfully. It would **not** stay accurate if the fuller `internal/router.Select` (which falls back to the first provider's first model when no route is configured at all) is later wired in as `Server.Router` — see `docs/FAQ.md` Q10/Q10a.
+> This check looks only at `Router.default`. The router that a CLI-launched gateway actually uses, `internal/router.Select` (wired in by `cmd/ccr` via `Server.WireDefaults` — `internal/gateway/wiring.go`), *additionally* falls back to the first provider's first model when no `Router` block is configured at all (`internal/router/router.go:73-86`) — so in that one specific case, `/ready` can report `503` even though `POST /v1/messages` would actually succeed. (A gateway built as a library without `WireDefaults` has no such fallback, and `/ready` matches its built-in `defaultRouter` exactly.) See `docs/FAQ.md` Q10/Q10a.
 
 ---
 
@@ -66,7 +68,7 @@ The Anthropic Messages API-compatible endpoint Claude Code actually talks to. Im
 ### Processing pipeline
 
 1. Read and JSON-decode the request body into an `AnthropicRequest` (`internal/translate.AnthropicRequest`). A read failure or invalid JSON → `400`.
-2. **Route** the request via `Server.Router.Route(&in)` to a `(config.Provider, model string)` pair. Failure (no route configured / route names an unknown provider) → `503`.
+2. **Route** the request via `Server.Router.Route(&in)` to a `(config.Provider, model string)` pair — on a CLI-launched gateway this is `internal/router.Select`'s haiku-tier-aware policy (see `docs/FAQ.md` Q10). Failure (no route configured / route names an unknown provider) → `503`.
 3. **Translate** Anthropic → OpenAI via `translate.AnthropicToOpenAI`, with per-provider options derived from the routed provider's `transformer.use` list (`CleanCache`, `StreamOptions`) plus `EnsureToolParameters` **always on** and `Model` set to the routed model id. A translation failure (e.g. an image content block) → `400`.
 4. JSON-encode the translated request. An encode failure → `500` (should not happen for a request that already parsed and translated successfully).
 5. For **non-streaming** requests only, wrap the outbound call's context in a deadline of `Options.UpstreamTimeout` (default 10 minutes). Streaming requests get no added deadline.

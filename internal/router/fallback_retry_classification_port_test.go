@@ -29,20 +29,41 @@ package router
 //     immediately" (fallbackRetryDelayAfterStatusForTest /
 //     fallbackRetryDelayAfterNetworkErrorForTest).
 //
-// None of this exists in this repository. router.Select resolves exactly
-// one (provider, model) pair per request and returns; there is no fallback
-// list, no failure classification, and proxy.Client.Do performs exactly one
-// HTTP attempt with no retry/backoff logic of any kind (see
-// internal/proxy/proxy.go's Do — it returns the first response or the first
-// transport error, full stop). A single upstream 429 or 503 today ends the
-// request; Claude Code sees the raw error with no automatic recovery.
+// GAPS CLOSED (see fallback.go): ClassifyStatus/ClassifyTransportError
+// implement the RETRYABLE/TERMINAL split; ClassifyRouteFailure ports
+// classifyRouteFailure's mode-aware table verbatim (TestClassifyRouteFailure_GAP,
+// renamed TestClassifyRouteFailure); BuildExecutionPlan ports
+// createRouteExecutionPlan's de-duplication contract (TestExecutionPlanDedup_GAP,
+// renamed TestBuildExecutionPlanDedup); FallbackRetryDelayAfterStatus /
+// FallbackRetryDelayAfterNetworkError port the backoff schedule
+// (TestFallbackRetryDelay_GAP, renamed TestFallbackRetryDelay). All four are
+// pure functions plus NextFallbackProvider, an addition (not present as a
+// single named function upstream, which threads the equivalent logic
+// through its route-execution loop) that ties classification to "which
+// provider/model to try next", satisfying task item 2's "ordered fallback
+// chain: given a primary route and a classification, produce the next
+// candidate provider to try" — and its hard rule that a Terminal
+// classification must never advance.
+//
+// What remains OUTSIDE this file's/package's scope: nothing here is wired
+// into an actual retry LOOP. proxy.Client.Do (internal/proxy, not owned by
+// this port) still makes exactly one HTTP attempt; wiring
+// ClassifyStatus/ClassifyRouteFailure/BuildExecutionPlan/NextFallbackProvider/
+// FallbackRetryDelayAfter* into an actual multi-attempt retry driver is a
+// internal/proxy and internal/gateway change, deliberately left undone here.
 
-import "testing"
+import (
+	"errors"
+	"fmt"
+	"syscall"
+	"testing"
 
-// TestClassifyRouteFailure_GAP documents the exact classification table
-// upstream enforces so a future retry/fallback implementation has a
-// ready-made acceptance test.
-func TestClassifyRouteFailure_GAP(t *testing.T) {
+	"github.com/vasic-digital/claude-code-router/internal/config"
+)
+
+// TestClassifyRouteFailure ports classifyRouteFailure's exact table from the
+// upstream comment above, verbatim.
+func TestClassifyRouteFailure(t *testing.T) {
 	type want struct {
 		failureClass   string
 		shouldFallback bool
@@ -52,61 +73,270 @@ func TestClassifyRouteFailure_GAP(t *testing.T) {
 		mode   string
 		want   want
 	}{
-		{400, "retry", want{"client", false}},
-		{400, "model-chain", want{"client", true}}, // model-chain always advances
-		{429, "retry", want{"client", true}},       // 429 is retryable even in "retry" mode
-		{503, "retry", want{"server", true}},
+		{400, ModeRetry, want{"client", false}},
+		{400, ModeModelChain, want{"client", true}}, // model-chain always advances
+		{429, ModeRetry, want{"client", true}},      // 429 is retryable even in "retry" mode
+		{503, ModeRetry, want{"server", true}},
+		// Additional coverage beyond the ported table: model-chain mode
+		// still reports the correct failureClass even though it always
+		// falls back, and an unrecognised/empty mode behaves like "retry"
+		// rather than panicking or silently always-advancing.
+		{503, ModeModelChain, want{"server", true}},
+		{401, "", want{"client", false}},
+		{500, "", want{"server", true}},
 	}
-	_ = cases
-	t.Skip("GAP: no failure-classification function exists anywhere in this repository; " +
-		"proxy.Client.Do makes exactly one attempt and returns whatever status the " +
-		"upstream sent, with no retry or fallback of any kind. (upstream: " +
-		"test/unit/gateway/routing-architecture.test.mjs)")
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s/%d", tc.mode, tc.status), func(t *testing.T) {
+			gotClass, gotFallback := ClassifyRouteFailure(tc.status, tc.mode)
+			if gotClass != tc.want.failureClass || gotFallback != tc.want.shouldFallback {
+				t.Errorf("ClassifyRouteFailure(%d, %q) = (%q, %v), want (%q, %v)",
+					tc.status, tc.mode, gotClass, gotFallback, tc.want.failureClass, tc.want.shouldFallback)
+			}
+		})
+	}
 }
 
-// TestExecutionPlanDedup_GAP documents createRouteExecutionPlan's
-// de-duplication contract: the primary model plus each distinct fallback
-// model, in order, with repeats (including a fallback model equal to the
-// primary) collapsed.
-func TestExecutionPlanDedup_GAP(t *testing.T) {
-	type attempt struct {
-		index int
-		model string
+// TestClassifyStatus table-drives the plain RETRYABLE/TERMINAL split task
+// item 2 specifies directly, independent of ClassifyRouteFailure's
+// mode-aware wrapping.
+func TestClassifyStatus(t *testing.T) {
+	cases := []struct {
+		status int
+		want   FailureClass
+	}{
+		{429, Retryable},
+		{500, Retryable},
+		{502, Retryable},
+		{503, Retryable},
+		{504, Retryable},
+		{400, Terminal},
+		{401, Terminal},
+		{402, Terminal},
+		{403, Terminal},
+		{404, Terminal},
+		{412, Terminal},
+		{418, Terminal}, // any other 4xx not explicitly listed as retryable
+		{200, Terminal}, // not even a failure status, but never Retryable either
 	}
+	for _, tc := range cases {
+		if got := ClassifyStatus(tc.status); got != tc.want {
+			t.Errorf("ClassifyStatus(%d) = %v, want %v", tc.status, got, tc.want)
+		}
+	}
+}
+
+// fakeTimeoutErr implements net.Error with Timeout()==true, standing in for
+// a real *net.OpError timeout without depending on actually triggering one.
+type fakeTimeoutErr struct{}
+
+func (fakeTimeoutErr) Error() string   { return "fake: i/o timeout" }
+func (fakeTimeoutErr) Timeout() bool   { return true }
+func (fakeTimeoutErr) Temporary() bool { return true }
+
+// TestClassifyTransportError table-drives the connection-reset/refused/
+// timeout RETRYABLE cases task item 2 specifies, plus the Terminal defaults
+// for nil and unrecognised transport errors.
+func TestClassifyTransportError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want FailureClass
+	}{
+		{"nil error", nil, Terminal},
+		{"timeout", fakeTimeoutErr{}, Retryable},
+		{"wrapped timeout", fmt.Errorf("dial: %w", fakeTimeoutErr{}), Retryable},
+		{"connection reset", fmt.Errorf("read: %w", syscall.ECONNRESET), Retryable},
+		{"connection refused", fmt.Errorf("dial: %w", syscall.ECONNREFUSED), Retryable},
+		{"unrecognised error", errors.New("tls: certificate signed by unknown authority"), Terminal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClassifyTransportError(tc.err); got != tc.want {
+				t.Errorf("ClassifyTransportError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildExecutionPlanDedup ports createRouteExecutionPlan's
+// de-duplication contract from the upstream comment above, verbatim.
+func TestBuildExecutionPlanDedup(t *testing.T) {
 	bodyModel := "Primary/alpha"
 	fallbackModels := []string{"Primary/alpha", "Secondary/beta", "Secondary/beta"}
-	want := []attempt{{0, "Primary/alpha"}, {1, "Secondary/beta"}}
-	_, _, _ = bodyModel, fallbackModels, want
-	t.Skip("GAP: router.Select returns a single (provider, model) pair; there is no " +
-		"fallback-chain / execution-plan concept, so a request never automatically " +
-		"tries a second provider or model after a failure. (upstream: " +
-		"test/unit/gateway/routing-architecture.test.mjs)")
+
+	got := BuildExecutionPlan(bodyModel, fallbackModels)
+
+	want := []Attempt{{0, "Primary/alpha"}, {1, "Secondary/beta"}}
+	if len(got) != len(want) {
+		t.Fatalf("BuildExecutionPlan len = %d, want %d (got %+v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("BuildExecutionPlan[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
 }
 
-// TestFallbackRetryDelay_GAP documents the exact backoff schedule upstream
-// uses between fallback attempts.
-func TestFallbackRetryDelay_GAP(t *testing.T) {
+// TestBuildExecutionPlanNoFallbacks covers the degenerate but common case of
+// a primary with no configured fallbacks at all: the plan is just the
+// primary, not empty and not an error.
+func TestBuildExecutionPlanNoFallbacks(t *testing.T) {
+	got := BuildExecutionPlan("Primary/alpha", nil)
+	want := []Attempt{{0, "Primary/alpha"}}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("BuildExecutionPlan = %+v, want %+v", got, want)
+	}
+}
+
+// nextFallbackCfg is the two-provider fixture NextFallbackProvider's tests
+// share: Primary is the primary attempt, Secondary the sole fallback.
+func nextFallbackCfg() *config.Config {
+	return &config.Config{
+		Providers: []config.Provider{
+			{Name: "Primary", APIBaseURL: "https://primary/x", Models: []string{"alpha"}},
+			{Name: "Secondary", APIBaseURL: "https://secondary/x", Models: []string{"beta"}},
+		},
+	}
+}
+
+// TestNextFallbackProviderAdvancesOnRetryable proves the ordinary path: a
+// Retryable failure on the primary advances to the next plan entry.
+func TestNextFallbackProviderAdvancesOnRetryable(t *testing.T) {
+	cfg := nextFallbackCfg()
+	plan := BuildExecutionPlan("Primary/alpha", []string{"Secondary/beta"})
+
+	p, model, ok, err := NextFallbackProvider(cfg, plan, "Primary/alpha", Retryable)
+	if err != nil {
+		t.Fatalf("NextFallbackProvider: %v", err)
+	}
+	if !ok {
+		t.Fatal("NextFallbackProvider: ok = false, want true")
+	}
+	if p.Name != "Secondary" || model != "beta" {
+		t.Errorf("NextFallbackProvider = (%q,%q), want (Secondary,beta)", p.Name, model)
+	}
+}
+
+// TestNextFallbackProviderNeverAdvancesOnTerminal is the hard rule task item
+// 2 calls out by name: a Terminal failure must never produce a next
+// candidate, even when the plan has one available — retrying a 401 burns
+// quota for zero chance of success.
+func TestNextFallbackProviderNeverAdvancesOnTerminal(t *testing.T) {
+	cfg := nextFallbackCfg()
+	plan := BuildExecutionPlan("Primary/alpha", []string{"Secondary/beta"})
+
+	p, model, ok, err := NextFallbackProvider(cfg, plan, "Primary/alpha", Terminal)
+	if err != nil {
+		t.Fatalf("NextFallbackProvider: unexpected error %v", err)
+	}
+	if ok {
+		t.Fatalf("NextFallbackProvider: ok = true, want false (Terminal must not advance); got (%q,%q)", p.Name, model)
+	}
+}
+
+// TestNextFallbackProviderExhaustedPlan proves that failing the LAST attempt
+// in the plan yields ok=false rather than an error — the chain is simply
+// over, which is not itself a failure of NextFallbackProvider.
+func TestNextFallbackProviderExhaustedPlan(t *testing.T) {
+	cfg := nextFallbackCfg()
+	plan := BuildExecutionPlan("Primary/alpha", []string{"Secondary/beta"})
+
+	_, _, ok, err := NextFallbackProvider(cfg, plan, "Secondary/beta", Retryable)
+	if err != nil {
+		t.Fatalf("NextFallbackProvider: unexpected error %v", err)
+	}
+	if ok {
+		t.Fatal("NextFallbackProvider: ok = true at the end of the plan, want false")
+	}
+}
+
+// TestNextFallbackProviderUnknownFailedModel covers a failedModel that is
+// not even present in plan (a caller bug, or a plan that was rebuilt
+// between attempts) — ok=false, no error, since there is no well-defined
+// "next" for a position that does not exist.
+func TestNextFallbackProviderUnknownFailedModel(t *testing.T) {
+	cfg := nextFallbackCfg()
+	plan := BuildExecutionPlan("Primary/alpha", []string{"Secondary/beta"})
+
+	_, _, ok, err := NextFallbackProvider(cfg, plan, "NotInPlan/whatever", Retryable)
+	if err != nil {
+		t.Fatalf("NextFallbackProvider: unexpected error %v", err)
+	}
+	if ok {
+		t.Fatal("NextFallbackProvider: ok = true for a model absent from plan, want false")
+	}
+}
+
+// TestNextFallbackProviderErrorsOnMisconfiguredCandidate proves a malformed
+// or unresolvable fallback entry fails loudly rather than being silently
+// skipped, matching resolveExplicitSelector's same "surface operator
+// mistakes" reasoning.
+func TestNextFallbackProviderErrorsOnMisconfiguredCandidate(t *testing.T) {
+	cfg := nextFallbackCfg()
+
+	t.Run("not a selector at all", func(t *testing.T) {
+		plan := BuildExecutionPlan("Primary/alpha", []string{"not-a-selector"})
+		_, _, ok, err := NextFallbackProvider(cfg, plan, "Primary/alpha", Retryable)
+		if ok || err == nil {
+			t.Fatalf("NextFallbackProvider: want an error for a non-selector candidate, got ok=%v err=%v", ok, err)
+		}
+	})
+
+	t.Run("unknown provider", func(t *testing.T) {
+		plan := BuildExecutionPlan("Primary/alpha", []string{"Ghost/whatever"})
+		_, _, ok, err := NextFallbackProvider(cfg, plan, "Primary/alpha", Retryable)
+		if ok || err == nil {
+			t.Fatalf("NextFallbackProvider: want an error for an unknown fallback provider, got ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+// TestFallbackRetryDelay ports fallbackRetryDelayAfterStatusForTest /
+// fallbackRetryDelayAfterNetworkErrorForTest's exact case tables from the
+// upstream comment above, verbatim.
+func TestFallbackRetryDelay(t *testing.T) {
 	cases := []struct {
 		name             string
 		failedAttemptIdx int
-		status           int
 		retryAfter       string
-		wantMillis       int
+		wantMillis       int64
 	}{
-		{"first retryable status, no Retry-After", 0, 503, "", 1000},
-		{"second attempt doubles", 1, 408, "", 2000},
-		{"Retry-After header wins", 0, 429, "3", 3000},
-		{"Retry-After: 0 is floored to the base delay", 0, 429, "0", 1000},
+		{"first retryable status, no Retry-After", 0, "", 1000},
+		{"second attempt doubles", 1, "", 2000},
+		{"Retry-After header wins", 0, "3", 3000},
+		{"Retry-After: 0 is floored to the base delay", 0, "0", 1000},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FallbackRetryDelayAfterStatus(tc.failedAttemptIdx, tc.retryAfter)
+			if got.Milliseconds() != tc.wantMillis {
+				t.Errorf("FallbackRetryDelayAfterStatus(%d, %q) = %v, want %dms", tc.failedAttemptIdx, tc.retryAfter, got, tc.wantMillis)
+			}
+		})
+	}
+
 	networkErrorCases := []struct {
 		failedAttemptIdx int
-		wantMillis       int
+		wantMillis       int64
 	}{
 		{0, 1000},
 		{2, 4000},
 	}
-	_, _ = cases, networkErrorCases
-	t.Skip("GAP: proxy.Client.Do has no retry logic at all, so there is no backoff " +
-		"schedule to port; a failed attempt is never retried, with or without a delay. " +
-		"(upstream: test/unit/gateway/router-builtins.test.mjs)")
+	for _, tc := range networkErrorCases {
+		got := FallbackRetryDelayAfterNetworkError(tc.failedAttemptIdx)
+		if got.Milliseconds() != tc.wantMillis {
+			t.Errorf("FallbackRetryDelayAfterNetworkError(%d) = %v, want %dms", tc.failedAttemptIdx, got, tc.wantMillis)
+		}
+	}
+}
+
+// TestFallbackRetryDelayUnparseableHeaderFallsBackToBackoff covers a
+// Retry-After header this package cannot parse (not a plain integer second
+// count) — it must be treated exactly like a missing header, not propagate
+// an error or panic.
+func TestFallbackRetryDelayUnparseableHeaderFallsBackToBackoff(t *testing.T) {
+	got := FallbackRetryDelayAfterStatus(1, "Wed, 21 Oct 2026 07:28:00 GMT")
+	if got.Milliseconds() != 2000 {
+		t.Errorf("FallbackRetryDelayAfterStatus with an unparseable header = %v, want 2000ms (fell back to backoff)", got)
+	}
 }

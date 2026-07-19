@@ -32,15 +32,16 @@ type Client struct {
 // generating, which can run far past any fixed per-request budget. Bounding
 // only the header wait catches a genuinely unresponsive upstream while
 // never cutting a legitimate, slow-but-alive stream short.
+//
+// Outbound calls to providers automatically honour HTTP_PROXY, HTTPS_PROXY
+// and NO_PROXY from the environment — see baseTransport (upstream_proxy.go)
+// for why that is done via a fresh per-Client lookup rather than by
+// inheriting http.DefaultTransport's Proxy field verbatim. An operator who
+// additionally needs to route through an AUTHENTICATED corporate/custom
+// proxy (one that env vars alone cannot express credentials for) should use
+// NewWithUpstreamProxy instead.
 func New(timeout time.Duration) *Client {
-	var transport *http.Transport
-	if base, ok := http.DefaultTransport.(*http.Transport); ok {
-		transport = base.Clone()
-	} else {
-		transport = &http.Transport{}
-	}
-	transport.ResponseHeaderTimeout = timeout
-	return &Client{HTTP: &http.Client{Transport: transport}}
+	return &Client{HTTP: &http.Client{Transport: baseTransport(timeout)}}
 }
 
 // Do posts body to p's endpoint and returns the upstream's raw HTTP
