@@ -54,14 +54,21 @@ don't. That is exactly what `§11.4.156` exists to catch.
 (`v0.1.0`, `v1.2.3`, ...) — matching the tag shape `git describe`,
 `goreleaser`, and both `gh release` / `glab release` expect by default.
 
-No tag has been cut yet (`git tag -l` is empty at the time this document was
-written). Recommended first release: **`v0.1.0`** — the project's own
-`README.md` "What is implemented today" / "Feature table" sections mark
-several behaviours **PLANNED** (structured logging, `Router.think`/
-`Router.longContext` routing, retry/fallback wiring), so a `0.x` series
-communicates "the wire protocol and CLI grammar are stable enough to depend
-on, but the feature set is still filling in" more honestly than jumping
-straight to `1.0.0`. Reserve `v1.0.0` for when those PLANNED rows clear.
+**`v0.1.0`** has been cut and published as a GitHub release (cross-compiled
+`linux`/`darwin`/`windows` × `amd64`/`arm64` archives + checksums). It is a
+`0.x` release because the project's own `README.md` "What is implemented
+today" / "Feature table" sections still mark several behaviours as not fully
+wired — `Router.think` routing is wired and unit-tested but inert (no `thinking`
+signal reaches the router yet; `Router.longContext` is live), and
+the retry loop's attempt budget and inbound auth have no CLI/config surface
+(the middleware is mounted but its accepted-key list is always empty). (The
+retry/fallback loop, vision/image support, structured logging, the provider
+`protocol` field with Anthropic-native passthrough, and an OpenAI
+chat-completions inbound facade — several listed as PLANNED or GAP in an
+earlier draft — have since landed and are live.) A `0.x` series communicates "the wire protocol and CLI grammar are
+stable enough to depend on, but the feature set is still filling in" more
+honestly than jumping straight to `1.0.0`. Reserve `v1.0.0` for when those
+rows clear.
 
 Within `0.x`: bump **MINOR** for a new capability (a PLANNED row moving to
 Implemented, a new CLI flag), **PATCH** for a bug fix with no interface

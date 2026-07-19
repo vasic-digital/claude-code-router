@@ -24,7 +24,7 @@ Group=ccr
 ExecStart=/usr/local/bin/ccr serve --no-open
 Restart=on-failure
 RestartSec=2
-# Config lives under the service user's $HOME by default (internal/config/config.go:78-91).
+# Config lives under the service user's $HOME by default (internal/config/config.go:148-160).
 Environment=HOME=/var/lib/claude-code-router
 WorkingDirectory=/var/lib/claude-code-router
 NoNewPrivileges=true
@@ -46,7 +46,7 @@ sudo systemctl enable --now claude-code-router
 systemctl status claude-code-router
 ```
 
-`ccr serve` handles its own graceful shutdown on `SIGTERM` (draining in-flight requests within a 10-second grace period — `cmd/ccr/serve.go:20`, `85-95`), so systemd's default `KillSignal=SIGTERM` needs no override. Because `internal/config.Dir()` resolves the config directory from `$HOME`/`os.UserHomeDir()` (`internal/config/config.go:78-91`), a dedicated service account with its own `$HOME` gives you a clean, isolated config location without any extra flag. `--no-open` avoids the unit trying (and failing) to launch a desktop browser (`--open` is otherwise off by default for `serve` anyway — `cmd/ccr/flags.go` — this flag is included here for explicitness).
+`ccr serve` handles its own graceful shutdown on `SIGTERM` (draining in-flight requests within a 10-second grace period — `cmd/ccr/serve.go:20`, `85-95`), so systemd's default `KillSignal=SIGTERM` needs no override. Because `internal/config.Dir()` resolves the config directory from `$HOME`/`os.UserHomeDir()` (`internal/config/config.go:148-160`), a dedicated service account with its own `$HOME` gives you a clean, isolated config location without any extra flag. `--no-open` avoids the unit trying (and failing) to launch a desktop browser (`--open` is otherwise off by default for `serve` anyway — `cmd/ccr/flags.go` — this flag is included here for explicitness).
 
 ### 1.2 Docker
 
@@ -59,29 +59,29 @@ docker run --rm -p 3458:3458 \
   claude-code-router:local
 ```
 
-The image's own comment block (`Dockerfile:16-33`) documents the same loopback constraint called out in §1's intro, in more detail, and is worth reading in full before you publish `-p 3456:3456` expecting it to work:
+The image's own comment block (`Dockerfile:16-34`) documents the loopback constraint in detail, and is worth reading before you publish `-p 3456:3456` expecting it to work — but note it predates the `--gateway-host` flag and is stale on one point (it says `serve.go` never sets `Host`; `serve.go:46` now sets `Host: flags.GatewayHost`, so `CCR_GATEWAY_HOST` *does* reach the gateway). The current reality:
 
-- The gateway is hard-bound to `127.0.0.1:3456` by `cmd/ccr` today — `-p 3456:3456` does **not** make it reachable from outside the container, because nothing inside the container listens on a non-loopback interface on that port.
-- The in-container `HEALTHCHECK` still works correctly regardless, since it runs inside the container's own network namespace, where `127.0.0.1` *is* the gateway.
-- The management server (3458) **does** honour `--host`/`CCR_WEB_HOST`, so `-e CCR_WEB_HOST=0.0.0.0 -p 3458:3458` exposes its `/health` and placeholder UI page externally today.
-- Use `--network host` (Linux) if you need the gateway itself reachable from outside the container before a `--host` flag for it lands.
+- The gateway defaults to `127.0.0.1:3456`, and the stock image's `CMD` (`ccr serve --host 0.0.0.0`) sets only the **management** host — so out of the box `-p 3456:3456` does **not** make the gateway reachable from outside the container, because nothing inside it listens on a non-loopback interface on 3456.
+- To expose the gateway, set its own bind address: `-e CCR_GATEWAY_HOST=0.0.0.0` (or run `ccr serve --gateway-host 0.0.0.0`) **and** publish `-p 3456:3456`. This is the supported way now — the `--network host` workaround the Dockerfile comment suggests is no longer required.
+- The in-container `HEALTHCHECK` works regardless, since it runs inside the container's own network namespace where `127.0.0.1` *is* the gateway.
+- The management server (3458) honours `--host`/`CCR_WEB_HOST`, so `-e CCR_WEB_HOST=0.0.0.0 -p 3458:3458` exposes its `/health` and placeholder UI page externally.
 
-The `ENTRYPOINT`/`CMD` run `ccr serve --host 0.0.0.0` (foreground, matching §1's "use `serve`, not `start`, under a supervisor" guidance) — `Dockerfile:114-118`. `EXPOSE 3456 3458` and `VOLUME ["/home/nonroot/.claude-code-router"]` are declared for documentation/tooling purposes; actual port publishing and volume mounting still need explicit `-p`/`-v` flags at `docker run` time, as above.
+The `ENTRYPOINT`/`CMD` run `ccr serve --host 0.0.0.0` (foreground, matching §1's "use `serve`, not `start`, under a supervisor" guidance) — `Dockerfile:117,121`. Note this exposes only the management server externally; add `-e CCR_GATEWAY_HOST=0.0.0.0` if you also need the gateway reachable. `EXPOSE 3456 3458` and `VOLUME ["/home/nonroot/.claude-code-router"]` are declared for documentation/tooling purposes; actual port publishing and volume mounting still need explicit `-p`/`-v` flags at `docker run` time, as above.
 
 Notes:
 - Publish container ports only to `127.0.0.1` on the host unless you specifically intend to expose them beyond localhost — see §5.
-- The config volume is mounted **read-write**: `cmd/ccr` writes `service.json`/`service.log` into the same `config.Dir()` (`cmd/ccr/service.go:26-27`), even though `config.json` itself is only ever read (`internal/config/config.go:102-118`). If you want a hard read-only guarantee on `config.json` specifically, mount it as an individual read-only file bind-mount instead of the whole volume.
-- `POST /v1/messages` reads provider API keys from `config.json` at request time and sends them upstream as `Authorization: Bearer <key>` (`internal/gateway/messages.go:73-76`) — see §6 on key handling before deciding whether the config volume, a secrets manager injecting the file, or an alternative mechanism fits your threat model.
+- The config volume is mounted **read-write**: `cmd/ccr` writes `service.json`/`service.log` into the same `config.Dir()` (`cmd/ccr/service.go:26-27`), even though `config.json` itself is only ever read (`internal/config/config.go:170-186`). If you want a hard read-only guarantee on `config.json` specifically, mount it as an individual read-only file bind-mount instead of the whole volume.
+- `POST /v1/messages` reads provider API keys from `config.json` at request time and sends them upstream as `Authorization: Bearer <key>` (`internal/gateway/messages.go:85-87`) — see §6 on key handling before deciding whether the config volume, a secrets manager injecting the file, or an alternative mechanism fits your threat model.
 - A `Makefile` also ships at the repository root with local build/test/release targets (`make build`, `make test`, `make cross-compile`, `make install`, etc. — run `make help` for the full list); it explicitly documents that there is no hosted CI/CD in this repository by design, so every target is meant to be run by a human or a local git hook (`Makefile:1-21`).
 
 ## 2. TLS certificates
 
-TLS is opt-in and controlled by two `internal/gateway.Options` fields, `CertFile`/`KeyFile` (`internal/gateway/gateway.go:38-41`):
+TLS is opt-in and controlled by two `internal/gateway.Options` fields, `CertFile`/`KeyFile` (`internal/gateway/gateway.go:39-42`):
 
 - Neither set → plain HTTP only (the default; matches what Claude Code and `claude_toolkit` expect out of the box).
 - Both set → HTTP/1.1 and HTTP/2 (ALPN `h2`) are served over TLS.
 - Both set **and** `EnableHTTP3` → QUIC/HTTP-3 is additionally served, and every response advertises it via `Alt-Svc: h3=":<port>"; ma=86400` (`internal/gateway/compress.go:120-128`).
-- `EnableHTTP3` set with **either** cert field missing → `Start()` returns an explicit error and refuses to boot, rather than silently serving HTTP/1.1 while claiming HTTP/3 support (`internal/gateway/gateway.go:142-147`).
+- `EnableHTTP3` set with **either** cert field missing → `Start()` returns an explicit error and refuses to boot, rather than silently serving HTTP/1.1 while claiming HTTP/3 support (`internal/gateway/gateway.go:223`).
 
 Recommended certificate sources:
 - **Public deployment**: a real CA (e.g. ACME/Let's Encrypt via a sidecar or reverse proxy that terminates TLS and hands the router plain HTTP on localhost — see §5).
@@ -98,23 +98,23 @@ Certificate rotation is the operator's responsibility — there is no hot-reload
 
 | Port | Default | Purpose |
 |---|---|---|
-| TCP/UDP `3456` | `internal/gateway/gateway.go:74-76`, fixed by `cmd/ccr` (`cmd/ccr/flags.go:26`) | **Gateway** — TCP for HTTP/1.1 and HTTP/2, UDP for HTTP/3 (QUIC) when `EnableHTTP3` is set (library-only today; not CLI-exposed — see §2). Both protocols share the same port number by design (`s.Addr()`, `internal/gateway/gateway.go:92`, used for both `h1h2` and `h3` servers in `Start()` at `135-168`). |
-| TCP `3458` | `cmd/ccr/flags.go:20-22`, configurable via `--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT` | **Management** control-plane server (`cmd/ccr/management.go`) — always started by `serve`/`start`/`ui`, cannot be disabled. Only `GET /health` and a placeholder `GET /` today. |
+| TCP/UDP `3456` | default `internal/gateway/gateway.go:106-108` (host `103-105`); configurable via `--gateway-host`/`--gateway-port`/`CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT` (`cmd/ccr/flags.go:37,43`) | **Gateway** — TCP for HTTP/1.1 and HTTP/2, UDP for HTTP/3 (QUIC) when `EnableHTTP3` is set (library-only today; not CLI-exposed — see §2). Both protocols share the same port number by design (`s.Addr()`, `internal/gateway/gateway.go:127`, used for both `h1h2` and `h3` servers in `Start()` at `212-245`). |
+| TCP `3458` | `cmd/ccr/flags.go:27-28`, configurable via `--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT` | **Management** control-plane server (`cmd/ccr/management.go`) — always started by `serve`/`start`/`ui`, cannot be disabled. Only `GET /health` and a placeholder `GET /` today. |
 
 Guidance:
-- Keep both bind addresses at the default `127.0.0.1` (`internal/gateway/gateway.go:71-73`; management defaults the same — `cmd/ccr/flags.go:21`) unless you have a specific reason to accept remote connections — see §5.
-- If you do bind either to a non-loopback address, firewall the port to only the networks/clients that should reach it (Claude Code instances, or an internal load balancer, for the gateway; whoever administers the router, for the management interface). There is no authentication built into `GET /health`/`GET /ready`/`POST /v1/messages` on the gateway (deliberately dependency-free — `internal/gateway/gateway.go:103-104`) **or** on the management server's own `/health`/`/` — anyone who can reach the gateway port can send requests billed to your configured provider keys, and the management server cannot be disabled independently of the whole service.
+- Keep both bind addresses at the default `127.0.0.1` (gateway host default `internal/gateway/gateway.go:103-105`; management defaults the same — `cmd/ccr/flags.go:27`) unless you have a specific reason to accept remote connections — see §5. The gateway's bind address is now itself configurable (`--gateway-host`/`CCR_GATEWAY_HOST`); binding it off-loopback should be a deliberate act, since it holds live provider API keys.
+- If you do bind either to a non-loopback address, firewall the port to only the networks/clients that should reach it (Claude Code instances, or an internal load balancer, for the gateway; whoever administers the router, for the management interface). `GET /health`/`GET /ready` are deliberately never authenticated (dependency-free liveness/readiness — `internal/gateway/gateway.go:158-159`). `POST /v1/messages` now carries route-scoped `RequireAPIKey` middleware (`internal/gateway/gateway.go:201`), but `cmd/ccr` never populates `Options.APIKeys` (no CLI flag or `config.json` field), and an empty key list disables authentication entirely — so on a CLI-launched gateway `POST /v1/messages` is still unauthenticated today. The management server's own `/health`/`/` are unauthenticated too. Net: anyone who can reach the gateway port can send requests billed to your configured provider keys, and the management server cannot be disabled independently of the whole service.
 - If `EnableHTTP3` is set (library use only, not yet via `cmd/ccr`), remember to open the **UDP** port in addition to TCP — QUIC runs over UDP.
 
 ## 4. Log management
 
-`internal/logging` is an empty directory — structured logging is **PLANNED** and not yet implemented. Today, the only place `gateway.go` writes anything itself is a single `fmt.Printf` when the HTTP/1.1/2 listener stops unexpectedly (`internal/gateway/gateway.go:161-164`), which goes to the process's stdout. `messages.go` itself emits no logs at all — a failed or errored request is only visible in its HTTP response, not in any server-side log line, until `internal/logging` lands. `cmd/ccr` itself only prints a handful of lifecycle lines (`gateway listening on …`, `management listening on …`, `shutting down…`) — no per-request logging exists anywhere yet.
+Structured, per-request logging is **wired and live**. `internal/logging` is a leveled `log/slog` logger configured from `CCR_LOG_LEVEL` (`debug`/`info`/`warn`/`error`, default `info`) and `CCR_LOG_FORMAT` (`text` or `json`, default `json`), wrapped in a redaction layer (`internal/logging/redact.go`) that scrubs secret-shaped keys and values before they are written. `internal/gateway/logging_middleware.go`'s `LoggingMiddleware` is mounted as the **outermost** middleware in `routes()` (`internal/gateway/gateway.go:152`), so **every** inbound request is logged exactly once — one line carrying method, path, status, duration, bytes, and a request id (an inbound `X-Request-Id` is honoured, otherwise one is generated and echoed back). It deliberately never reads request/response bodies and never logs any header value, so prompts, completions, and `Authorization`/`x-api-key` credentials are structurally absent from the log. With `cmd/ccr` (which passes no `Options.Logger`), the middleware falls back to `internal/logging.New(os.Stderr)`, so `CCR_LOG_LEVEL`/`CCR_LOG_FORMAT` take effect out of the box and the logs go to the process's stderr. In addition, a single `fmt.Printf` reports an unexpected HTTP/1.1/2 listener stop (`internal/gateway/gateway.go:240`), and `cmd/ccr` prints a handful of lifecycle lines (`gateway listening on …`, `management listening on …`, `shutting down…`).
 
 Two different log destinations depending on how you launch it:
 - **`ccr serve`** (what §1's systemd unit and Docker `ENTRYPOINT` use): everything goes to the process's own stdout/stderr — capture it the normal supervisor way.
 - **`ccr start`/`ui`**: the detached child's stdout/stderr are redirected to `~/.claude-code-router/service.log` (`cmd/ccr/service.go:120-125`), since there is no terminal left for it to write to once detached. If you use `start`/`ui` outside of a supervisor (e.g. on an interactive workstation), this file — not your terminal — is where to look when something goes wrong.
 
-Until structured logging lands, operators should:
+The structured access log is emitted to stderr; operators should:
 - Run the process under a supervisor that captures stdout/stderr (systemd + `journalctl`, or Docker's own logging driver) — i.e. use `serve`, per the note at the top of §1.
 - For systemd, logs are available via `journalctl -u claude-code-router -f`.
 - For Docker, `docker logs -f ccr`.
@@ -123,20 +123,20 @@ Until structured logging lands, operators should:
 
 ## 5. Security hardening
 
-- **Bind address**: default to `127.0.0.1` (`internal/gateway/gateway.go:71-73`). This is a deliberate compatibility choice — the whole point is that Claude Code and the existing `claude_toolkit` already expect a local, unauthenticated gateway on `127.0.0.1:3456`. If you need remote access, put a reverse proxy (nginx, Caddy, Traefik) in front that terminates TLS and adds authentication/authorization, rather than exposing the gateway directly on a public interface.
-- **Key handling**: `Provider.APIKey` (`internal/config/config.go:38`) is read straight from `config.json` in plain text and sent upstream as `Authorization: Bearer <key>` (`internal/proxy/proxy.go:70`). Treat `config.json` like a secrets file:
+- **Bind address**: default to `127.0.0.1` (`internal/gateway/gateway.go:103-105`). This is a deliberate compatibility choice — the whole point is that Claude Code and the existing `claude_toolkit` already expect a local, unauthenticated gateway on `127.0.0.1:3456`. If you need remote access, put a reverse proxy (nginx, Caddy, Traefik) in front that terminates TLS and adds authentication/authorization, rather than exposing the gateway directly on a public interface.
+- **Key handling**: `Provider.APIKey` (`internal/config/config.go:53`) is read straight from `config.json` in plain text and sent upstream as `Authorization: Bearer <key>` (`internal/proxy/proxy.go:70`). Treat `config.json` like a secrets file:
   - Restrict filesystem permissions (`0600`, owned by the service account — matching what the test suite itself writes temp configs as: `internal/config/config_test.go:12`).
   - Never commit a real `config.json` to version control.
   - `internal/proxy.Client.Do` is specifically tested to **never** leak the API key or the `Authorization` header contents into any returned error, across connection-refused, malformed-URL, and unresolvable-host failure modes (`internal/proxy/proxy_test.go:175-217`) — so error logs are safe to forward to normal aggregation, but the config file itself is not.
-- **HTTP/3 requires TLS, always** — there is no cleartext QUIC mode, and the code refuses to start otherwise (`internal/gateway/gateway.go:142-147`). Don't attempt to work around this.
-- **Recovery middleware**: the Gin engine runs with `gin.Recovery()` (`internal/gateway/gateway.go:82`), so a panic in a single request handler is converted to a 500 rather than crashing the whole process — but this is not a substitute for input validation upstream of the handler.
-- **No built-in authentication is active by default** on `/health`, `/ready`, or `POST /v1/messages` — none of the three routes registered in `internal/gateway/gateway.go:97-131` require credentials, and `cmd/ccr` does not install any. The capability exists as an opt-in library function, `gateway.RequireAPIKey(keys []string)` (`internal/gateway/auth.go`) — it accepts `Authorization: Bearer <key>` or `x-api-key: <key>`, using a constant-time comparison so response timing cannot leak key material, and rejects with a fixed `401` message that never echoes what the client sent. It is not wired into the route table by `gateway.go` or `cmd/ccr` today, so using it currently means embedding `internal/gateway` as a library and installing it yourself. Until then, if the gateway is reachable from anywhere other than trusted local processes, put an authenticating reverse proxy in front of it.
+- **HTTP/3 requires TLS, always** — there is no cleartext QUIC mode, and the code refuses to start otherwise (`internal/gateway/gateway.go:223`). Don't attempt to work around this.
+- **Recovery middleware**: the Gin engine runs with `gin.Recovery()` (`internal/gateway/gateway.go:117`), so a panic in a single request handler is converted to a 500 rather than crashing the whole process — but this is not a substitute for input validation upstream of the handler.
+- **Inbound authentication is mounted but disabled by default.** `gateway.RequireAPIKey(keys []string)` (`internal/gateway/auth.go`) is now installed as route-scoped middleware on `POST /v1/messages` only (`internal/gateway/gateway.go:201`); `/health`/`/ready` are deliberately never gated. It accepts `Authorization: Bearer <key>` or `x-api-key: <key>`, compares with a constant-time comparison so response timing cannot leak key material, and rejects with a fixed `401` message that never echoes what the client sent. **But** `cmd/ccr` never populates `Options.APIKeys` (no CLI flag, no `config.json` field), and `RequireAPIKey`'s own contract is that an EMPTY key list disables authentication entirely — every request passes through. So a CLI-launched gateway is unauthenticated by default today; setting a non-empty key list currently requires embedding `internal/gateway` as a library. Until an operator-facing switch lands, if the gateway is reachable from anywhere other than trusted local processes, put an authenticating reverse proxy in front of it.
 - **The management interface is also unauthenticated, and cannot be disabled** — `cmdServe` always starts it, regardless of `--gateway`/`--no-gateway` (`cmd/ccr/serve.go:59-70`); only its host/port are configurable, not whether it runs at all. Its code comment describes it as deliberately minimal and "out of scope" for now (`cmd/ccr/management.go:16-20`) — treat it the same as the gateway for exposure purposes: default it to loopback, and put an authenticating reverse proxy in front if you need it reachable beyond that.
-- **Provider API keys travel in the clear over your configured transport** unless you enable TLS yourself: both the CLI-wired `internal/proxy.Client` (`internal/proxy/proxy.go:70`) and the library-only built-in `defaultUpstream` (`internal/gateway/messages.go:73-76`) set `Authorization: Bearer <key>` on the outgoing upstream request — but neither one is the thing to secure; the *inbound* leg from Claude Code to the gateway is what §2's TLS guidance covers.
+- **Provider API keys travel in the clear over your configured transport** unless you enable TLS yourself: both the CLI-wired `internal/proxy.Client` (`internal/proxy/proxy.go:70`) and the library-only built-in `defaultUpstream` (`internal/gateway/messages.go:85-87`) set `Authorization: Bearer <key>` on the outgoing upstream request — but neither one is the thing to secure; the *inbound* leg from Claude Code to the gateway is what §2's TLS guidance covers.
 
 ## 6. Backup and restore of configuration
 
-The entire operational state is the single file `~/.claude-code-router/config.json` (or `%APPDATA%\claude-code-router\config.json` on Windows) — `internal/config/config.go:78-94`. There is no database, no other state directory referenced anywhere in the code read for this manual.
+The entire operational state is the single file `~/.claude-code-router/config.json` (or `%APPDATA%\claude-code-router\config.json` on Windows) — `internal/config/config.go:148-162`. There is no database, no other state directory referenced anywhere in the code read for this manual.
 
 **Backup:**
 
@@ -153,11 +153,13 @@ cp -p ~/.claude-code-router/config.json.bak.<timestamp> ~/.claude-code-router/co
 systemctl restart claude-code-router   # or: docker restart ccr
 ```
 
-**Validating a config before deploying it** — since `Load()`/`Validate()` are pure functions over the file (`internal/config/config.go:96-155`), the safest promotion path is: validate on a non-production host or in CI, then copy the already-known-good file into place. (A `ccr config validate`-style subcommand is a natural fit for `cmd/ccr` but is **PLANNED**, not present.)
+**Validating a config before deploying it** — `ccr config validate [path]` loads a config and reports **every** structural problem in one pass (not just the first), exiting `0` iff it is valid and `1` otherwise (`cmd/ccr/config_cmd.go`, `internal/config/validate_cmd.go`). Run it on a non-production host or in CI, then copy the already-known-good file into place. `ccr config show [path]` prints the effective config as indented JSON with every provider's `api_key` replaced by the fixed marker `[REDACTED]` (the real key's bytes are never marshalled — `config.Redacted`), so it is safe to paste into a bug report or a screen share. Both default `path` to the same `~/.claude-code-router/config.json` the gateway reads.
+
+**Config hot-reload** is a library (`internal/config.Watcher`, `internal/config/watch.go`): it polls the file by mtime+size and keeps the most recent **known-good** config available to concurrent readers, REJECTING any reload that fails to parse or fails `Validate()` — the previous good config keeps serving and the failure is reported via a caller-supplied `onError` callback, never by panicking or swapping in a broken config; a briefly-absent file is treated the same way (last good config keeps serving until the file reappears). **It is now wired into `ccr serve`** (and `start`/`ui`/`web`): `serve` starts a `configReloader` on `config.json` (`cmd/ccr/serve.go:93-112`, `cmd/ccr/reload.go`) that logs each validated change, keeps the previous good config on a rejected change, and is stopped cleanly on shutdown. **The honest boundary:** the running gateway captured its `*config.Config` at startup and `gateway.Server` exposes no public setter to swap it in place, so a validated reload today is *validated, logged, and kept as the latest known-good config* (`Current()`) but does **not** rebind the live listener — the running gateway keeps serving its startup config, and a process restart is still required for the new config to actually take effect (`cmd/ccr/reload.go:25-38` documents this seam).
 
 ## 7. Upgrade and rollback
 
-There is no published release artifact yet, so "upgrade" means rebuilding from a newer commit/tag:
+`v0.1.0` is tagged and published as a GitHub release (cross-compiled archives + checksums — see `docs/RELEASE.md`), so "upgrade" can mean downloading a newer release artifact, or rebuilding from a newer commit/tag:
 
 ```bash
 cd /path/to/claude-code-router
@@ -177,7 +179,7 @@ go build -o /usr/local/bin/ccr ./cmd/ccr
 
 `ccr stop` needs no special handling across a binary upgrade: it only reads the pidfile (`~/.claude-code-router/service.json`) and signals that PID (`cmd/ccr/service.go:145-184`) — it works against whatever process is currently tracked, old or new binary alike.
 
-**Configuration compatibility across upgrades**: because the config schema is deliberately byte-compatible with the upstream Node router and is validated defensively on every load (`internal/config/config.go:96-155`), an existing `config.json` should continue to load unchanged across Go-router upgrades — a break here would be treated as a regression, per the explicit toolkit-compatibility test (`internal/config/config_test.go:18-35`).
+**Configuration compatibility across upgrades**: because the config schema is deliberately byte-compatible with the upstream Node router and is validated defensively on every load (`internal/config/config.go:170-233`), an existing `config.json` should continue to load unchanged across Go-router upgrades — a break here would be treated as a regression, per the explicit toolkit-compatibility test (`internal/config/config_test.go:18-35`).
 
 **Rollback**: keep the previous binary (or container image tag) available and swap back:
 
@@ -199,7 +201,7 @@ There are **two, differently-shaped** `/health` endpoints — do not point a pro
 | Gateway | 3456 | `GET /ready` | see below |
 | Management | 3458 | `GET /health` | `{"providers":N,"service":"ccr-management","status":"ok"}` (a `map[string]any`, so `encoding/json` emits keys alphabetically, not in this listed order — `cmd/ccr/management.go:34-41`) |
 
-The gateway's two endpoints are implemented and require no authentication (`internal/gateway/gateway.go:105-127`):
+The gateway's two endpoints are implemented and require no authentication (`internal/gateway/gateway.go:102-124`):
 
 ### `GET /health`
 
@@ -217,7 +219,7 @@ A stricter **readiness** probe — green only when the router can actually resol
 
 - `200 {"status": "ready"}` when at least one provider is configured **and** `Router.default` is non-empty.
 - `503 {"status": "no providers configured"}` when `Providers` is empty.
-- `503 {"status": "no default route configured"}` when providers exist but `Router.default` is empty (`internal/gateway/gateway.go:120-124`). Be aware `/ready` checks `Router.default` specifically, while the real router `cmd/ccr` wires in, `internal/router.Select`, *does* fall back to the first provider's first model when no route string is configured at all (`internal/router/router.go:73-86`) — so on a CLI-launched gateway, `/ready` can under-report readiness slightly relative to what `POST /v1/messages` would actually resolve in that one specific "no `Router` block at all" case. (If instead you construct `gateway.New` as a library without `WireDefaults`, the built-in `defaultRouter` has no such fallback either, and `/ready` matches it exactly.)
+- `503 {"status": "no default route configured"}` when providers exist but `Router.default` is empty (`internal/gateway/gateway.go:175-179`). Be aware `/ready` checks `Router.default` specifically, while the real router `cmd/ccr` wires in, `internal/router.Select`, *does* fall back to the first provider's first model when no route string is configured at all (`internal/router/router.go:73-86`) — so on a CLI-launched gateway, `/ready` can under-report readiness slightly relative to what `POST /v1/messages` would actually resolve in that one specific "no `Router` block at all" case. (If instead you construct `gateway.New` as a library without `WireDefaults`, the built-in `defaultRouter` has no such fallback either, and `/ready` matches it exactly.)
 
 Both are covered by table-driven tests (`internal/gateway/gateway_test.go:135-161`).
 

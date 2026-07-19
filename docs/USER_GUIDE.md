@@ -23,13 +23,13 @@ Requires Go **1.26.4** or compatible (`go.mod:3`). Direct dependencies: `github.
 
 ### 2.1 File location
 
-`internal/config.Dir()` resolves the configuration directory (`internal/config/config.go:78-91`):
+`internal/config.Dir()` resolves the configuration directory (`internal/config/config.go:148-160`):
 
 - **Linux/macOS**: `~/.claude-code-router`
 - **Windows**, when `%APPDATA%` is set: `%APPDATA%\claude-code-router`
 - Any platform where `os.UserHomeDir()` fails: falls back to the relative path `.claude-code-router`
 
-The config file itself is `config.json` inside that directory (`internal/config/config.go:94`), i.e. `~/.claude-code-router/config.json` on Linux/macOS.
+The config file itself is `config.json` inside that directory (`internal/config/config.go:162`), i.e. `~/.claude-code-router/config.json` on Linux/macOS.
 
 ### 2.2 File shape
 
@@ -53,34 +53,36 @@ The JSON schema is intentionally **byte-compatible** with the upstream Node rout
 }
 ```
 
-Field reference (`internal/config/config.go:31-76`):
+Field reference (`internal/config/config.go:46-144`):
 
 | JSON key | Go field | Required | Notes |
 |---|---|---|---|
 | `Providers[].name` | `Provider.Name` | Yes | Must be non-empty and unique across the file |
 | `Providers[].api_base_url` | `Provider.APIBaseURL` | Yes | Must start with `http://` or `https://`; must be the **complete** endpoint URL (e.g. ending in `/chat/completions`) — the proxy client posts to it verbatim (`internal/proxy/proxy.go:49-53`) |
 | `Providers[].api_key` | `Provider.APIKey` | No (but needed for a real upstream) | Sent as `Authorization: Bearer <key>` (`internal/proxy/proxy.go:70`) |
-| `Providers[].models` | `Provider.Models` | No | Used by the fallback route when `Router` is empty (`internal/router/router.go:73-86`) |
-| `Providers[].transformer.use` | `Provider.Transformer.Use` | No | List of transformer names; known values today: `cleancache`, `streamoptions` (`internal/config/config.go:43-49`) |
+| `Providers[].models` | `Provider.Models` | No | Used by the first-provider fallback and by bare-model resolution when no `Router.default` is set (`internal/router/router.go:72-86`) |
+| `Providers[].transformer.use` | `Provider.Transformer.Use` | No | List of transformer names; known values today: `cleancache`, `streamoptions` (`internal/config/config.go:66-72`) |
+| `Providers[].protocol` | `Provider.Protocol` | No | `"openai"` (default) or `"anthropic"`. **Absent** → inferred from `api_base_url` (an `api.anthropic.com`/`*.anthropic.com` host or an `/anthropic` path segment → `anthropic`; else `openai`). An `anthropic` provider receives the Anthropic-shaped request **unchanged** and its response is relayed back verbatim, instead of the OpenAI translation (`internal/config/config.go:87-130`, `internal/gateway/messages.go:233-295`). Any other value is a validation error |
 | `Router.default` | `Route.Default` | No | `"provider,model"` string |
 | `Router.background` | `Route.Background` | No | `"provider,model"` string; used for Claude Code's cheap/background ("haiku") tier |
-| `Router.think` | `Route.Think` | No | Accepted and validated; **not yet consulted by routing logic** (PLANNED) |
-| `Router.longContext` | `Route.LongContext` | No | Accepted and validated; **not yet consulted by routing logic** (PLANNED) |
+| `Router.think` | `Route.Think` | No | Accepted and validated; routing branch is **wired and unit-tested but inert today** — no `thinking` signal reaches the router, so it never fires (see `docs/FAQ.md` Q11) |
+| `Router.longContext` | `Route.LongContext` | No | Accepted and validated, and **live**: a request whose estimated prompt exceeds ~60000 tokens routes here when this is set (see `docs/FAQ.md` Q11) |
 
 ### 2.3 Loading and validation behaviour
 
-`Load(path)` (`internal/config/config.go:96-118`):
+`Load(path)` (`internal/config/config.go:170-186`):
 
 - **File missing** → returns an empty, valid `*Config{}` and **no error**. The gateway is designed to boot in this state and report "not configured" via `/health`/`/ready`, rather than refusing to start.
 - **File present but malformed JSON** → returns an error. This is deliberate: silently continuing with a half-parsed config risks routing requests to the wrong upstream.
-- **File present, valid JSON, but fails `Validate()`** → returns an error. `Validate()` checks (`internal/config/config.go:122-155`):
+- **File present, valid JSON, but fails `Validate()`** → returns an error. `Validate()` checks (`internal/config/config.go:190-233`):
   - every provider has a non-empty, unique `name`;
   - every provider's `api_base_url` is non-empty and starts with `http://`/`https://`;
-  - every non-empty `Router` route (`default`, `background`, `think`, `longContext`) parses as `"provider,model"` and references a provider that actually exists in `Providers`.
+  - every non-empty `Router` route (`default`, `background`, `think`, `longContext`) parses as `"provider,model"` and references a provider that actually exists in `Providers`;
+  - every provider's `protocol`, if set, is one of `"openai"`/`"anthropic"` (an unrecognised value is a named error, not a silent fallback — `internal/config/config.go:206-215`).
 
 ### 2.4 Route string syntax
 
-A route is `"provider,model"`. Only the **first** comma is the separator — everything after it, including further commas, is the model id verbatim (`internal/config/config.go:157-172`, tested at `internal/config/config_test.go:110-124`). This matters for providers whose model ids legitimately contain commas.
+A route is `"provider,model"`. Only the **first** comma is the separator — everything after it, including further commas, is the model id verbatim (`internal/config/config.go:239-249`, tested at `internal/config/config_test.go:110-124`). This matters for providers whose model ids legitimately contain commas.
 
 ## 3. Provider setup walkthrough
 
@@ -203,14 +205,29 @@ The management server's `/health` has its **own**, differently-shaped body — d
 
 **`cmd/ccr` always calls `WireDefaults`** before starting the gateway (`cmd/ccr/serve.go:44-51`) — so every gateway started through the CLI (`start`/`ui`/`serve`/`web`) gets the fuller behaviour: haiku-tier requests route to `Router.background` when set, and the upstream client bounds only the wait for response headers rather than the whole call. This only matters to you if you use `internal/gateway` as a **library** directly (your own `main.go`, not `cmd/ccr`) and forget to call `srv.WireDefaults(0)` after `gateway.New` and before `Start()` — in that case you'd silently get the minimal built-ins instead (`Router.default`-only routing, a plain `net/http` call with no special timeout handling).
 
+### 4.3 Validating and inspecting config (`ccr config`)
+
+Two config subcommands ship in the binary (they are dispatched by `cmd/ccr/main.go` but are not part of the `--help` usage text, which is pinned to the upstream v3.0.6 grammar):
+
+```bash
+# Report EVERY structural problem in one pass; exit 0 iff valid, 1 otherwise.
+bin/ccr config validate                 # defaults to ~/.claude-code-router/config.json
+bin/ccr config validate ./staging.json  # or an explicit path
+
+# Print the effective config as JSON with every api_key replaced by [REDACTED].
+bin/ccr config show
+```
+
+`validate` uses a non-short-circuiting checker (`config.LoadForValidation` + `config.CheckAll`), so a config with several mistakes gets one complete report instead of a fix-one-rerun loop (`cmd/ccr/config_cmd.go`, `internal/config/validate_cmd.go`). `show` replaces each provider's `api_key` with the fixed marker `[REDACTED]` — the real key's bytes are never marshalled at all, so the output is safe to paste into a bug report or a screen share (`config.Redacted`). Neither command starts a server; both are pure functions over the file.
+
 ## 5. TLS and HTTP/3
 
-`internal/gateway.Options` supports TLS and HTTP/3 (`internal/gateway/gateway.go:35-47`), but `cmd/ccr` does **not** currently expose `--cert`/`--key`/`--http3` flags — `cmdServe` always constructs `gateway.Options{Port: defaultGatewayPort}` with no TLS fields set (`cmd/ccr/serve.go:46`). Reaching TLS/HTTP-3 today means using `internal/gateway` as a library directly, calling `gateway.New(cfg, gateway.Options{CertFile: ..., KeyFile: ..., EnableHTTP3: true})` yourself. Treat CLI flags for this as **PLANNED**.
+`internal/gateway.Options` supports TLS and HTTP/3 (`internal/gateway/gateway.go:35-47`), but `cmd/ccr` does **not** currently expose `--cert`/`--key`/`--http3` flags — `cmdServe` always constructs `gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort}` with no TLS fields set (`cmd/ccr/serve.go:46`). Reaching TLS/HTTP-3 today means using `internal/gateway` as a library directly, calling `gateway.New(cfg, gateway.Options{CertFile: ..., KeyFile: ..., EnableHTTP3: true})` yourself. Treat CLI flags for this as **PLANNED**.
 
 - Plain HTTP on `127.0.0.1` is the default because that is what Claude Code and the existing toolkit expect out of the box; TLS/HTTP-3 are opt-in (`internal/gateway/gateway.go:12-16`).
-- Setting **both** `CertFile` and `KeyFile` enables TLS for the HTTP/1.1 and HTTP/2 listener (`internal/gateway/gateway.go:142`, `154-160`).
+- Setting **both** `CertFile` and `KeyFile` enables TLS for the HTTP/1.1 and HTTP/2 listener (`internal/gateway/gateway.go:219`, `233-234`).
 - `EnableHTTP3` additionally serves QUIC on the same address and advertises it via an `Alt-Svc: h3=":<port>"; ma=86400` response header on every request (`internal/gateway/compress.go:120-128`).
-- **HTTP/3 requires TLS.** QUIC has no cleartext mode. If `EnableHTTP3` is set without both `CertFile` and `KeyFile`, `Start()` returns an explicit error rather than silently downgrading to HTTP/1.1 — silently downgrading would misreport the transport actually in use (`internal/gateway/gateway.go:143-147`, tested at `internal/gateway/gateway_test.go:165-174`).
+- **HTTP/3 requires TLS.** QUIC has no cleartext mode. If `EnableHTTP3` is set without both `CertFile` and `KeyFile`, `Start()` returns an explicit error rather than silently downgrading to HTTP/1.1 — silently downgrading would misreport the transport actually in use (`internal/gateway/gateway.go:223`, tested at `internal/gateway/gateway_test.go:165-174`).
 - When TLS is enabled but `EnableHTTP3` is not, the `Alt-Svc` header is never sent — the gateway never advertises a capability it doesn't have (`internal/gateway/gateway_test.go:176-184`).
 
 Generating a self-signed certificate for local testing:
@@ -236,16 +253,16 @@ No client action is required — this happens for every response, including `/he
 |---|---|---|
 | Gateway won't start, error mentions "HTTP/3 requires TLS" | `EnableHTTP3` set without both `CertFile` and `KeyFile` | Supply both, or drop `EnableHTTP3` |
 | `GET /ready` returns 503 with `"no providers configured"` | `config.json` missing or has an empty `Providers` array | Add at least one provider |
-| `GET /ready` returns 503 with `"no default route configured"` | `Router.default` is unset — this check looks **only** at `Router.default`, not at whether a provider has models (`internal/gateway/gateway.go:120-124`) | Set `Router.default` |
+| `GET /ready` returns 503 with `"no default route configured"` | `Router.default` is unset — this check looks **only** at `Router.default`, not at whether a provider has models (`internal/gateway/gateway.go:175-179`) | Set `Router.default` |
 | Config fails to load with a JSON parse error | Malformed `config.json` (trailing comma, unclosed bracket, etc.) | Validate the JSON; a missing file is fine, but broken JSON is a hard error by design |
 | Config fails to load with `"api_base_url must be http(s)"` | A `api_base_url` uses a non-`http(s)` scheme, or is missing entirely | Use the full `https://…` chat-completions URL |
 | Config fails to load with `"duplicate provider name"` | Two `Providers[]` entries share a `name` | Rename one |
 | Config fails to load with `"references unknown provider"` | A `Router` route names a provider not present in `Providers[]` | Fix the typo, or add the missing provider |
 | `POST /v1/messages` returns `503` with `{"error":{"type":"not_found_error",...}}` | No route resolvable — `Router.default` empty, or it names a provider not in `Providers[]` (`internal/gateway/messages.go:222-226`) | Fix `Router.default` |
-| `POST /v1/messages` returns `502` (`api_error`) after a delay of a few seconds | Upstream transport failure retried up to `Options.MaxAttempts` times (default 3) with exponential backoff before giving up, or an upstream response with malformed JSON / zero `choices` (`internal/gateway/messages.go:318-383` — retry loop; `489-499` — malformed/empty response) | Check the named provider's `api_base_url` and reachability; the delay before the `502` is expected, not a hang |
-| `POST /v1/messages` returns the upstream's own 4xx/5xx | The gateway preserves the upstream's exact status code rather than collapsing everything to a generic error, so Claude Code's retry/backoff logic sees the real signal. A `429`/`5xx` is retried internally first (see the row above); only a `Terminal` status (per `internal/router.ClassifyStatus`) or an exhausted retry budget is actually forwarded (`internal/gateway/messages.go:352-373`, `418-478`) | Treat it like a normal upstream API error for that provider |
+| `POST /v1/messages` returns `502` (`api_error`) after a delay of a few seconds | Upstream transport failure retried up to `Options.MaxAttempts` times (default 3) with exponential backoff before giving up, or an upstream response with malformed JSON / zero `choices` (`internal/gateway/messages.go:344-416` — retry loop; `489-499` — malformed/empty response) | Check the named provider's `api_base_url` and reachability; the delay before the `502` is expected, not a hang |
+| `POST /v1/messages` returns the upstream's own 4xx/5xx | The gateway preserves the upstream's exact status code rather than collapsing everything to a generic error, so Claude Code's retry/backoff logic sees the real signal. A `429`/`5xx` is retried internally first (see the row above); only a `Terminal` status (per `internal/router.ClassifyStatus`) or an exhausted retry budget is actually forwarded (`internal/gateway/messages.go:378-399`, `448-504`) | Treat it like a normal upstream API error for that provider |
 | Upstream call fails but the error never shows the API key | If launched via `cmd/ccr` (which calls `WireDefaults`), this is the verified behaviour of `internal/proxy.Client` (`internal/proxy/proxy.go:61-64`, `internal/proxy/proxy_test.go:175-217`). If you construct `gateway.New` as a library **without** calling `WireDefaults`, you get the smaller built-in `defaultUpstream` (`internal/gateway/messages.go:77-93`) instead, which has no equivalent dedicated key-leak test — treat its error-safety as unconfirmed in that case | Check the provider name/base URL named in the error, then verify the key out-of-band |
-| A request carrying an `x-api-key`/`Authorization` header is treated no differently from one without | `gateway.RequireAPIKey` is mounted on `POST /v1/messages` (`internal/gateway/gateway.go:161`), but `cmd/ccr` never populates `Options.APIKeys` — no CLI flag or `config.json` field exists for it yet — so the accepted-key list is always empty, which the middleware itself documents as "authentication disabled" (`internal/gateway/auth.go`) | Expected today; see README.md "Known limitations" |
+| A request carrying an `x-api-key`/`Authorization` header is treated no differently from one without | `gateway.RequireAPIKey` is mounted on `POST /v1/messages` (`internal/gateway/gateway.go:201`), but `cmd/ccr` never populates `Options.APIKeys` — no CLI flag or `config.json` field exists for it yet — so the accepted-key list is always empty, which the middleware itself documents as "authentication disabled" (`internal/gateway/auth.go`) | Expected today; see README.md "Known limitations" |
 | A vision/image request | Image content blocks (base64 or URL source) are converted to OpenAI `image_url` parts, including inside `tool_result` content — an unsupported media type, oversized payload, or malformed source is still a named `400` error rather than a silent drop (`internal/translate/anthropic.go:237-335`) | Not an error path any more for supported PNG/JPEG/GIF/WebP images; see `docs/FAQ.md` Q12 |
 | A **streaming** response never times out against a wedged upstream that never sends anything at all | Depends on wiring: `handleMessages` itself only applies `UpstreamTimeout` to the request context for **non-streaming** calls, never for streaming (`internal/gateway/messages.go:248-256`). If launched via `cmd/ccr`, `internal/proxy.Client`'s `ResponseHeaderTimeout` (also set from `UpstreamTimeout`, default 10 minutes) separately bounds the wait for the upstream's *response headers* on a streaming call too — so a CLI-launched gateway times out a streaming call that never even gets headers, but once headers (and therefore the SSE stream) start, the body can keep flowing indefinitely (`internal/gateway/wiring.go:65-71`, `internal/proxy/proxy.go:26-44`). A gateway built as a library without `WireDefaults` has no such protection at all | Expected once streaming has started; if a request never gets a first byte back, expect it to fail after `UpstreamTimeout` when CLI-launched |
 | A **non-streaming** request is cut off after `UpstreamTimeout`, even though headers came back quickly | By design: `handleMessages`'s `UpstreamTimeout` bounds the *entire* non-streaming call, retries included, via `context.WithTimeout` (`internal/gateway/messages.go:248-256`) regardless of wiring — this is stricter than `internal/proxy.Client`'s own `ResponseHeaderTimeout`, which only bounds the header wait (`internal/proxy/proxy.go:26-44`); the context deadline from `messages.go` is what actually governs a non-streaming call's total duration | Raise the gateway's `UpstreamTimeout` (currently not CLI-exposed — see §4.2/§5) if your provider's non-streaming responses are slow to fully arrive |
