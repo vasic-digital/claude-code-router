@@ -297,7 +297,17 @@ func (s *Server) handleMessages(c *gin.Context) {
 		}
 	}
 
-	resp, ok := s.doUpstreamWithRetry(c, ctx, provider, outBody, anthropicResponder{})
+	// Cross-provider fallback (opt-in) applies ONLY to the non-streaming,
+	// OpenAI-provider path: streaming cannot fall back once bytes flush, and an
+	// Anthropic-native primary uses its own passthrough transport. When the
+	// flag is off (the default) this is byte-identical to the single call.
+	var resp *http.Response
+	var ok bool
+	if !anthropicNative && !in.Stream && s.cfg.Router.CrossProviderFallback {
+		resp, ok = s.acquireOpenAIWithFallback(c, ctx, &in, provider, model, anthropicResponder{})
+	} else {
+		resp, ok, _ = s.doUpstreamWithRetry(c, ctx, provider, outBody, anthropicResponder{}, false)
+	}
 	if !ok {
 		// A terminal failure, an exhausted retry budget, or a cancelled
 		// context has already written the response — nothing left to do.
@@ -336,6 +346,88 @@ func (s *Server) handleMessages(c *gin.Context) {
 		}
 	}
 	respondNonStreamingBytes(c, raw, model)
+}
+
+// openAIBodyFor translates the Anthropic request into the OpenAI upstream body
+// for a specific (provider, model), applying that provider's transformer flags.
+// It is the per-attempt body builder cross-provider fallback needs: each
+// candidate provider may declare different transformers and is sent a different
+// model id, so the body must be rebuilt per attempt.
+func (s *Server) openAIBodyFor(in *translate.AnthropicRequest, prov config.Provider, model string) ([]byte, error) {
+	outReq, err := translate.AnthropicToOpenAI(in, translate.Options{
+		CleanCache:           prov.Has("cleancache"),
+		StreamOptions:        prov.Has("streamoptions"),
+		EnsureToolParameters: true,
+		Model:                model,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(outReq)
+}
+
+// acquireOpenAIWithFallback drives cross-provider fallback for the non-streaming
+// OpenAI path. It tries the primary and, on a RETRYABLE failure (5xx/429/
+// transport) that exhausts the primary's same-provider retries, each other
+// configured provider that also serves the model (router.BuildProviderPlan
+// order: explicit Router.fallback chain, then auto-discovered same-model
+// providers), re-translating the request for each. A Terminal failure never
+// falls back. Only OpenAI-shaped candidates are attempted — an Anthropic-native
+// entry in the plan is skipped, since this path OpenAI-translates.
+//
+// It returns (resp, true) on the FIRST success. On total failure the error has
+// already been written by the final attempt (which runs with canFallback=false),
+// so the caller simply returns.
+func (s *Server) acquireOpenAIWithFallback(c *gin.Context, ctx context.Context, in *translate.AnthropicRequest, primary config.Provider, primaryModel string, er errorResponder) (*http.Response, bool) {
+	plan := router.BuildProviderPlan(s.cfg, &primary, primaryModel, s.cfg.Router.Fallback)
+
+	type attempt struct {
+		prov  config.Provider
+		model string
+	}
+	attempts := make([]attempt, 0, len(plan))
+	for _, a := range plan {
+		prov, m, err := router.ResolveAttempt(s.cfg, a)
+		if err != nil || prov.ResolvedProtocol() != config.ProtocolOpenAI {
+			// Unresolvable (a misconfigured explicit chain entry) or
+			// Anthropic-native — not attemptable on the OpenAI-translate path.
+			continue
+		}
+		attempts = append(attempts, attempt{*prov, m})
+	}
+	if len(attempts) == 0 {
+		// Defensive: the primary is OpenAI-shaped on this path, so it is always
+		// present. Fall back to a single primary attempt rather than 500.
+		body, err := s.openAIBodyFor(in, primary, primaryModel)
+		if err != nil {
+			er.writeError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return nil, false
+		}
+		resp, ok, _ := s.doUpstreamWithRetry(c, ctx, primary, body, er, false)
+		return resp, ok
+	}
+
+	for i, at := range attempts {
+		body, err := s.openAIBodyFor(in, at.prov, at.model)
+		if err != nil {
+			er.writeError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+			return nil, false
+		}
+		canFallback := i < len(attempts)-1
+		resp, ok, tryNext := s.doUpstreamWithRetry(c, ctx, at.prov, body, er, canFallback)
+		if ok {
+			return resp, true
+		}
+		if !tryNext {
+			// Terminal, ctx-ended, or the last provider exhausted: the error is
+			// already written. Stop.
+			return nil, false
+		}
+		// tryNext: this provider is retryable-exhausted; try the next one.
+	}
+	// Unreachable: the last attempt runs with canFallback=false, which never
+	// returns tryNext=true. Terminating return for the compiler.
+	return nil, false
 }
 
 // ---------- Retry loop ----------
@@ -384,7 +476,7 @@ var (
 // would corrupt an in-flight SSE conversation Claude Code is already
 // consuming, and cannot happen because this function has, by construction,
 // no further opportunity to run once streamAnthropicSSE starts.
-func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provider config.Provider, body []byte, er errorResponder) (*http.Response, bool) {
+func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provider config.Provider, body []byte, er errorResponder, canFallback bool) (*http.Response, bool, bool) {
 	maxAttempts := s.opt.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = defaultMaxAttempts
@@ -394,10 +486,11 @@ func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provid
 		if err := ctx.Err(); err != nil {
 			// The client disconnected, or (non-streaming only) the overall
 			// request deadline already passed, before this attempt even
-			// started. Hammering the upstream further would serve no one.
+			// started. A ctx failure NEVER falls back — whoever would receive a
+			// retry (or another provider's answer) is already gone.
 			er.writeError(c, http.StatusGatewayTimeout, "api_error",
 				fmt.Sprintf("request context ended before attempt %d: %v", attempt+1, err))
-			return nil, false
+			return nil, false, false
 		}
 
 		resp, err := s.Upstream.Do(ctx, provider, body)
@@ -406,16 +499,24 @@ func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provid
 				if !sleepForRetry(ctx, retryDelayAfterNetworkError(attempt)) {
 					er.writeError(c, http.StatusGatewayTimeout, "api_error",
 						fmt.Sprintf("request context ended while waiting to retry: %v", ctx.Err()))
-					return nil, false
+					return nil, false, false
 				}
 				continue
 			}
+			// Same-provider retries exhausted (or a one-shot terminal transport
+			// error). If the failure is Retryable and the caller has ANOTHER
+			// provider to try, signal tryNext WITHOUT writing — the next
+			// provider gets a clean slate; the last one (canFallback=false)
+			// writes the error.
+			if router.ClassifyTransportError(err) == router.Retryable && canFallback {
+				return nil, false, true
+			}
 			er.writeError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("upstream request failed: %v", err))
-			return nil, false
+			return nil, false, false
 		}
 
 		if resp.StatusCode < 400 {
-			return resp, true
+			return resp, true, false
 		}
 
 		if router.ClassifyStatus(resp.StatusCode) == router.Retryable && attempt+1 < maxAttempts {
@@ -429,26 +530,30 @@ func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provid
 			if !sleepForRetry(ctx, retryDelayAfterStatus(attempt, retryAfter)) {
 				er.writeError(c, http.StatusGatewayTimeout, "api_error",
 					"request context ended while waiting to retry")
-				return nil, false
+				return nil, false, false
 			}
 			continue
 		}
 
-		// Either Terminal (never retry — see the package doc on
-		// router.Retryable/Terminal) or Retryable but out of attempts:
-		// either way, report exactly what upstream said.
+		// Either Terminal (never retry, and cross-provider fallback deliberately
+		// does NOT chase a Terminal failure — a 400/401/404 is about the request
+		// or credentials, not provider health) or Retryable-but-exhausted. In
+		// the latter case, if the caller has another provider, discard and
+		// signal tryNext without writing.
+		if router.ClassifyStatus(resp.StatusCode) == router.Retryable && canFallback {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			return nil, false, true
+		}
 		er.forwardUpstream(c, resp)
 		_ = resp.Body.Close()
-		return nil, false
+		return nil, false, false
 	}
 
-	// Unreachable in practice: every branch above returns before the loop
-	// can exit on its own condition — a retryable failure only `continue`s
-	// when attempt+1 < maxAttempts guarantees another iteration is still in
-	// range. This exists solely to give the function a terminating return
-	// the compiler can see.
+	// Unreachable in practice: every branch above returns before the loop can
+	// exit on its own condition. Terminating return for the compiler.
 	er.writeError(c, http.StatusInternalServerError, "api_error", "retry loop ended without a result (this is a bug)")
-	return nil, false
+	return nil, false, false
 }
 
 // sleepForRetry blocks for d or until ctx is done, whichever comes first. It

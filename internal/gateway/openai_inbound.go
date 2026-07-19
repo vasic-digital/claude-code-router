@@ -125,7 +125,7 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 		defer cancel()
 	}
 
-	resp, ok := s.doUpstreamWithRetry(c, ctx, provider, outBody, openAIResponder{})
+	resp, ok, _ := s.doUpstreamWithRetry(c, ctx, provider, outBody, openAIResponder{}, false)
 	if !ok {
 		return
 	}

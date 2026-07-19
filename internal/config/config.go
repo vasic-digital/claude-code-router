@@ -136,6 +136,19 @@ type Route struct {
 	Background  string `json:"background,omitempty"`
 	Think       string `json:"think,omitempty"`
 	LongContext string `json:"longContext,omitempty"`
+	// CrossProviderFallback, when true, lets the gateway try another configured
+	// provider that ALSO serves the routed model if the primary fails with a
+	// RETRYABLE class (5xx / 429 / transport) after its same-provider retries.
+	// A Terminal failure (400/401/404/...) never falls back. Default false =>
+	// byte-identical single-provider behaviour. Applies only to non-streaming
+	// OpenAI-provider requests (streaming cannot fall back mid-stream; an
+	// Anthropic-native primary is not eligible).
+	CrossProviderFallback bool `json:"crossProviderFallback,omitempty"`
+	// Fallback is an optional explicit ordered "provider,model" chain tried
+	// (in order) before the auto-discovered same-model providers. Ignored
+	// unless CrossProviderFallback is true. Each entry must name a configured
+	// provider.
+	Fallback []string `json:"fallback,omitempty"`
 }
 
 // Config is the whole configuration document.
@@ -265,6 +278,18 @@ func (c *Config) Validate() error {
 		}
 		if !seen[name] {
 			return fmt.Errorf("Router.%s references unknown provider %q", label, name)
+		}
+	}
+	// Each explicit fallback entry must be a "provider,model" selector naming a
+	// configured provider — a typo here would otherwise surface only at request
+	// time as a skipped attempt.
+	for i, f := range c.Router.Fallback {
+		name, _, err := SplitRoute(f)
+		if err != nil {
+			return fmt.Errorf("Router.fallback[%d]: %w", i, err)
+		}
+		if !seen[name] {
+			return fmt.Errorf("Router.fallback[%d] references unknown provider %q", i, name)
 		}
 	}
 	// An absent/nil Cache is always valid (caching disabled). A disabled Cache
