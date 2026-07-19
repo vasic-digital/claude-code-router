@@ -64,6 +64,16 @@ Flags (start, ui, serve, web):
   --http3, --no-http3      Advertise and serve HTTP/3 (QUIC) on the gateway
                             alongside TLS (env CCR_HTTP3). Requires --tls-cert
                             and --tls-key — QUIC has no cleartext mode.
+  --api-key <key>          Accept this key for INBOUND gateway auth (repeatable;
+                            env CCR_API_KEYS = comma-separated list). Enforced on
+                            the completion routes via Authorization: Bearer <key>
+                            or x-api-key; /health and /ready are never gated.
+                            Default (none) leaves the gateway unauthenticated.
+                            Prefer CCR_API_KEYS over the flag — a flag value is
+                            visible in the process list. Keys may not contain a
+                            comma (the env-list separator).
+  --max-attempts <n>       Upstream retry budget (env CCR_MAX_ATTEMPTS). Must be
+                            >= 1; default 3.
 
   -h, --help                Show this help
 `

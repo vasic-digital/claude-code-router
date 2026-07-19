@@ -196,3 +196,126 @@ func TestParseCommonFlagsBadEnvHTTP3(t *testing.T) {
 		t.Error("bad CCR_HTTP3 should error")
 	}
 }
+
+func eqStrs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestParseCommonFlagsAPIKeysDefaults(t *testing.T) {
+	f, _, err := parseCommonFlags(nil, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(f.APIKeys) != 0 {
+		t.Errorf("APIKeys = %v, want empty by default (auth disabled)", f.APIKeys)
+	}
+}
+
+func TestParseCommonFlagsAPIKeysRepeatedFlag(t *testing.T) {
+	f, _, err := parseCommonFlags([]string{"--api-key", "k1", "--api-key", "k2"}, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !eqStrs(f.APIKeys, []string{"k1", "k2"}) {
+		t.Errorf("APIKeys = %v, want [k1 k2]", f.APIKeys)
+	}
+}
+
+func TestParseCommonFlagsAPIKeysEnvCommaList(t *testing.T) {
+	t.Setenv("CCR_API_KEYS", " a , b ,, c ")
+	f, _, err := parseCommonFlags(nil, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !eqStrs(f.APIKeys, []string{"a", "b", "c"}) {
+		t.Errorf("APIKeys = %v, want [a b c] (trimmed, empties dropped)", f.APIKeys)
+	}
+}
+
+func TestParseCommonFlagsAPIKeysFlagOverridesEnv(t *testing.T) {
+	t.Setenv("CCR_API_KEYS", "envkey1,envkey2")
+	f, _, err := parseCommonFlags([]string{"--api-key", "flagkey"}, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !eqStrs(f.APIKeys, []string{"flagkey"}) {
+		t.Errorf("APIKeys = %v, want [flagkey] — the flag must replace the env list", f.APIKeys)
+	}
+}
+
+// `--api-key ""` is an explicit "clear the accepted list" — the empty value is
+// dropped but the flag's presence still overrides the env, yielding an empty
+// list (auth DISABLED). Documents the intended override-to-empty behaviour so a
+// future change can't silently alter it.
+func TestParseCommonFlagsEmptyAPIKeyClearsEnv(t *testing.T) {
+	t.Setenv("CCR_API_KEYS", "envsecret")
+	f, _, err := parseCommonFlags([]string{"--api-key", ""}, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(f.APIKeys) != 0 {
+		t.Errorf("--api-key \"\" over CCR_API_KEYS should clear to empty (auth disabled), got %v", f.APIKeys)
+	}
+}
+
+func TestParseCommonFlagsMaxAttempts(t *testing.T) {
+	f, _, err := parseCommonFlags([]string{"--max-attempts", "5"}, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.MaxAttempts != 5 {
+		t.Errorf("MaxAttempts = %d, want 5", f.MaxAttempts)
+	}
+
+	// Default is 0 ("unset" → gateway applies its own default).
+	f2, _, _ := parseCommonFlags(nil, false, true)
+	if f2.MaxAttempts != 0 {
+		t.Errorf("default MaxAttempts = %d, want 0 (unset)", f2.MaxAttempts)
+	}
+}
+
+func TestParseCommonFlagsMaxAttemptsEnvAndPrecedence(t *testing.T) {
+	t.Setenv("CCR_MAX_ATTEMPTS", "7")
+	f, _, err := parseCommonFlags(nil, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.MaxAttempts != 7 {
+		t.Errorf("MaxAttempts from env = %d, want 7", f.MaxAttempts)
+	}
+	// Flag beats env.
+	f2, _, err := parseCommonFlags([]string{"--max-attempts", "2"}, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f2.MaxAttempts != 2 {
+		t.Errorf("MaxAttempts = %d, want the flag (2) to beat env (7)", f2.MaxAttempts)
+	}
+}
+
+func TestParseCommonFlagsMaxAttemptsErrors(t *testing.T) {
+	cases := [][]string{
+		{"--max-attempts"},        // missing value
+		{"--max-attempts", "0"},   // must be >= 1
+		{"--max-attempts", "-1"},  // negative
+		{"--max-attempts", "abc"}, // not an int
+	}
+	for _, args := range cases {
+		if _, _, err := parseCommonFlags(args, false, true); err == nil {
+			t.Errorf("parseCommonFlags(%v) did not error", args)
+		}
+	}
+	// Bad env too.
+	t.Setenv("CCR_MAX_ATTEMPTS", "0")
+	if _, _, err := parseCommonFlags(nil, false, true); err == nil {
+		t.Error("CCR_MAX_ATTEMPTS=0 should error (< 1)")
+	}
+}

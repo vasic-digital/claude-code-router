@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 )
 
 // commonFlags is the flag set shared by start, ui, serve and web.
@@ -26,6 +27,16 @@ type commonFlags struct {
 	// HTTP3 advertises and serves the gateway over HTTP/3 (QUIC) alongside the
 	// TLS TCP listener. QUIC has no cleartext mode, so it REQUIRES TLSCert+TLSKey.
 	HTTP3 bool
+	// APIKeys is the accepted-key list for INBOUND gateway authentication. Empty
+	// (the default) leaves the gateway unauthenticated exactly as before; a
+	// non-empty list makes RequireAPIKey enforce a Bearer/x-api-key match on the
+	// completion routes (never on /health or /ready). Set via repeated --api-key
+	// or the comma-separated CCR_API_KEYS env.
+	APIKeys []string
+	// MaxAttempts caps upstream request attempts (the retry budget). 0 means
+	// "unset" — the gateway applies its built-in default (3). Set via
+	// --max-attempts or CCR_MAX_ATTEMPTS; must be >= 1 when provided.
+	MaxAttempts int
 }
 
 // defaultManagementHost/Port match the Node implementation's management
@@ -99,6 +110,26 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 		}
 		f.HTTP3 = enabled
 	}
+	if v := os.Getenv("CCR_API_KEYS"); v != "" {
+		f.APIKeys = splitAPIKeys(v)
+	}
+	if v := os.Getenv("CCR_MAX_ATTEMPTS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return f, nil, fmt.Errorf("CCR_MAX_ATTEMPTS=%q is not a valid integer: %w", v, err)
+		}
+		if n < 1 {
+			return f, nil, fmt.Errorf("CCR_MAX_ATTEMPTS=%q must be >= 1", v)
+		}
+		f.MaxAttempts = n
+	}
+
+	// A --api-key flag (repeatable) OVERRIDES the CCR_API_KEYS env entirely, so an
+	// operator can shrink the accepted set on the command line even when the
+	// toolkit injects an env list. sawAPIKeyFlag distinguishes "no flag given"
+	// (keep env) from "flag given, possibly none" (replace env).
+	var apiKeysFromFlag []string
+	var sawAPIKeyFlag bool
 
 	var rest []string
 	for i := 0; i < len(args); i++ {
@@ -159,9 +190,37 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 			f.HTTP3 = true
 		case "--no-http3":
 			f.HTTP3 = false
+		case "--api-key":
+			i++
+			if i >= len(args) {
+				return f, nil, fmt.Errorf("--api-key requires a value")
+			}
+			sawAPIKeyFlag = true
+			if k := strings.TrimSpace(args[i]); k != "" {
+				apiKeysFromFlag = append(apiKeysFromFlag, k)
+			}
+		case "--max-attempts":
+			i++
+			if i >= len(args) {
+				return f, nil, fmt.Errorf("--max-attempts requires a value")
+			}
+			n, err := strconv.Atoi(args[i])
+			if err != nil {
+				return f, nil, fmt.Errorf("--max-attempts %q is not a valid integer: %w", args[i], err)
+			}
+			if n < 1 {
+				return f, nil, fmt.Errorf("--max-attempts %q must be >= 1", args[i])
+			}
+			f.MaxAttempts = n
 		default:
 			rest = append(rest, args[i])
 		}
+	}
+
+	// A --api-key flag replaces the CCR_API_KEYS env list wholesale (flag > env),
+	// so the command line is authoritative when both are present.
+	if sawAPIKeyFlag {
+		f.APIKeys = apiKeysFromFlag
 	}
 
 	// TLS cert and key are a matched pair: one without the other cannot start a
@@ -178,4 +237,17 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 	}
 
 	return f, rest, nil
+}
+
+// splitAPIKeys parses a CCR_API_KEYS env value: a comma-separated list of
+// accepted inbound keys, each trimmed of surrounding whitespace, with empty
+// elements dropped. Returns nil for an all-empty value.
+func splitAPIKeys(v string) []string {
+	var keys []string
+	for _, part := range strings.Split(v, ",") {
+		if k := strings.TrimSpace(part); k != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
 }

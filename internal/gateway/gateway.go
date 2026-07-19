@@ -58,11 +58,12 @@ type Options struct {
 	// bound how many upstream calls a retry scenario needs to arrange.
 	MaxAttempts int
 	// APIKeys, when non-empty, are the client-presented keys RequireAPIKey
-	// accepts on POST /v1/messages (via "Authorization: Bearer <key>" or
-	// "x-api-key: <key>"). /health and /ready are never gated by this — a
+	// accepts on ALL FOUR completion routes (/v1/messages, /v1/chat/completions,
+	// and their /proxy aliases), via "Authorization: Bearer <key>" or
+	// "x-api-key: <key>". /health and /ready are never gated by this — a
 	// supervisor must always be able to probe liveness/readiness regardless
 	// of auth configuration. An EMPTY (the default, zero-value) list leaves
-	// /v1/messages unauthenticated too: see auth.go's package doc for why
+	// those routes unauthenticated too: see auth.go's package doc for why
 	// that default is deliberate — the toolkit that drives this gateway
 	// today sends no client key at all, on a loopback-only listener.
 	APIKeys []string

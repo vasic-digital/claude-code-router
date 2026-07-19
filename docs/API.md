@@ -1,6 +1,6 @@
 # API Reference
 
-This is the non-interactive HTTP reference for the **gateway's** routes, all registered in `routes()` (`internal/gateway/gateway.go:132-208`) and served on `127.0.0.1:3456` by default — independently configurable via `--gateway-host`/`--gateway-port` (`CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT`), see `docs/USER_GUIDE.md` §4. There are two unauthenticated `GET` probes (`/health`, `/ready`) plus the completion endpoints: `POST /v1/messages` (Anthropic Messages — documented in full below) and `POST /v1/chat/completions` (an OpenAI chat-completions facade, `internal/gateway/openai_inbound.go`), each also reachable under the `/proxy/v1/...` alias. Every completion path is POST and dispatches through a single classifier-driven entrypoint, `handleInbound` (`internal/gateway/openai_inbound.go:44`), which routes by path→protocol (`requestProtocolForPath`, `internal/gateway/protocol.go`); OpenAI Responses and Gemini paths are recognised by that classifier but not served (no routes), so they `404`. `GET /health` and `GET /ready` are always unauthenticated by design (a supervisor must be able to probe them regardless of auth configuration); the completion routes have route-scoped API-key middleware mounted (`RequireAPIKey`, `internal/gateway/gateway.go:201`) but it is unconfigurable from `cmd/ccr` today, so they are unauthenticated too in practice — see "Authentication" below. This reference documents `POST /v1/messages` in depth; the OpenAI facade shares the same routing, auth, retry, and error-shape machinery.
+This is the non-interactive HTTP reference for the **gateway's** routes, all registered in `routes()` (`internal/gateway/gateway.go:132-208`) and served on `127.0.0.1:3456` by default — independently configurable via `--gateway-host`/`--gateway-port` (`CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT`), see `docs/USER_GUIDE.md` §4. There are two unauthenticated `GET` probes (`/health`, `/ready`) plus the completion endpoints: `POST /v1/messages` (Anthropic Messages — documented in full below) and `POST /v1/chat/completions` (an OpenAI chat-completions facade, `internal/gateway/openai_inbound.go`), each also reachable under the `/proxy/v1/...` alias. Every completion path is POST and dispatches through a single classifier-driven entrypoint, `handleInbound` (`internal/gateway/openai_inbound.go:44`), which routes by path→protocol (`requestProtocolForPath`, `internal/gateway/protocol.go`); OpenAI Responses and Gemini paths are recognised by that classifier but not served (no routes), so they `404`. `GET /health` and `GET /ready` are always unauthenticated by design (a supervisor must be able to probe them regardless of auth configuration); all four completion routes share the same route-scoped API-key middleware (`RequireAPIKey`, `internal/gateway/gateway.go:362-367`), which `cmd/ccr` now exposes as `--api-key`/`CCR_API_KEYS` — see "Authentication" below. The accepted-key list defaults to empty, which leaves the routes unauthenticated unless an operator opts in. This reference documents `POST /v1/messages` in depth; the OpenAI facade shares the same routing, auth, retry, and error-shape machinery.
 
 > **Not covered here:** `cmd/ccr` also runs a second, separate HTTP server — the "management" interface, `127.0.0.1:3458` by default (`--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT`) — with its own, differently-shaped `GET /health` (`{"providers":N,"service":"ccr-management","status":"ok"}`), the Prometheus `GET /metrics` text-exposition endpoint (`internal/metrics`; families and scrape config in `docs/ADMIN_MANUAL.md` §9), and a placeholder `GET /` HTML page. It is a separate `net/http.ServeMux` in `cmd/ccr/management.go`, described in its own code comment as deliberately minimal (a real web UI is out of scope for now). `/metrics` lives here, on the loopback control plane, deliberately **off** the gateway hot path. See `docs/USER_GUIDE.md` §4 and `docs/ADMIN_MANUAL.md` §8–§9.
 
@@ -16,13 +16,19 @@ Every response, on every route, passes through the compression middleware descri
 
 ## Authentication
 
-`internal/gateway.RequireAPIKey(keys []string)` (`internal/gateway/auth.go`) is mounted as route-scoped middleware directly ahead of `handleMessages`:
+`internal/gateway.RequireAPIKey(keys []string)` (`internal/gateway/auth.go`) is mounted once and applied to **all four** completion routes — `/v1/messages`, `/proxy/v1/messages`, `/v1/chat/completions`, `/proxy/v1/chat/completions` — ahead of the shared `handleInbound` entrypoint:
 
 ```go
-s.eng.POST("/v1/messages", RequireAPIKey(s.opt.APIKeys), s.handleMessages)
+inbound := RequireAPIKey(s.opt.APIKeys)
+for _, p := range []string{
+    "/v1/messages", "/proxy/v1/messages",
+    "/v1/chat/completions", "/proxy/v1/chat/completions",
+} {
+    s.eng.POST(p, inbound, s.handleInbound)
+}
 ```
 
-— `internal/gateway/gateway.go:201`. It is deliberately **route-scoped**, not installed via `s.eng.Use(...)`: `GET /health`/`GET /ready` are never gated, so a supervisor can always probe liveness/readiness regardless of auth configuration.
+— `internal/gateway/gateway.go:362-367`. It is deliberately **route-scoped**, not installed via `s.eng.Use(...)`: `GET /health`/`GET /ready` are never gated, so a supervisor can always probe liveness/readiness regardless of auth configuration.
 
 When `keys` (`Options.APIKeys`) is non-empty, a request must present a matching key via either header, checked in this order:
 
@@ -35,7 +41,9 @@ Comparison uses `crypto/subtle.ConstantTimeCompare`, so response timing cannot l
 {"type":"error","error":{"type":"authentication_error","message":"invalid or missing API key"}}
 ```
 
-**When `keys` is empty — which is always, on a gateway launched via `cmd/ccr`** — `RequireAPIKey` disables authentication entirely and every request passes through, exactly as if the middleware were not installed at all. `cmd/ccr` has no `--api-key`/`--api-keys` flag and no `config.json` field to populate `Options.APIKeys`, so **`POST /v1/messages` is unauthenticated on every CLI-launched gateway today**. Populating `APIKeys` is only possible by constructing `gateway.New(cfg, gateway.Options{APIKeys: [...]})` yourself as a library. See README.md "Known limitations" and `docs/FAQ.md` Q29.
+**Configuring it from `cmd/ccr`:** `Options.APIKeys` is now populated from a repeatable `--api-key <key>` flag or the comma-separated `CCR_API_KEYS` env var (`cmd/ccr/flags.go`) — a flag value wholesale **replaces** the `CCR_API_KEYS` list rather than merging with it. `ccr start`/`ui` forward accepted keys to the detached `serve` child via the inherited `CCR_API_KEYS` environment, never via argv (`cmd/ccr/service.go:107-114`) — a flag value would otherwise be visible to any local user via `ps`. **Prefer `CCR_API_KEYS` (or the environment form for `start`/`ui`) over `--api-key` for this reason.**
+
+**The default is still an empty key list**, which `RequireAPIKey` treats as "authentication disabled" — every request passes through, exactly as if the middleware were not installed at all. This preserves backward compatibility for callers that send no client key today. See README.md "Known limitations" and `docs/FAQ.md` Q29.
 
 ---
 
@@ -88,11 +96,11 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3456/ready
 
 ## `POST /v1/messages`
 
-The Anthropic Messages API-compatible endpoint Claude Code actually talks to. Implemented in `internal/gateway/messages.go:189-296` (`handleMessages`), which delegates the actual upstream call to a retry loop, `doUpstreamWithRetry` (`internal/gateway/messages.go:319-416` — see "Processing pipeline" below). Route-scoped middleware, `RequireAPIKey`, also sits in front of this handler (`internal/gateway/gateway.go:201`) — see "Authentication" below.
+The Anthropic Messages API-compatible endpoint Claude Code actually talks to. Implemented in `internal/gateway/messages.go:189-296` (`handleMessages`), which delegates the actual upstream call to a retry loop, `doUpstreamWithRetry` (`internal/gateway/messages.go:319-416` — see "Processing pipeline" below). Route-scoped middleware, `RequireAPIKey`, also sits in front of this handler (`internal/gateway/gateway.go:362-367`) — see "Authentication" below.
 
 ### Processing pipeline
 
-1. `RequireAPIKey` middleware runs first (see [Authentication](#authentication)) — a no-op today on every CLI-launched gateway.
+1. `RequireAPIKey` middleware runs first (see [Authentication](#authentication)) — a no-op unless `--api-key`/`CCR_API_KEYS` configured a non-empty key list.
 2. Cap and read the request body (`http.MaxBytesReader`, 32MiB). Over the cap → `413`; otherwise unreadable → `400`.
 3. JSON-decode the body into an `AnthropicRequest` (`internal/translate.AnthropicRequest`). Invalid JSON → `400`.
 4. **Route** the request via `Server.Router.Route(&in)` to a `(config.Provider, model string)` pair — on a CLI-launched gateway this is `internal/router.Select`'s haiku-tier-aware policy (see `docs/FAQ.md` Q10). Failure (no route configured / route names an unknown provider) → `503`.
@@ -238,7 +246,7 @@ Verified end-to-end for both an upstream-mapped error and a malformed-upstream-b
 | Status | `error.type` | Cause |
 |---|---|---|
 | `400` | `invalid_request_error` | Unreadable request body, invalid request JSON, or a translation failure (e.g. an unsupported/malformed `image` source) |
-| `401` | `authentication_error` | `RequireAPIKey` rejected the request — only possible if `Options.APIKeys` is non-empty, which no CLI-launched gateway sets today (see [Authentication](#authentication)) |
+| `401` | `authentication_error` | `RequireAPIKey` rejected the request — only possible when `Options.APIKeys` is non-empty, i.e. `--api-key`/`CCR_API_KEYS` configured at least one key (see [Authentication](#authentication)) |
 | `413` | `invalid_request_error` | Request body exceeded the 32MiB cap (`http.MaxBytesReader`) |
 | `503` | `not_found_error` | No route could be resolved (`Router.default` unset, or it names an unknown provider) |
 | `502` | `api_error` | Upstream transport failure that exhausted its retry budget; or the upstream returned a `200` with malformed JSON, or with zero `choices` |

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -101,17 +102,11 @@ func cmdStart(args []string, stdout, stderr io.Writer, isUI bool) int {
 		return 1
 	}
 
-	childArgs := []string{"serve", "--host", flags.Host, "--port", fmt.Sprintf("%d", flags.Port)}
-	if flags.Gateway {
-		childArgs = append(childArgs, "--gateway")
-	} else {
-		childArgs = append(childArgs, "--no-gateway")
-	}
-	if flags.Open {
-		childArgs = append(childArgs, "--open")
-	} else {
-		childArgs = append(childArgs, "--no-open")
-	}
+	childArgs := serveChildArgs(flags)
+
+	// Inbound API keys are secrets: hand them to the detached child through the
+	// inherited environment, NEVER via argv (which would expose them in `ps`).
+	applyChildAPIKeyEnv(flags.APIKeys)
 
 	if err := os.MkdirAll(config.Dir(), 0o755); err != nil {
 		fmt.Fprintf(stderr, "create %s: %v\n", config.Dir(), err)
@@ -181,4 +176,72 @@ func cmdStop(args []string, stdout, stderr io.Writer) int {
 	_ = removeServiceState()
 	fmt.Fprintf(stdout, "ccr stopped (pid %d).\n", st.PID)
 	return 0
+}
+
+// applyChildAPIKeyEnv makes the current process's CCR_API_KEYS env EXACTLY
+// reflect the parent's resolved inbound-key list, so the detached `serve` child
+// (which inherits os.Environ()) sees the same flag>env resolution the parent
+// computed. This must SET on a non-empty list AND UNSET on an empty one:
+// otherwise `ccr start --api-key ""` (clearing a non-empty CCR_API_KEYS present
+// in the real environment) would leave the child inheriting the stale env and
+// re-enabling auth — inconsistent with `ccr serve --api-key ""`, which disables
+// it. Keys travel by env, never argv (see serveChildArgs). The env format is
+// comma-separated, matching splitAPIKeys (so a key may not itself contain a
+// comma — documented in --help).
+func applyChildAPIKeyEnv(keys []string) {
+	if len(keys) > 0 {
+		os.Setenv("CCR_API_KEYS", strings.Join(keys, ","))
+	} else {
+		os.Unsetenv("CCR_API_KEYS")
+	}
+}
+
+// serveChildArgs builds the argv for the detached `serve` child that `start` and
+// `ui` re-exec. It forwards every NON-SECRET commonFlags field the child's
+// parseCommonFlags understands, so `ccr start --gateway-port N` (and the TLS/
+// HTTP3 flags, --max-attempts, etc.) actually reach the running gateway instead
+// of being silently dropped — the documented start/ui flag-forwarding bug, which
+// for TLS meant `ccr start --tls-cert …` silently served plaintext.
+//
+// Inbound API keys are deliberately NOT placed here: they are secrets and argv
+// is world-readable via `ps`. They reach the child through the inherited
+// CCR_API_KEYS environment instead (set by cmdStart before spawning).
+func serveChildArgs(f commonFlags) []string {
+	args := []string{
+		"serve",
+		"--host", f.Host,
+		"--port", fmt.Sprintf("%d", f.Port),
+		"--gateway-host", f.GatewayHost,
+		"--gateway-port", fmt.Sprintf("%d", f.GatewayPort),
+	}
+	if f.Gateway {
+		args = append(args, "--gateway")
+	} else {
+		args = append(args, "--no-gateway")
+	}
+	if f.Open {
+		args = append(args, "--open")
+	} else {
+		args = append(args, "--no-open")
+	}
+	// TLS cert/key are file PATHS (not secret material), safe in argv. The parent
+	// already enforced the both-or-neither invariant, so forwarding each when
+	// non-empty preserves it.
+	if f.TLSCert != "" {
+		args = append(args, "--tls-cert", f.TLSCert)
+	}
+	if f.TLSKey != "" {
+		args = append(args, "--tls-key", f.TLSKey)
+	}
+	if f.HTTP3 {
+		args = append(args, "--http3")
+	} else {
+		args = append(args, "--no-http3")
+	}
+	// 0 means "unset" (child applies its default); only forward a real value,
+	// since --max-attempts 0 would be rejected by the child.
+	if f.MaxAttempts >= 1 {
+		args = append(args, "--max-attempts", fmt.Sprintf("%d", f.MaxAttempts))
+	}
+	return args
 }

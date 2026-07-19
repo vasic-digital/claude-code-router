@@ -4,9 +4,43 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.6` (below) are the
+`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.7` (below) are the
 current releases. Entries are drawn from this repository's real `git log`
 history — nothing here is speculative.
+
+## [0.4.7] - 2026-07-20
+
+Operator control surface: inbound authentication becomes configurable, the
+retry budget is exposed, and `ccr start`/`ui` stop silently dropping gateway
+flags. All backward compatible — defaults are unchanged.
+
+### Added
+
+- **Inbound gateway authentication is now operator-configurable.** `--api-key
+  <key>` (repeatable) and `CCR_API_KEYS` (comma-separated list) populate the
+  accepted-key list that the already-present `RequireAPIKey` middleware enforces
+  on the four completion routes (`/v1/messages`, `/v1/chat/completions`, and
+  their `/proxy` aliases) via `Authorization: Bearer <key>` or `x-api-key`;
+  `/health` and `/ready` are never gated. The `--api-key` flag replaces the
+  `CCR_API_KEYS` env list (flag > env). **Default remains an empty list =
+  unauthenticated**, so existing loopback deployments are unaffected. Keys are
+  compared in constant time and never echoed in the 401 body. `ccr start`/`ui`
+  hand keys to the detached child through the inherited environment, never argv
+  (a flag value would be visible in `ps`).
+- **`--max-attempts <n>`** (env `CCR_MAX_ATTEMPTS`, must be ≥ 1) exposes the
+  upstream retry budget (`gateway.Options.MaxAttempts`); default remains 3.
+
+### Fixed
+
+- **`ccr start` / `ccr ui` now forward the gateway flags to the detached `serve`
+  child.** `--gateway-host`, `--gateway-port`, and the TLS/HTTP3 flags
+  (`--tls-cert`/`--tls-key`/`--http3`) plus `--max-attempts` were parsed by
+  `start`/`ui` but silently dropped when re-execing `serve`, so
+  `ccr start --gateway-port N` bound the default and — more seriously —
+  `ccr start --tls-cert … --tls-key …` silently served **plaintext**. The child
+  argv is now built by a single tested helper (`serveChildArgs`) whose output
+  round-trips losslessly back through the flag parser. (The `CCR_*` env path
+  already worked and still does.)
 
 ## [0.4.6] - 2026-07-20
 

@@ -116,7 +116,7 @@ bin/ccr serve            # foreground (blocks until Ctrl-C / SIGTERM) — alias:
 bin/ccr stop            # stops what "start"/"ui" started
 ```
 
-Full grammar (verbatim from `bin/ccr --help`, sourced from `cmd/ccr/main.go:28-61`):
+Full grammar (verbatim from `bin/ccr --help`, sourced from `cmd/ccr/main.go:28-79`):
 
 ```
 ccr - Claude Code Router
@@ -129,7 +129,7 @@ Usage:
   ccr <profile-name-or-id> [cli|app] [-- <agent args>]
 ```
 
-(`start`/`ui`/`serve`/`web` additionally accept `--gateway-port <port>` and `--gateway-host <host>` — see below.)
+(`start`/`ui`/`serve`/`web` additionally accept `--gateway-port <port>` and `--gateway-host <host>` — see below — plus `--tls-cert`/`--tls-key`/`--http3` (§5), `--api-key`/`CCR_API_KEYS` for inbound gateway auth, and `--max-attempts`/`CCR_MAX_ATTEMPTS` for the upstream retry budget — see the security note below and `docs/ADMIN_MANUAL.md` §5.)
 
 Worked examples:
 
@@ -182,7 +182,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:3456 claude
 
 `--host`/`--port` configure the **management** server; `--gateway-host`/`--gateway-port` configure the **gateway** (`cmd/ccr/flags.go:9-43`, `cmd/ccr/serve.go:46`) — the two have always been logically independent, but until this release the gateway's address was hardcoded. The gateway still defaults to `127.0.0.1` **on purpose**: it holds live provider API keys, so binding it to every interface has to be a deliberate act, not the default. Set `--gateway-host 0.0.0.0` explicitly inside a container — `127.0.0.1` there is the container's *own* loopback, unreachable from a published port no matter how it's mapped. `--gateway`/`--no-gateway` controls whether the gateway starts at all; `--open`/`--no-open` controls whether a browser is launched at the management URL.
 
-**`ccr start`/`ui` do not forward `--gateway-host`/`--gateway-port` to the detached `serve` child** (`cmd/ccr/service.go:104-114` only forwards `--host`, `--port`, `--gateway`/`--no-gateway`, `--open`/`--no-open`). The flags are accepted and validated by `start`/`ui` but then silently dropped — only the `CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT` environment-variable form survives into the child (environment variables are inherited by the detached process; the flags are not re-passed). Use `ccr serve`/`web` directly, or the environment-variable form, until this is fixed.
+**`ccr start`/`ui` now forward `--gateway-host`/`--gateway-port` to the detached `serve` child**, along with the TLS/HTTP3 flags and `--max-attempts`: `serveChildArgs` (`cmd/ccr/service.go:196-234`) builds the child's argument list from `--host`, `--port`, `--gateway`/`--no-gateway`, `--open`/`--no-open`, `--gateway-host`, `--gateway-port`, `--tls-cert`/`--tls-key`/`--http3`/`--no-http3`, and `--max-attempts` (when set) — previously only the first four survived, so e.g. `ccr start --tls-cert …` silently served plaintext. The `CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT` environment-variable form has always worked too, since the detached child inherits the parent's environment regardless. **Inbound API keys are the one deliberate exception**: `--api-key`/`CCR_API_KEYS` are never placed in the child's argv (which is world-readable via `ps`) — they travel to the child exclusively through the inherited `CCR_API_KEYS` environment variable, set by `cmdStart` before spawning (`cmd/ccr/service.go:107-114`).
 
 The management server's `/health` has its **own**, differently-shaped body — don't confuse it with the gateway's:
 
@@ -196,7 +196,7 @@ The management server's `/health` has its **own**, differently-shaped body — d
 
 `start` and `ui` don't run the server themselves — they re-exec the same binary as `ccr serve` in a **fully detached** child process (`setsid` on Unix), then return immediately (`cmd/ccr/service.go:77-143`):
 
-- The child's PID, host, port, `--gateway` flag, and start time are recorded in `~/.claude-code-router/service.json` — note this is the **management** host/port; the gateway's own `--gateway-host`/`--gateway-port` are neither recorded here nor forwarded to the child at all (see §4's note on that gap).
+- The child's PID, host, port, `--gateway` flag, and start time are recorded in `~/.claude-code-router/service.json` — note this is the **management** host/port; the gateway's own `--gateway-host`/`--gateway-port` are not recorded here, though they (and the TLS/HTTP3/`--max-attempts` flags) are now forwarded to the child's argv (see §4's note above).
 - The child's stdout/stderr are redirected to `~/.claude-code-router/service.log` — check this file if something goes wrong after `start` reports success, since there is no other way to see the child's own output.
 - Running `start`/`ui` again while a tracked process is still alive is refused, reporting the existing PID and management URL, rather than starting a second instance (`cmd/ccr/service.go:93-96`).
 - `stop` sends `SIGTERM`, polls for up to 5 seconds, then `SIGKILL`s if the process hasn't exited, and always removes the pidfile — including when the pidfile pointed at an already-dead process (a "stale pidfile", cleaned up and reported rather than silently ignored) (`cmd/ccr/service.go:145-184`).
@@ -239,6 +239,15 @@ Generating a self-signed certificate for local testing:
 openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"
 ```
 
+### 5.1 Inbound gateway authentication and the retry budget
+
+Two more `internal/gateway.Options` fields are CLI-exposed alongside TLS/HTTP3:
+
+- **`--api-key <key>` (repeatable) / `CCR_API_KEYS` (comma-separated)** populate `Options.APIKeys`, the accepted-key list for `RequireAPIKey` (`cmd/ccr/flags.go`). A request must then present a matching key via `Authorization: Bearer <key>` or `x-api-key: <key>` on any of the four completion routes (`/v1/messages`, `/proxy/v1/messages`, `/v1/chat/completions`, `/proxy/v1/chat/completions`); `GET /health`/`GET /ready` are never gated. A `--api-key` flag value **replaces** the `CCR_API_KEYS` list wholesale, rather than merging with it. **The default is still an empty list — authentication disabled — for backward compatibility.** Prefer `CCR_API_KEYS` over the flag: a flag value is visible to any local user via `ps`, and `ccr start`/`ui` forward configured keys to the detached `serve` child only through the inherited environment, never through argv. See `docs/ADMIN_MANUAL.md` §5 for the full security guidance.
+- **`--max-attempts <n>` / `CCR_MAX_ATTEMPTS`** set `Options.MaxAttempts`, the upstream retry budget (must be `>= 1`; default `3` — one initial try plus two retries). See `docs/FAQ.md` Q28 for the retry/classification policy this budget governs.
+
+Both flags are forwarded by `ccr start`/`ui` to the detached `serve` child they spawn (`--max-attempts` via argv, `--api-key`/`CCR_API_KEYS` via the inherited environment only — see §4.1).
+
 ## 6. Content-encoding negotiation
 
 Every response passes through `compressionMiddleware` (`internal/gateway/compress.go:84-118`), which:
@@ -265,7 +274,7 @@ No client action is required — this happens for every response, including `/he
 | `POST /v1/messages` returns `502` (`api_error`) after a delay of a few seconds | Upstream transport failure retried up to `Options.MaxAttempts` times (default 3) with exponential backoff before giving up, or an upstream response with malformed JSON / zero `choices` (`internal/gateway/messages.go:344-416` — retry loop; `489-499` — malformed/empty response) | Check the named provider's `api_base_url` and reachability; the delay before the `502` is expected, not a hang |
 | `POST /v1/messages` returns the upstream's own 4xx/5xx | The gateway preserves the upstream's exact status code rather than collapsing everything to a generic error, so Claude Code's retry/backoff logic sees the real signal. A `429`/`5xx` is retried internally first (see the row above); only a `Terminal` status (per `internal/router.ClassifyStatus`) or an exhausted retry budget is actually forwarded (`internal/gateway/messages.go:378-399`, `448-504`) | Treat it like a normal upstream API error for that provider |
 | Upstream call fails but the error never shows the API key | If launched via `cmd/ccr` (which calls `WireDefaults`), this is the verified behaviour of `internal/proxy.Client` (`internal/proxy/proxy.go:61-64`, `internal/proxy/proxy_test.go:175-217`). If you construct `gateway.New` as a library **without** calling `WireDefaults`, you get the smaller built-in `defaultUpstream` (`internal/gateway/messages.go:77-93`) instead, which has no equivalent dedicated key-leak test — treat its error-safety as unconfirmed in that case | Check the provider name/base URL named in the error, then verify the key out-of-band |
-| A request carrying an `x-api-key`/`Authorization` header is treated no differently from one without | `gateway.RequireAPIKey` is mounted on `POST /v1/messages` (`internal/gateway/gateway.go:201`), but `cmd/ccr` never populates `Options.APIKeys` — no CLI flag or `config.json` field exists for it yet — so the accepted-key list is always empty, which the middleware itself documents as "authentication disabled" (`internal/gateway/auth.go`) | Expected today; see README.md "Known limitations" |
+| A request carrying an `x-api-key`/`Authorization` header is treated no differently from one without | `gateway.RequireAPIKey` is mounted on all four completion routes (`internal/gateway/gateway.go:362-367`) and is CLI-configurable via `--api-key`/`CCR_API_KEYS`, but that list **defaults to empty**, which the middleware itself documents as "authentication disabled" (`internal/gateway/auth.go`) | Expected unless you've configured `--api-key`/`CCR_API_KEYS`; see README.md "Known limitations" and `docs/ADMIN_MANUAL.md` §5 |
 | A vision/image request | Image content blocks (base64 or URL source) are converted to OpenAI `image_url` parts, including inside `tool_result` content — an unsupported media type, oversized payload, or malformed source is still a named `400` error rather than a silent drop (`internal/translate/anthropic.go:237-335`) | Not an error path any more for supported PNG/JPEG/GIF/WebP images; see `docs/FAQ.md` Q12 |
 | A **streaming** response never times out against a wedged upstream that never sends anything at all | Depends on wiring: `handleMessages` itself only applies `UpstreamTimeout` to the request context for **non-streaming** calls, never for streaming (`internal/gateway/messages.go:248-256`). If launched via `cmd/ccr`, `internal/proxy.Client`'s `ResponseHeaderTimeout` (also set from `UpstreamTimeout`, default 10 minutes) separately bounds the wait for the upstream's *response headers* on a streaming call too — so a CLI-launched gateway times out a streaming call that never even gets headers, but once headers (and therefore the SSE stream) start, the body can keep flowing indefinitely (`internal/gateway/wiring.go:65-71`, `internal/proxy/proxy.go:26-44`). A gateway built as a library without `WireDefaults` has no such protection at all | Expected once streaming has started; if a request never gets a first byte back, expect it to fail after `UpstreamTimeout` when CLI-launched |
 | A **non-streaming** request is cut off after `UpstreamTimeout`, even though headers came back quickly | By design: `handleMessages`'s `UpstreamTimeout` bounds the *entire* non-streaming call, retries included, via `context.WithTimeout` (`internal/gateway/messages.go:248-256`) regardless of wiring — this is stricter than `internal/proxy.Client`'s own `ResponseHeaderTimeout`, which only bounds the header wait (`internal/proxy/proxy.go:26-44`); the context deadline from `messages.go` is what actually governs a non-streaming call's total duration | Raise the gateway's `UpstreamTimeout` (currently not CLI-exposed — see §4.2/§5) if your provider's non-streaming responses are slow to fully arrive |

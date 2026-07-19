@@ -57,6 +57,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 			CertFile:    flags.TLSCert,
 			KeyFile:     flags.TLSKey,
 			EnableHTTP3: flags.HTTP3,
+			APIKeys:     flags.APIKeys,
+			MaxAttempts: flags.MaxAttempts,
 		})
 		// Install the real router and upstream client. Without this the
 		// gateway keeps its minimal built-in defaults, which always resolve
