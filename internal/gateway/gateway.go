@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -60,6 +61,16 @@ type Options struct {
 	// that default is deliberate — the toolkit that drives this gateway
 	// today sends no client key at all, on a loopback-only listener.
 	APIKeys []string
+	// Logger is the structured logger the per-request access-logging
+	// middleware writes to (see logging_middleware.go, mounted in routes()).
+	// A nil Logger (the zero-value default) means "use an env-configured
+	// redacting logger to os.Stderr" — LoggingMiddleware itself does that
+	// fallback via internal/logging.New, so CCR_LOG_LEVEL / CCR_LOG_FORMAT are
+	// honoured out of the box without a caller wiring anything. It is a
+	// *slog.Logger from internal/logging (New / NewWithOptions), never a raw
+	// slog logger: every logger this package accepts must carry the redaction
+	// guarantee. Tests point this at a bytes.Buffer to capture output.
+	Logger *slog.Logger
 }
 
 // defaultMaxAttempts is the number of upstream attempts a request gets when
@@ -119,6 +130,26 @@ func (s *Server) Addr() string { return fmt.Sprintf("%s:%d", s.opt.Host, s.opt.P
 func (s *Server) Handler() http.Handler { return s.eng }
 
 func (s *Server) routes() {
+	// Access logging is mounted FIRST, so it is the OUTERMOST middleware:
+	//
+	//   - It logs EVERY inbound request exactly once — /health, /ready, the
+	//     inbound completion endpoints, and requests RequireAPIKey rejects with
+	//     401 alike — because it wraps the whole chain via s.eng.Use rather
+	//     than being route-scoped. It never gates anything (it always calls
+	//     c.Next()), so unlike RequireAPIKey it is safe as a global middleware:
+	//     /health and /ready keep answering unchanged, they are merely logged.
+	//   - Sitting OUTSIDE compressionMiddleware means it observes the final
+	//     response status and the actual (post-compression) byte count after
+	//     the entire chain has run, and it sets the X-Request-Id response
+	//     header before any handler writes — an inner position would capture a
+	//     not-yet-flushed byte count.
+	//   - It logs only request/response METADATA (method, path, status,
+	//     duration, bytes, request id). It never reads either body and never
+	//     logs any header value, so an inbound Authorization/x-api-key
+	//     credential and all prompt/completion content are structurally absent
+	//     from the log; the internal/logging redactor backing the logger is a
+	//     second line of defence, not the primary guarantee.
+	s.eng.Use(LoggingMiddleware(s.opt.Logger))
 	s.eng.Use(compressionMiddleware())
 	if s.opt.EnableHTTP3 {
 		s.eng.Use(altSvcMiddleware(s.opt.Port))
