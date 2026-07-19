@@ -48,6 +48,16 @@ type AnthropicRequest struct {
 	TopP          *float64        `json:"top_p,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
 	Stream        bool            `json:"stream,omitempty"`
+	// Thinking is Anthropic's extended-thinking request field (e.g.
+	// {"type":"enabled","budget_tokens":1024}). It is kept as an optional
+	// RawMessage so it round-trips byte-for-byte and its ABSENCE is identical
+	// to before this field existed (omitempty ⇒ a request without it encodes
+	// exactly as it always did). The translator does NOT forward it to OpenAI
+	// (which has no such field — AnthropicToOpenAI builds OpenAIRequest from
+	// named fields and ignores this one), and AnthropicPassthrough preserves it
+	// via the raw bytes regardless. Its only consumer is the router's
+	// requestWantsThinking, which reads it to activate Router.Think routing.
+	Thinking json.RawMessage `json:"thinking,omitempty"`
 }
 
 type AnthropicMessage struct {

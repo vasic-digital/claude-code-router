@@ -281,3 +281,63 @@ func TestSamplingParamsAndStopSequences(t *testing.T) {
 		t.Errorf("stop = %v, want [DONE]", out.Stop)
 	}
 }
+
+// OpenAI has no `thinking` field. Adding Thinking to AnthropicRequest must NOT
+// leak it into the OpenAI request: the serialized OpenAIRequest must never
+// contain a "thinking" key, and a request carrying a thinking block must
+// translate byte-for-byte identically to the same request without one.
+func TestAnthropicToOpenAIDropsThinking(t *testing.T) {
+	base := func() *AnthropicRequest {
+		return &AnthropicRequest{
+			Model:     "m",
+			MaxTokens: 100,
+			System:    json.RawMessage(`"You are helpful."`),
+			Messages: []AnthropicMessage{
+				{Role: "user", Content: json.RawMessage(`"hi"`)},
+			},
+		}
+	}
+
+	without := base()
+	with := base()
+	with.Thinking = json.RawMessage(`{"type":"enabled","budget_tokens":1024}`)
+
+	outWithout, err := AnthropicToOpenAI(without, Options{})
+	if err != nil {
+		t.Fatalf("convert without thinking: %v", err)
+	}
+	outWith, err := AnthropicToOpenAI(with, Options{})
+	if err != nil {
+		t.Fatalf("convert with thinking: %v", err)
+	}
+
+	jsonWith := mustJSON(t, outWith)
+	if strings.Contains(jsonWith, "thinking") {
+		t.Errorf("OpenAI request leaked a thinking key: %s", jsonWith)
+	}
+	// Presence of the thinking field must not perturb any other output.
+	if jsonWithout := mustJSON(t, outWithout); jsonWith != jsonWithout {
+		t.Errorf("thinking changed the OpenAI translation:\n with:    %s\n without: %s", jsonWith, jsonWithout)
+	}
+}
+
+// AnthropicPassthrough works on raw bytes and already preserves unknown fields;
+// a `thinking` block must survive a native-Anthropic passthrough verbatim.
+func TestAnthropicPassthroughPreservesThinking(t *testing.T) {
+	raw := []byte(`{"model":"m","max_tokens":100,"thinking":{"type":"enabled","budget_tokens":1024},"messages":[{"role":"user","content":"hi"}]}`)
+	out, err := AnthropicPassthrough(raw, Options{})
+	if err != nil {
+		t.Fatalf("passthrough: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("unmarshal passthrough output: %v", err)
+	}
+	th, ok := m["thinking"]
+	if !ok {
+		t.Fatalf("passthrough dropped the thinking field: %s", out)
+	}
+	if !strings.Contains(string(th), `"budget_tokens":1024`) {
+		t.Errorf("thinking block not preserved verbatim: %s", th)
+	}
+}

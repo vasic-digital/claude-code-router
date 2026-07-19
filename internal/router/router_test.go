@@ -397,25 +397,104 @@ func TestSelectExplicitSelectorBeatsOverrides(t *testing.T) {
 	}
 }
 
-// Honesty lock: think-routing does NOT fire from any request the gateway builds
-// today, because the typed request carries no thinking field. Even with
-// Router.Think configured, an ordinary request resolves to Default, and
-// requestWantsThinking reports false for every request.
-func TestSelectThinkInertForTodaysRequests(t *testing.T) {
+// thinkingRequest builds a request carrying Anthropic's `thinking` field, the
+// signal that activates Router.Think routing. thinking is the raw JSON to place
+// in that field (e.g. `null` to prove an explicit null does NOT count).
+func thinkingRequest(model, thinking string) *translate.AnthropicRequest {
+	return &translate.AnthropicRequest{
+		Model:    model,
+		Messages: []translate.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"think hard about this"`)}},
+		Thinking: json.RawMessage(thinking),
+	}
+}
+
+// TestRequestWantsThinking pins the seam directly: present-and-non-null fires,
+// absent and explicit-null do not, and neither does a nil request.
+func TestRequestWantsThinking(t *testing.T) {
+	cases := []struct {
+		name string
+		req  *translate.AnthropicRequest
+		want bool
+	}{
+		{"nil request", nil, false},
+		{
+			"absent thinking",
+			&translate.AnthropicRequest{Model: "m"},
+			false,
+		},
+		{
+			"explicit null thinking",
+			thinkingRequest("m", `null`),
+			false,
+		},
+		{
+			"explicit null with whitespace",
+			thinkingRequest("m", " null "),
+			false,
+		},
+		{
+			"enabled thinking block",
+			thinkingRequest("m", `{"type":"enabled","budget_tokens":1024}`),
+			true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := requestWantsThinking(tc.req); got != tc.want {
+				t.Errorf("requestWantsThinking = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSelectThinkRouteFiresFromThinkingRequest proves the think path end-to-end
+// through Select: a request that carries a real `thinking` block routes to
+// Router.Think when it is configured.
+func TestSelectThinkRouteFiresFromThinkingRequest(t *testing.T) {
+	cfg := fourRouteCfg()
+	req := thinkingRequest("claude-3-7-sonnet-20250219", `{"type":"enabled","budget_tokens":1024}`)
+	p, model, err := Select(cfg, req)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if p.Name != "think-prov" || model != "think-model" {
+		t.Errorf("think route did not fire: got (%q,%q), want (think-prov, think-model)", p.Name, model)
+	}
+}
+
+// Regression: with Router.Think UNSET, even a real thinking request stays on
+// Default — behaviour is identical to before the override could fire.
+func TestSelectThinkingRequestUnchangedWhenThinkUnset(t *testing.T) {
+	cfg := fourRouteCfg()
+	cfg.Router.Think = ""
+	req := thinkingRequest("claude-3-7-sonnet-20250219", `{"type":"enabled","budget_tokens":1024}`)
+	p, model, err := Select(cfg, req)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if p.Name != "main-prov" || model != "main-model-a" {
+		t.Errorf("think must not fire when Router.Think is unset: got (%q,%q), want (main-prov, main-model-a)", p.Name, model)
+	}
+}
+
+// A NON-thinking request (no `thinking` field) must resolve exactly as before,
+// even with Router.Think configured: the seam fires only on the client's own
+// signal, never on an ordinary turn.
+func TestSelectNonThinkingRequestUnchanged(t *testing.T) {
 	cfg := fourRouteCfg()
 	req := &translate.AnthropicRequest{
 		Model:    "claude-3-7-sonnet-20250219",
 		Messages: []translate.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"think hard about this"`)}},
 	}
 	if requestWantsThinking(req) {
-		t.Fatal("requestWantsThinking should be false until translate.AnthropicRequest models the thinking field")
+		t.Fatal("requestWantsThinking must be false for a request that carries no thinking field")
 	}
 	p, model, err := Select(cfg, req)
 	if err != nil {
 		t.Fatalf("Select: %v", err)
 	}
 	if p.Name != "main-prov" || model != "main-model-a" {
-		t.Errorf("think must not fire from a real request today: got (%q,%q), want (main-prov, main-model-a)", p.Name, model)
+		t.Errorf("non-thinking request must resolve to Default: got (%q,%q), want (main-prov, main-model-a)", p.Name, model)
 	}
 }
 

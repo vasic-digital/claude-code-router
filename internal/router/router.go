@@ -38,8 +38,8 @@ import (
 //     "claude-3-5-haiku-20241022" wrap the tier name rather than equalling it,
 //     hence a substring match), prefer cfg.Router.Background when it is set.
 //  3. Think: if the request asked for extended reasoning AND cfg.Router.Think
-//     is set, route there. See requestWantsThinking for the honest caveat that
-//     this signal is inert for the requests the gateway builds today.
+//     is set, route there. The signal is the client's own `thinking` field
+//     (see requestWantsThinking) — it fires when a request carries one.
 //  4. Default: otherwise, and whenever the applicable override is unset, use
 //     cfg.Router.Default.
 //  5. If the resulting route string is empty (operator configured providers
@@ -109,15 +109,15 @@ func Select(cfg *config.Config, req *translate.AnthropicRequest) (*config.Provid
 // routeSignals are the request-derived facts the route-override precedence
 // depends on. They are extracted once, up front, from the incoming request so
 // that chooseRoute — where the precedence actually lives — can be exercised in
-// isolation without constructing whole request bodies, and so the (currently
-// inert) thinking signal has a single, well-documented seam rather than being
-// smeared through the selection logic.
+// isolation without constructing whole request bodies, and so the thinking
+// signal has a single, well-documented seam rather than being smeared through
+// the selection logic.
 type routeSignals struct {
 	// haiku marks Claude Code's cheap/background tier (see isHaikuTier).
 	haiku bool
-	// thinking marks a request that asked for extended reasoning. See
-	// requestWantsThinking for why this is false for every request the gateway
-	// builds today, and exactly what caller-side change makes it fire.
+	// thinking marks a request that asked for extended reasoning. It is read
+	// from the client's own `thinking` field (see requestWantsThinking) and
+	// fires when a request carries one.
 	thinking bool
 	// longContext marks a request whose estimated prompt token footprint
 	// exceeds DefaultLongContextThreshold (see estimateTokenCount).

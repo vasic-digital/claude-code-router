@@ -13,6 +13,7 @@ package router
 // upstream expectations this implements).
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 
@@ -150,29 +151,26 @@ func estimateTokenCount(req *translate.AnthropicRequest) int {
 // ("thinking"), which — when Router.Think is configured — routes the request to
 // the think model (see chooseRoute).
 //
-// HONEST LIMITATION: the typed translate.AnthropicRequest this router receives
-// does NOT model Anthropic's `thinking` request field (see its definition in
-// internal/translate/anthropic.go — Model, MaxTokens, Messages, System, Tools,
-// Temperature, TopP, StopSequences, Stream, and nothing else). There is
-// therefore nothing here to inspect: this returns false for every request the
-// gateway builds today, so think-routing is inert in production.
+// It FIRES when the client sends Anthropic's `thinking` request field:
+// translate.AnthropicRequest models it as an optional json.RawMessage, so an
+// incoming `thinking` block survives decoding and is inspected here. The signal
+// is true only when that field is actually present and carries a non-null value
+// — an omitted field (len 0) or an explicit `"thinking": null` both mean the
+// client did NOT ask for extended reasoning, so both return false.
 //
-// Making it fire requires a caller-side change OUTSIDE this package's ownership:
-// add a
-//
-//	Thinking json.RawMessage `json:"thinking,omitempty"`
-//
-// field to translate.AnthropicRequest so the incoming `thinking` block survives
-// decoding, then have this return true when it is present and non-null (e.g.
-// len(req.Thinking) > 0 && !bytes.Equal(req.Thinking, []byte("null"))). No proxy
+// The signal is read STRICTLY from the client's own `thinking` field. No proxy
 // signal (max_tokens, stop sequences, …) is substituted, because inferring
 // "thinking" from an unrelated field would misroute ordinary requests — exactly
 // the kind of silent misrouting the rest of this package is careful to avoid.
 //
-// The routing LOGIC that consumes this signal is real and is pinned directly by
-// unit tests that set routeSignals.thinking (see the chooseRoute tests).
+// The routing LOGIC that consumes this signal is pinned directly by unit tests
+// that set routeSignals.thinking (see the chooseRoute tests); the end-to-end
+// activation is pinned by the Select think-routing tests.
 func requestWantsThinking(req *translate.AnthropicRequest) bool {
-	return false
+	if req == nil || len(req.Thinking) == 0 {
+		return false
+	}
+	return !bytes.Equal(bytes.TrimSpace(req.Thinking), []byte("null"))
 }
 
 // containsString reports whether s appears verbatim in list. Extracted
