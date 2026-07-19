@@ -113,8 +113,13 @@ func New(cfg *config.Config, opt Options) *Server {
 		opt.MaxAttempts = defaultMaxAttempts
 	}
 	gin.SetMode(gin.ReleaseMode)
+	// gin.New() (not gin.Default()) so NO middleware is pre-installed here:
+	// panic recovery is mounted in routes() INSIDE LoggingMiddleware, so that a
+	// recovered 500 is still access-logged. Mounting gin.Recovery() here would
+	// make it the outermost middleware, and a panicking handler would unwind
+	// past LoggingMiddleware's post-c.Next() log call before Recovery caught it —
+	// leaving the panic request unlogged. See routes() for the ordering.
 	eng := gin.New()
-	eng.Use(gin.Recovery())
 
 	s := &Server{opt: opt, cfg: cfg, eng: eng, ready: make(chan struct{})}
 	s.Router = defaultRouter{cfg: cfg}
@@ -150,6 +155,16 @@ func (s *Server) routes() {
 	//     from the log; the internal/logging redactor backing the logger is a
 	//     second line of defence, not the primary guarantee.
 	s.eng.Use(LoggingMiddleware(s.opt.Logger))
+
+	// Panic recovery is mounted INSIDE LoggingMiddleware (registered after it,
+	// so it wraps the handlers but is itself wrapped by logging). gin.Recovery
+	// recovers a panicking handler and writes a 500, then returns NORMALLY to
+	// its caller — which is LoggingMiddleware, whose post-c.Next() code then
+	// runs and logs that recovered 500 (correct status and byte count included).
+	// The reverse order — Recovery outermost — would let the panic unwind past
+	// LoggingMiddleware's log call, so panic requests would escape the access
+	// log entirely.
+	s.eng.Use(gin.Recovery())
 	s.eng.Use(compressionMiddleware())
 	if s.opt.EnableHTTP3 {
 		s.eng.Use(altSvcMiddleware(s.opt.Port))

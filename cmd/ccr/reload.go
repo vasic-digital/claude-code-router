@@ -85,6 +85,12 @@ func (r *configReloader) detect(last *config.Config, interval time.Duration, onR
 		case <-r.stopCh:
 			return
 		case <-t.C:
+			// CAVEAT: pointer-identity polling COALESCES. If two valid configs are
+			// swapped by the watcher between two detector ticks, only the latest is
+			// observed here — the intermediate generation fires no onReload. Benign
+			// today (onReload is log-only, so at worst one log line is skipped), but
+			// a future in-place-swap hook wired in here must NOT assume it sees every
+			// validated generation; if it must, drive it off the watcher directly.
 			cur := r.w.Current()
 			if cur != last {
 				last = cur

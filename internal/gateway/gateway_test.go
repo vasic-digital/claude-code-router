@@ -1,17 +1,21 @@
 package gateway
 
 import (
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/andybalholm/brotli"
+	"github.com/gin-gonic/gin"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
+	"github.com/vasic-digital/claude-code-router/internal/logging"
 )
 
 func testCfg() *config.Config {
@@ -188,6 +192,63 @@ func TestAltSvcAdvertisedOnlyWithHTTP3(t *testing.T) {
 	s3.Handler().ServeHTTP(rec3, httptest.NewRequest(http.MethodGet, "/health", nil))
 	if v := rec3.Header().Get("Alt-Svc"); !strings.Contains(v, `h3=":4443"`) {
 		t.Errorf("Alt-Svc = %q, want it to advertise h3 on 4443", v)
+	}
+}
+
+// A panicking handler must be BOTH recovered (clean 500, no crashed process)
+// AND still access-logged. gin.Recovery is mounted inside LoggingMiddleware
+// (see routes()); if that ordering ever regresses to Recovery-outermost, the
+// panic unwinds past LoggingMiddleware's post-c.Next() log call and the request
+// escapes the access log — which this test exists to catch. The redaction
+// guarantee must survive the panic path too: no secret leaks into the log.
+func TestPanicRequestIsRecoveredAndStillLogged(t *testing.T) {
+	var buf bytes.Buffer
+	logger := logging.NewWithOptions(&buf, slog.LevelInfo, logging.FormatJSON)
+	s := New(testCfg(), Options{Logger: logger})
+
+	const secret = "sk-panic-secret-value-0123456789abcdef"
+	// Register a handler that panics only after the middleware chain has been
+	// entered, so the panic must unwind through LoggingMiddleware before
+	// gin.Recovery catches it — the exact path the fix protects.
+	s.eng.GET("/boom", func(c *gin.Context) {
+		panic("handler exploded")
+	})
+
+	// gin.Recovery dumps the panic + stack to gin.DefaultErrorWriter (separate
+	// from our access logger). Silence it so the test's own output stays clean.
+	oldWriter := gin.DefaultErrorWriter
+	gin.DefaultErrorWriter = io.Discard
+	defer func() { gin.DefaultErrorWriter = oldWriter }()
+
+	req := httptest.NewRequest(http.MethodGet, "/boom", nil)
+	req.Header.Set("Authorization", "Bearer "+secret)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	// Recovery still converts the panic into a clean 500.
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 (panic must be recovered, not propagated)", rec.Code)
+	}
+
+	// The recovered 500 must STILL be logged exactly once — the whole point.
+	lines := logLines(t, &buf)
+	if len(lines) != 1 {
+		t.Fatalf("got %d log lines for a panicking request, want exactly 1: %v", len(lines), lines)
+	}
+	line := lines[0]
+	if line["status"] != float64(http.StatusInternalServerError) {
+		t.Errorf("logged status = %v, want 500", line["status"])
+	}
+	if line["path"] != "/boom" {
+		t.Errorf("logged path = %v, want /boom", line["path"])
+	}
+	if line["method"] != http.MethodGet {
+		t.Errorf("logged method = %v, want GET", line["method"])
+	}
+
+	// Redaction guarantee: the Authorization secret must never reach the log.
+	if strings.Contains(buf.String(), secret) {
+		t.Fatalf("panic-path access log leaked the Authorization secret: %s", buf.String())
 	}
 }
 

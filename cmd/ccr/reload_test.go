@@ -13,9 +13,17 @@ import (
 // These fixtures mirror the shapes internal/config.Load accepts/rejects. The
 // invalid one is missing api_base_url, so Config.Validate fails and the watcher
 // must reject the reload.
+//
+// reloadValidA and reloadValidB deliberately differ in BYTE LENGTH (B carries an
+// extra "models" field), not just in a few substituted characters. The watcher's
+// change detection is mtime+size: if the two valid configs were the same length,
+// the A->B change would be observable ONLY through mtime, so a filesystem with
+// coarse/non-monotonic mtime could mask a real content change. Differing lengths
+// exercise the size arm of the OR too, so the test proves change detection on
+// either signal rather than leaning entirely on the mtime nudge below.
 const (
 	reloadValidA  = `{"Providers":[{"name":"a","api_base_url":"https://a.example/v1"}],"Router":{"default":"a,model-1"}}`
-	reloadValidB  = `{"Providers":[{"name":"b","api_base_url":"https://b.example/v1"}],"Router":{"default":"b,model-2"}}`
+	reloadValidB  = `{"Providers":[{"name":"b","api_base_url":"https://b.example/v1","models":["model-2"]}],"Router":{"default":"b,model-2"}}`
 	reloadInvalid = `{"Providers":[{"name":"c"}]}` // missing api_base_url -> fails Validate
 )
 
