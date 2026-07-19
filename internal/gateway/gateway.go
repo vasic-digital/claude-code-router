@@ -54,6 +54,16 @@ type Server struct {
 	h1h2  *http.Server
 	h3    *http3.Server
 	ready chan struct{}
+
+	// Router and Upstream are overridable seams for the full routing and
+	// upstream-proxy implementations (internal/router, internal/proxy), which
+	// this package deliberately does not import. New wires in minimal working
+	// defaults (defaultRouter, defaultUpstream — see messages.go) so the
+	// gateway is functional standalone; a caller that owns the fuller
+	// implementations may replace either field after construction, before
+	// Start.
+	Router   Router
+	Upstream Upstream
 }
 
 // New builds a Server. It does not listen until Start is called.
@@ -72,6 +82,8 @@ func New(cfg *config.Config, opt Options) *Server {
 	eng.Use(gin.Recovery())
 
 	s := &Server{opt: opt, cfg: cfg, eng: eng, ready: make(chan struct{})}
+	s.Router = defaultRouter{cfg: cfg}
+	s.Upstream = &defaultUpstream{}
 	s.routes()
 	return s
 }
@@ -113,6 +125,9 @@ func (s *Server) routes() {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ready"})
 	})
+
+	// The Anthropic-compatible endpoint Claude Code actually talks to.
+	s.eng.POST("/v1/messages", s.handleMessages)
 }
 
 // Start binds and serves. It returns once the listener is up; serving
