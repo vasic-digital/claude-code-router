@@ -168,7 +168,7 @@ stateDiagram-v2
     Serving --> [*]: Shutdown(ctx)
 ```
 
-Source: `internal/gateway/gateway.go:212-245` (`Start`), `internal/gateway/compress.go:120-128` (`altSvcMiddleware`, registered only when `EnableHTTP3`). Tested at `internal/gateway/gateway_test.go:165-192`. **Note:** `cmd/ccr` always calls `gateway.New(cfg, gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort})` with no TLS fields set (`cmd/ccr/serve.go:46`) — so in practice, a CLI-launched gateway always takes the `ServePlainHTTP` branch today, regardless of which host/port it binds. `CertFile`/`KeyFile`/`EnableHTTP3` are only reachable via direct library use; see `docs/USER_GUIDE.md` §5.
+Source: `internal/gateway/gateway.go:212-245` (`Start`), `internal/gateway/compress.go:120-128` (`altSvcMiddleware`, registered only when `EnableHTTP3`). Tested at `internal/gateway/gateway_test.go:165-192`. **Note:** `cmd/ccr` now passes `CertFile`/`KeyFile`/`EnableHTTP3` from `--tls-cert`/`--tls-key`/`--http3` into `gateway.New(cfg, gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort, CertFile: flags.TLSCert, KeyFile: flags.TLSKey, EnableHTTP3: flags.HTTP3})` (`cmd/ccr/serve.go:54-60`) — so a CLI-launched gateway takes the `ServePlainHTTP` branch by default, but reaches `ServeTLSOnly` or `ServeH3AndTLS` as soon as `--tls-cert`/`--tls-key` (and, for the latter, `--http3`) are passed; see `docs/USER_GUIDE.md` §5.
 
 ### Content-encoding negotiation (evaluated per-request)
 
@@ -291,7 +291,7 @@ See `docs/FAQ.md` Q10, Q28, Q29 for the operator-facing version of this.
 | `cache_control` stripping | Implemented and fully wired: `translate.StripCacheControl` (`json.Number`-safe) is called from `AnthropicToOpenAI`'s tool-conversion loop whenever `cleancache` is configured (`internal/translate/anthropic.go:441-461`; `docs/FAQ.md` Q5) |
 | Retry loop on a failed upstream call | Implemented and live (`doUpstreamWithRetry`, `internal/gateway/messages.go:319-416`), driving `internal/router/fallback.go`'s classification/backoff policy. Attempt budget (`MaxAttempts`, default 3) not yet CLI/config-exposed |
 | Inbound gateway authentication (`RequireAPIKey`) | Mounted on `POST /v1/messages`, but unconfigurable — `Options.APIKeys` has no CLI flag/config field, so it is always empty (auth disabled) on a CLI-launched gateway |
-| Gateway transport (HTTP/1.1, HTTP/2, HTTP/3, compression) | Implemented; TLS/HTTP-3 not yet CLI-exposed. Bind address/port ARE now CLI-exposed (`--gateway-host`/`--gateway-port`) |
+| Gateway transport (HTTP/1.1, HTTP/2, HTTP/3, compression) | Implemented; TLS/HTTP-3 CLI-exposed via `--tls-cert`/`--tls-key`/`--http3`. Bind address/port also CLI-exposed (`--gateway-host`/`--gateway-port`) |
 | `GET /health`, `GET /ready`, `POST /v1/messages` | Implemented |
 | CLI (`cmd/ccr`: `start`/`ui`/`serve`/`web`/`stop`, pidfile service management) | Implemented |
 | Separate management control-plane server | Implemented, deliberately minimal (own `/health`, placeholder `/`) |

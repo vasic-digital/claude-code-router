@@ -99,3 +99,100 @@ func TestParseCommonFlagsBadEnvPort(t *testing.T) {
 		t.Error("bad CCR_WEB_PORT should error")
 	}
 }
+
+func TestParseCommonFlagsTLSDefaults(t *testing.T) {
+	f, _, err := parseCommonFlags(nil, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.TLSCert != "" || f.TLSKey != "" {
+		t.Errorf("TLS cert/key = %q/%q, want empty by default", f.TLSCert, f.TLSKey)
+	}
+	if f.HTTP3 {
+		t.Error("HTTP3 = true, want false by default")
+	}
+}
+
+func TestParseCommonFlagsTLSExplicit(t *testing.T) {
+	f, _, err := parseCommonFlags(
+		[]string{"--tls-cert", "/etc/ccr/cert.pem", "--tls-key", "/etc/ccr/key.pem", "--http3"},
+		false, true,
+	)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.TLSCert != "/etc/ccr/cert.pem" || f.TLSKey != "/etc/ccr/key.pem" {
+		t.Errorf("TLS cert/key = %q/%q, want the passed paths", f.TLSCert, f.TLSKey)
+	}
+	if !f.HTTP3 {
+		t.Error("--http3 did not set HTTP3")
+	}
+}
+
+func TestParseCommonFlagsHTTP3RequiresTLS(t *testing.T) {
+	// --http3 alone (no certs) must be rejected with a clear message rather
+	// than deferred to the gateway.
+	if _, _, err := parseCommonFlags([]string{"--http3"}, false, true); err == nil {
+		t.Error("--http3 without TLS certs should error")
+	}
+}
+
+func TestParseCommonFlagsTLSPairRequired(t *testing.T) {
+	// A cert without a key (or vice versa) cannot form a TLS listener.
+	if _, _, err := parseCommonFlags([]string{"--tls-cert", "cert.pem"}, false, true); err == nil {
+		t.Error("--tls-cert without --tls-key should error")
+	}
+	if _, _, err := parseCommonFlags([]string{"--tls-key", "key.pem"}, false, true); err == nil {
+		t.Error("--tls-key without --tls-cert should error")
+	}
+}
+
+func TestParseCommonFlagsNoHTTP3ClearsEnv(t *testing.T) {
+	// CCR_HTTP3 can be overridden back off by --no-http3 (and the guard must
+	// then not fire, since HTTP3 is off).
+	t.Setenv("CCR_HTTP3", "true")
+	t.Setenv("CCR_TLS_CERT", "cert.pem")
+	t.Setenv("CCR_TLS_KEY", "key.pem")
+	f, _, err := parseCommonFlags([]string{"--no-http3"}, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.HTTP3 {
+		t.Error("--no-http3 did not clear HTTP3 set via CCR_HTTP3")
+	}
+}
+
+func TestParseCommonFlagsTLSEnv(t *testing.T) {
+	t.Setenv("CCR_TLS_CERT", "/env/cert.pem")
+	t.Setenv("CCR_TLS_KEY", "/env/key.pem")
+	t.Setenv("CCR_HTTP3", "1")
+	f, _, err := parseCommonFlags(nil, false, true)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if f.TLSCert != "/env/cert.pem" || f.TLSKey != "/env/key.pem" {
+		t.Errorf("TLS cert/key = %q/%q, want env values", f.TLSCert, f.TLSKey)
+	}
+	if !f.HTTP3 {
+		t.Error("CCR_HTTP3=1 did not enable HTTP3")
+	}
+}
+
+func TestParseCommonFlagsTLSErrors(t *testing.T) {
+	cases := [][]string{
+		{"--tls-cert"}, // missing value
+		{"--tls-key"},  // missing value
+	}
+	for _, args := range cases {
+		if _, _, err := parseCommonFlags(args, false, true); err == nil {
+			t.Errorf("parseCommonFlags(%v) did not error", args)
+		}
+	}
+}
+
+func TestParseCommonFlagsBadEnvHTTP3(t *testing.T) {
+	t.Setenv("CCR_HTTP3", "maybe")
+	if _, _, err := parseCommonFlags(nil, false, true); err == nil {
+		t.Error("bad CCR_HTTP3 should error")
+	}
+}

@@ -20,9 +20,11 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -394,8 +396,12 @@ func (s *Server) metricsMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Start binds and serves. It returns once the listener is up; serving
-// continues in the background until Shutdown.
+// Start binds and serves. It returns ONLY once every listener has actually
+// bound (and, for TLS, the certificate has loaded) — so a returned nil is a
+// genuine promise that the gateway is serving, and any bind/cert failure is
+// returned as an error rather than swallowed in a background goroutine after the
+// caller already reported "listening". Serving then continues in the background
+// until Shutdown.
 func (s *Server) Start() error {
 	s.h1h2 = &http.Server{
 		Addr:              s.Addr(),
@@ -410,21 +416,66 @@ func (s *Server) Start() error {
 		return errors.New("HTTP/3 requires TLS: set both CertFile and KeyFile (QUIC has no cleartext mode)")
 	}
 
+	// Load the certificate up front so a bad --tls-cert/--tls-key path or an
+	// unparseable PEM is reported synchronously (the single most common operator
+	// error for this feature) instead of surfacing later from a goroutine while
+	// the caller has already printed "listening on https://…".
+	var cert tls.Certificate
+	if tlsEnabled {
+		loaded, err := tls.LoadX509KeyPair(s.opt.CertFile, s.opt.KeyFile)
+		if err != nil {
+			return fmt.Errorf("load TLS cert/key: %w", err)
+		}
+		cert = loaded
+	}
+
+	// Bind the TCP listener synchronously so "address already in use" is a
+	// returned error, not a swallowed goroutine failure.
+	ln, err := net.Listen("tcp", s.Addr())
+	if err != nil {
+		return fmt.Errorf("bind gateway %s: %w", s.Addr(), err)
+	}
+
 	if s.opt.EnableHTTP3 {
-		s.h3 = &http3.Server{Addr: s.Addr(), Handler: s.eng}
-		go func() { _ = s.h3.ListenAndServeTLS(s.opt.CertFile, s.opt.KeyFile) }()
+		// Bind the QUIC UDP socket synchronously too, on the same address, so an
+		// h3 bind failure is returned rather than swallowed by the old
+		// `_ = s.h3.ListenAndServeTLS(...)`. The loaded cert is reused — no
+		// second read of the key material.
+		udpAddr, uerr := net.ResolveUDPAddr("udp", s.Addr())
+		if uerr != nil {
+			_ = ln.Close()
+			return fmt.Errorf("resolve gateway h3 udp addr %s: %w", s.Addr(), uerr)
+		}
+		udpConn, uerr := net.ListenUDP("udp", udpAddr)
+		if uerr != nil {
+			_ = ln.Close()
+			return fmt.Errorf("bind gateway h3 udp %s: %w", s.Addr(), uerr)
+		}
+		s.h3 = &http3.Server{
+			Addr:      s.Addr(),
+			Handler:   s.eng,
+			TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		}
+		go func() {
+			if serr := s.h3.Serve(udpConn); serr != nil && !errors.Is(serr, http.ErrServerClosed) {
+				fmt.Printf("gateway: h3 listener stopped: %v\n", serr)
+			}
+		}()
 	}
 
 	go func() {
-		var err error
+		var serr error
 		if tlsEnabled {
-			err = s.h1h2.ListenAndServeTLS(s.opt.CertFile, s.opt.KeyFile)
+			// The listener is already bound; ServeTLS re-reads the (already
+			// validated) cert files and configures HTTP/2 exactly as
+			// ListenAndServeTLS did.
+			serr = s.h1h2.ServeTLS(ln, s.opt.CertFile, s.opt.KeyFile)
 		} else {
-			err = s.h1h2.ListenAndServe()
+			serr = s.h1h2.Serve(ln)
 		}
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if serr != nil && !errors.Is(serr, http.ErrServerClosed) {
 			// Surface rather than swallow; the supervisor decides.
-			fmt.Printf("gateway: listener stopped: %v\n", err)
+			fmt.Printf("gateway: listener stopped: %v\n", serr)
 		}
 	}()
 	close(s.ready)

@@ -51,7 +51,13 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 	var gw *gateway.Server
 	var responseCache gateway.ResponseCache
 	if flags.Gateway {
-		gw = gateway.New(cfg, gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort})
+		gw = gateway.New(cfg, gateway.Options{
+			Host:        flags.GatewayHost,
+			Port:        flags.GatewayPort,
+			CertFile:    flags.TLSCert,
+			KeyFile:     flags.TLSKey,
+			EnableHTTP3: flags.HTTP3,
+		})
 		// Install the real router and upstream client. Without this the
 		// gateway keeps its minimal built-in defaults, which always resolve
 		// Router.default — so haiku-tier background requests would be sent to
@@ -79,7 +85,15 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 			}
 			return 1
 		}
-		fmt.Fprintf(stdout, "gateway listening on %s\n", gw.Addr())
+		scheme := "http"
+		if flags.TLSCert != "" {
+			scheme = "https"
+		}
+		transport := ""
+		if flags.HTTP3 {
+			transport = " (+HTTP/3)"
+		}
+		fmt.Fprintf(stdout, "gateway listening on %s://%s%s\n", scheme, gw.Addr(), transport)
 	}
 
 	mgmt, err := newManagementServer(flags.Host, flags.Port, cfg, rec)

@@ -4,24 +4,22 @@
 // exercises: HTTP/2 over TLS (ALPN h2), the Alt-Svc h3 advertisement, and
 // HTTP/3 over QUIC.
 //
-// # Start path: IN-PROCESS gateway.New(...).Start(), not `ccr serve`
+// # Start path: the REAL `ccr serve` SUBPROCESS, driven by CLI flags
 //
-// The `ccr serve` CLI (cmd/ccr/flags.go + serve.go) exposes NO TLS/HTTP3
-// surface at all: parseCommonFlags knows only --host/--port/--gateway-host/
-// --gateway-port/--open/--gateway (+ the CCR_WEB_*/CCR_GATEWAY_* env
-// equivalents), and cmdServe constructs gateway.Options with ONLY Host+Port —
-// CertFile, KeyFile and EnableHTTP3 are never set from any flag or env var. TLS
-// and HTTP/3 are reachable ONLY through gateway.Options. So there is no
-// subprocess path that could turn them on; instead we start the gateway
-// IN-PROCESS via gateway.New(cfg, Options{CertFile, KeyFile, EnableHTTP3:true})
-// + Start() on a free loopback port. It is still a REAL TLS listener over real
-// loopback sockets (net/http's ListenAndServeTLS for h1/h2, quic-go's
-// http3.Server for h3) — same-process, but genuinely on the wire, driven by a
-// real net/http and a real quic-go client. Every cert is generated at runtime
-// into t.TempDir(); there are no fixtures.
+// The `ccr serve` CLI now exposes the full TLS/HTTP3 surface: --tls-cert /
+// --tls-key switch the gateway to HTTPS (HTTP/2 over TLS via ALPN) and --http3
+// advertises + serves QUIC alongside it (with the CCR_TLS_CERT / CCR_TLS_KEY /
+// CCR_HTTP3 env equivalents). So this suite starts the SAME binary an operator
+// runs — `ccr serve --tls-cert … --tls-key … --http3` as an os/exec subprocess
+// on free loopback ports — and drives it with a real net/http (h1/h2) and a real
+// quic-go http3.Transport (h3) over genuine loopback sockets. Every cert is
+// generated at runtime into t.TempDir(); there are no fixtures. This closes the
+// prior gap where TLS/HTTP3 were reachable only through the in-process
+// gateway.Options struct and never through the shipped CLI.
 package livetls
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -31,19 +29,67 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
-
-	"github.com/vasic-digital/claude-code-router/internal/config"
-	"github.com/vasic-digital/claude-code-router/internal/gateway"
 )
+
+// ---------- Built binary (TestMain) ----------
+
+var (
+	ccrBin   string
+	buildErr error
+	buildOut string
+)
+
+func TestMain(m *testing.M) {
+	os.Exit(func() int {
+		dir, err := os.MkdirTemp("", "ccr-livetls-bin-")
+		if err != nil {
+			buildErr = fmt.Errorf("mktemp for binary: %w", err)
+			return m.Run()
+		}
+		defer os.RemoveAll(dir)
+
+		bin := filepath.Join(dir, "ccr")
+		root, err := filepath.Abs(filepath.Join("..", ".."))
+		if err != nil {
+			buildErr = fmt.Errorf("resolve repo root: %w", err)
+			return m.Run()
+		}
+		cmd := exec.Command("go", "build", "-o", bin, "./cmd/ccr")
+		cmd.Dir = root
+		out, berr := cmd.CombinedOutput()
+		buildOut = string(out)
+		if berr != nil {
+			buildErr = fmt.Errorf("go build ./cmd/ccr failed: %w", berr)
+			return m.Run()
+		}
+		ccrBin = bin
+		return m.Run()
+	}())
+}
+
+// requireBinary fails loudly (never a silent skip) if the binary could not be
+// built, surfacing the captured build output.
+func requireBinary(t *testing.T) {
+	t.Helper()
+	if buildErr != nil || ccrBin == "" {
+		t.Fatalf("ccr binary was not built: %v\n--- build output ---\n%s", buildErr, buildOut)
+	}
+}
 
 // ---------- self-signed cert generation (crypto/tls + x509 + ecdsa) ----------
 
@@ -135,69 +181,171 @@ func freePort(t *testing.T) int {
 	return 0
 }
 
-// minimalConfig is enough for the /health handler (it only reports
-// len(Providers)); no upstream is ever contacted by these transport tests.
-func minimalConfig() *config.Config {
-	return &config.Config{
-		Providers: []config.Provider{{
-			Name:       "p",
-			APIBaseURL: "https://upstream.invalid/chat/completions",
-			Models:     []string{"m"},
-		}},
-		Router: config.Route{Default: "p,m"},
-	}
+// minimalConfigJSON is enough for the /health handler (it only reports
+// len(Providers)); no upstream is ever contacted by these transport tests. The
+// top-level keys are capitalised to match the config schema (Providers/Router).
+const minimalConfigJSON = `{
+  "Providers": [
+    {"name": "p", "api_base_url": "https://upstream.invalid/chat/completions", "models": ["m"]}
+  ],
+  "Router": {"default": "p,m"}
+}`
+
+// ---------- Concurrency-safe output buffer ----------
+
+// syncBuffer is safe for the exec copier writes and concurrent test reads.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
 }
 
-// startTLSGateway starts an in-process TLS gateway on a free port with HTTP/3
-// enabled, registers cleanup, and blocks (bounded) until its HTTPS /health
-// answers 200. A bind/serve failure surfaces as a fatal readiness timeout with
-// no silent skip.
-func startTLSGateway(t *testing.T, pool *x509.CertPool, certFile, keyFile string) (*gateway.Server, int) {
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// ---------- Serve subprocess lifecycle (TLS + HTTP/3) ----------
+
+type serveInstance struct {
+	t      *testing.T
+	cmd    *exec.Cmd
+	out    *syncBuffer
+	pool   *x509.CertPool
+	gwPort int
+
+	exitCh   chan struct{} // closed once the process has been reaped
+	stopOnce sync.Once
+}
+
+// startServeTLS generates a fresh cert, writes config.json under a temp HOME,
+// and starts the REAL `ccr serve` with --tls-cert/--tls-key/--http3 on free
+// loopback ports. It blocks (bounded) until the HTTPS /health answers 200. Any
+// failure is a hard t.Fatalf carrying the subprocess output — never a silent
+// skip.
+func startServeTLS(t *testing.T) *serveInstance {
 	t.Helper()
-	port := freePort(t)
-	gw := gateway.New(minimalConfig(), gateway.Options{
-		Host:        "127.0.0.1",
-		Port:        port,
-		CertFile:    certFile,
-		KeyFile:     keyFile,
-		EnableHTTP3: true,
-	})
-	if err := gw.Start(); err != nil {
-		t.Fatalf("start TLS gateway on port %d: %v", port, err)
+	requireBinary(t)
+
+	certFile, keyFile, pool := genSelfSignedCert(t)
+
+	home := t.TempDir()
+	cfgDir := filepath.Join(home, ".claude-code-router")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
 	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = gw.Shutdown(ctx)
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(minimalConfigJSON), 0o644); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+
+	si := &serveInstance{
+		t:      t,
+		out:    &syncBuffer{},
+		pool:   pool,
+		gwPort: freePort(t),
+		exitCh: make(chan struct{}),
+	}
+	mgmtPort := freePort(t)
+
+	si.cmd = exec.Command(ccrBin, "serve",
+		"--no-open",
+		"--gateway-host", "127.0.0.1",
+		"--gateway-port", strconv.Itoa(si.gwPort),
+		"--host", "127.0.0.1",
+		"--port", strconv.Itoa(mgmtPort),
+		"--tls-cert", certFile,
+		"--tls-key", keyFile,
+		"--http3",
+	)
+	si.cmd.Stdout = si.out
+	si.cmd.Stderr = si.out
+	si.cmd.Env = envWith(os.Environ(), map[string]string{
+		"HOME":          home,
+		"CCR_LOG_LEVEL": "error",
 	})
-	waitTLSHealthy(t, pool, port)
-	return gw, port
+
+	if err := si.cmd.Start(); err != nil {
+		t.Fatalf("start ccr serve (TLS): %v", err)
+	}
+	go func() {
+		_ = si.cmd.Wait()
+		close(si.exitCh)
+	}()
+	t.Cleanup(si.stop)
+
+	si.waitTLSHealthy(15 * time.Second)
+	return si
+}
+
+func envWith(base []string, overrides map[string]string) []string {
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, kv := range base {
+		keep := true
+		for k := range overrides {
+			if strings.HasPrefix(kv, k+"=") {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			out = append(out, kv)
+		}
+	}
+	for k, v := range overrides {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
+func (si *serveInstance) gwURL(path string) string {
+	return fmt.Sprintf("https://127.0.0.1:%d%s", si.gwPort, path)
+}
+
+// exited reports whether the subprocess has already been reaped.
+func (si *serveInstance) exited() bool {
+	select {
+	case <-si.exitCh:
+		return true
+	default:
+		return false
+	}
 }
 
 // h2Client builds an HTTP/2-capable client that trusts the self-signed cert and
 // verifies the server by the 127.0.0.1 IP SAN. ForceAttemptHTTP2 makes net/http
 // offer "h2" in the ALPN list so the TLS listener negotiates HTTP/2.
-func h2Client(pool *x509.CertPool) *http.Client {
+func (si *serveInstance) h2Client() *http.Client {
 	return &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
 			ForceAttemptHTTP2: true,
-			TLSClientConfig:   &tls.Config{RootCAs: pool, ServerName: "127.0.0.1"},
+			TLSClientConfig:   &tls.Config{RootCAs: si.pool, ServerName: "127.0.0.1"},
 		},
 	}
 }
 
-// waitTLSHealthy polls HTTPS /health until 200 or a bounded deadline. A never-ok
-// listener is a hard failure (never a hanging sleep, never a silent pass).
-func waitTLSHealthy(t *testing.T, pool *x509.CertPool, port int) {
-	t.Helper()
-	client := h2Client(pool)
-	url := fmt.Sprintf("https://127.0.0.1:%d/health", port)
-	deadline := time.Now().Add(10 * time.Second)
+// waitTLSHealthy polls HTTPS /health until 200 or a bounded deadline. A
+// never-ok listener — or an early process exit — is a hard failure (never a
+// hanging sleep, never a silent pass).
+func (si *serveInstance) waitTLSHealthy(within time.Duration) {
+	si.t.Helper()
+	client := si.h2Client()
+	url := si.gwURL("/health")
+	deadline := time.Now().Add(within)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		if si.exited() {
+			si.t.Fatalf("ccr serve exited before HTTPS /health became ready\n--- output ---\n%s", si.out.String())
+		}
 		resp, err := client.Get(url)
 		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return
@@ -208,26 +356,44 @@ func waitTLSHealthy(t *testing.T, pool *x509.CertPool, port int) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("HTTPS /health on port %d never became ready: %v", port, lastErr)
+	si.t.Fatalf("HTTPS /health on port %d never became ready within %s: %v\n--- output ---\n%s",
+		si.gwPort, within, lastErr, si.out.String())
+}
+
+// stop signals SIGTERM, then kills if the process does not exit in time. Runs
+// via t.Cleanup so no ccr process is ever leaked, and is idempotent.
+func (si *serveInstance) stop() {
+	si.stopOnce.Do(func() {
+		if si.cmd.Process == nil {
+			return
+		}
+		_ = si.cmd.Process.Signal(syscall.SIGTERM)
+		select {
+		case <-si.exitCh:
+		case <-time.After(10 * time.Second):
+			_ = si.cmd.Process.Kill()
+			<-si.exitCh
+		}
+	})
 }
 
 // ---------- 1+3+4: real HTTPS over HTTP/2, Alt-Svc h3 advertisement ----------
 
-// TestHTTP2OverTLS drives a REAL HTTPS request to GET /health over HTTP/2 and
+// TestHTTP2OverTLS drives a REAL HTTPS request to GET /health over HTTP/2
+// against the `ccr serve --tls-cert … --tls-key … --http3` subprocess and
 // asserts the response is 200, was served over TLS (resp.TLS != nil), and the
 // negotiated protocol is HTTP/2.0 — and that the same response advertises h3 on
 // the listener's port via Alt-Svc (proving altSvcMiddleware fired because
-// EnableHTTP3 is set). These two are the DEFINITIVE assertions the task
-// requires to always pass.
+// --http3 is set). These are the DEFINITIVE assertions the suite requires to
+// always pass.
 func TestHTTP2OverTLS(t *testing.T) {
-	certFile, keyFile, pool := genSelfSignedCert(t)
-	_, port := startTLSGateway(t, pool, certFile, keyFile)
+	si := startServeTLS(t)
 
-	client := h2Client(pool)
-	url := fmt.Sprintf("https://127.0.0.1:%d/health", port)
+	client := si.h2Client()
+	url := si.gwURL("/health")
 	resp, err := client.Get(url)
 	if err != nil {
-		t.Fatalf("HTTPS GET %s: %v", url, err)
+		t.Fatalf("HTTPS GET %s: %v\n--- output ---\n%s", url, err, si.out.String())
 	}
 	defer resp.Body.Close()
 
@@ -244,7 +410,7 @@ func TestHTTP2OverTLS(t *testing.T) {
 		resp.StatusCode, resp.Proto, resp.TLS.Version, resp.TLS.NegotiatedProtocol)
 
 	// Alt-Svc must advertise h3 on THIS port (compress.go: `h3=":<port>"; ma=86400`).
-	wantAltSvc := fmt.Sprintf(`h3=":%d"; ma=86400`, port)
+	wantAltSvc := fmt.Sprintf(`h3=":%d"; ma=86400`, si.gwPort)
 	if got := resp.Header.Get("Alt-Svc"); got != wantAltSvc {
 		t.Fatalf("Alt-Svc = %q, want %q", got, wantAltSvc)
 	}
@@ -254,22 +420,22 @@ func TestHTTP2OverTLS(t *testing.T) {
 // ---------- 5: real HTTP/3 over QUIC (best-effort) ----------
 
 // TestHTTP3OverQUIC makes a REAL HTTP/3 request to /health through quic-go's
-// http3.Transport and asserts 200 with resp.Proto == "HTTP/3.0". The QUIC
-// handshake over a loopback UDP socket can be flaky in constrained CI/sandbox
-// environments (no UDP, blocked, or the h3 listener's UDP bind losing the
-// close/re-bind port race), so on a handshake/dial error this test SKIPS with
-// an explicit, stated reason rather than passing silently — the h2 path and the
-// Alt-Svc advertisement in TestHTTP2OverTLS carry the definitive proof.
+// http3.Transport against the subprocess and asserts 200 with
+// resp.Proto == "HTTP/3.0". The QUIC handshake over a loopback UDP socket can
+// be flaky in constrained CI/sandbox environments (no UDP, blocked, or the h3
+// listener's UDP bind losing the close/re-bind port race), so on a
+// handshake/dial error this test SKIPS with an explicit, stated reason rather
+// than passing silently — the h2 path and the Alt-Svc advertisement in
+// TestHTTP2OverTLS carry the definitive proof.
 func TestHTTP3OverQUIC(t *testing.T) {
-	certFile, keyFile, pool := genSelfSignedCert(t)
-	_, port := startTLSGateway(t, pool, certFile, keyFile)
+	si := startServeTLS(t)
 
 	tr := &http3.Transport{
-		TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: "127.0.0.1"},
+		TLSClientConfig: &tls.Config{RootCAs: si.pool, ServerName: "127.0.0.1"},
 	}
 	defer tr.Close()
 	client := &http.Client{Transport: tr, Timeout: 5 * time.Second}
-	url := fmt.Sprintf("https://127.0.0.1:%d/health", port)
+	url := si.gwURL("/health")
 
 	// Bounded retry: the UDP/QUIC listener may need a moment beyond the TCP
 	// /health readiness gate. Never an unbounded sleep.
@@ -300,25 +466,46 @@ func TestHTTP3OverQUIC(t *testing.T) {
 	t.Logf("h3 OK: status=%d proto=%q", resp.StatusCode, resp.Proto)
 }
 
-// ---------- 6: HTTP/3 without TLS is an explicit error ----------
+// ---------- 6: `ccr serve --http3` without TLS is a clean CLI error ----------
 
-// TestHTTP3WithoutTLSIsError proves the gateway REFUSES to silently downgrade:
-// EnableHTTP3 with no CertFile/KeyFile must make Start() return an explicit
-// error (QUIC has no cleartext mode), never a quietly-plain-HTTP listener.
-func TestHTTP3WithoutTLSIsError(t *testing.T) {
-	gw := gateway.New(minimalConfig(), gateway.Options{
-		Host:        "127.0.0.1",
-		Port:        freePort(t),
-		EnableHTTP3: true,
-		// CertFile/KeyFile deliberately unset.
-	})
-	err := gw.Start()
-	if err == nil {
-		// Do not leak a listener if Start unexpectedly succeeded.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = gw.Shutdown(ctx)
-		cancel()
-		t.Fatalf("Start() with EnableHTTP3 and no TLS returned nil error; want an explicit HTTP/3-requires-TLS error")
+// TestServeHTTP3WithoutTLSRejected proves the SHIPPED CLI refuses to silently
+// downgrade: `ccr serve --http3` with no --tls-cert/--tls-key must exit
+// non-zero with an explicit "requires TLS" message on stderr, never a quietly
+// plain-HTTP listener. The flag parser rejects it before any listener binds, so
+// the process exits fast; a bounded wait guards against a hang.
+func TestServeHTTP3WithoutTLSRejected(t *testing.T) {
+	requireBinary(t)
+
+	home := t.TempDir()
+	cfgDir := filepath.Join(home, ".claude-code-router")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
 	}
-	t.Logf("no-TLS HTTP/3 correctly rejected: %v", err)
+	if err := os.WriteFile(filepath.Join(cfgDir, "config.json"), []byte(minimalConfigJSON), 0o644); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, ccrBin, "serve", "--no-open", "--http3")
+	cmd.Env = envWith(os.Environ(), map[string]string{"HOME": home})
+	out, err := cmd.CombinedOutput()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("`ccr serve --http3` (no TLS) hung instead of erroring; output:\n%s", out)
+	}
+	if err == nil {
+		t.Fatalf("`ccr serve --http3` (no TLS) exited 0; want a non-zero usage error. output:\n%s", out)
+	}
+	if exit, ok := err.(*exec.ExitError); ok {
+		if code := exit.ExitCode(); code != 2 {
+			t.Errorf("exit code = %d, want 2 (usage error). output:\n%s", code, out)
+		}
+	} else {
+		t.Fatalf("run ccr serve: unexpected error type %T: %v", err, err)
+	}
+	if !strings.Contains(string(out), "--http3 requires TLS") {
+		t.Fatalf("stderr did not explain the TLS requirement; got:\n%s", out)
+	}
+	t.Logf("CLI correctly rejected --http3 without TLS:\n%s", strings.TrimSpace(string(out)))
 }

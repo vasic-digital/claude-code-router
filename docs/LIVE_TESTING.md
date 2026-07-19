@@ -108,9 +108,9 @@ checks.
 
 ## Additional live suites
 
-Beyond `test/live/` (the core scenarios above), three focused suites cover the
-transport and operational surfaces, each building `ccr` and driving it over real
-loopback:
+Beyond `test/live/` (the core scenarios above), six focused suites cover the
+transport, operational, production-matrix, and adversarial surfaces, each
+building `ccr` and driving it over real loopback:
 
 - **`test/livetls/`** — TLS transport: HTTP/2 over TLS (ALPN h2), the `Alt-Svc`
   h3 advertisement, a real HTTP/3-over-QUIC request, and HTTP/3-without-TLS
@@ -123,9 +123,58 @@ loopback:
 - **`test/liveload/`** — concurrency + soak: 500 concurrent requests with exact
   metric equality, the in-flight gauge quiescing to 0, cache-under-load bounds,
   200 concurrent streams, and a multi-second soak with zero errors and no panics.
+- **`test/livegraceful/`** — graceful SIGTERM shutdown, driven through the real
+  `ccr serve` subprocess: `TestGracefulShutdownUnderLoad` fires 16 concurrent
+  `POST /v1/messages` against a deliberately slow upstream, sends SIGTERM
+  mid-drain, and asserts a clean exit 0 within the ~10s `shutdownGrace` window,
+  every completed response is a well-formed Anthropic message (never a
+  truncated/garbage body), the upstream's started/finished counts line up (so
+  nothing was cut off), no panic/goroutine-dump/leak marker appears in the log,
+  and the management `/metrics` listener is gone after exit.
+  `TestGracefulShutdownIdle` proves an idle server (no in-flight requests) also
+  exits 0 promptly on SIGTERM, logging "shutting down..." with no crash.
+- **`test/liveprod/`** — a broad production matrix (`TestLiveProductionMatrix`),
+  each subtest standing up its own fresh upstream and serve instance:
+  `endpoint_surface` (every routable endpoint reaches the right handler; `GET
+  /v1/messages` → 404/405; `POST /v1/responses` → 404; negative probes collapse
+  to the `/(unmatched)` metrics bucket with no raw-path label leak);
+  `config_plain` (exact RED + gen_ai metric deltas across 1 non-stream + 1
+  stream `/v1/messages` call and 1 `/v1/chat/completions` call — all three
+  upstream calls are attributed in `ccr_gen_ai_upstream_requests_total` and the
+  token counters, across BOTH the Anthropic path and the OpenAI facade, which
+  now records upstream + non-streaming token usage at parity with
+  `/v1/messages`); `cache_memory` / `cache_sqlite` (a HIT skips
+  the upstream and moves `ccr_gen_ai_cache_lookups_total{tier="exact",result="hit"}`
+  for both cache backends); `cache_semantic` (a near-duplicate request hits the
+  semantic tier); `cross_provider_fallback` (per-attempt provider attribution —
+  both the failed primary and the secondary that actually served appear in
+  `ccr_gen_ai_upstream_requests_total`); `transformer_cleancache_streamoptions`
+  (`stream_options.include_usage` is injected into the upstream body and
+  `cache_control` is stripped from a forwarded tool schema, both verified at the
+  wire); `router_think_routing` (a request carrying a `thinking` field routes to
+  the think provider; the default provider is never hit); `multi_provider_routing`
+  (a bare default-tier model, a haiku-tier background model, and an explicit
+  `"provider,model"` selector each reach their intended, distinct provider).
+- **`test/liveedge/`** — adversarial/robustness testing against one `ccr serve`
+  subprocess: an oversized 33MiB body → 413 with the server surviving;
+  malformed JSON → 400; wrong method / unknown route / `POST /v1/responses` →
+  404/405; the OpenAI facade's own invalid JSON → 400 in an OpenAI error
+  envelope, and an anthropic-native route on that facade → 501; upstream
+  misbehavior (a non-JSON garbage 200, an empty 200 body, a valid-JSON
+  zero-choices 200) each map to a clean 502 `api_error` and are never relayed as
+  if they were a valid message, while a large-but-under-cap body still returns
+  200; a mid-stream upstream EOF still terminates the client's SSE
+  well-formed (`message_stop` present, no hang); a canary `api_key` is asserted
+  to never leak into any client-visible response body or any `/metrics` label
+  (grep-count 0) across 401/500/garbage-upstream error paths; a
+  unicode/control-character payload round-trips byte-for-byte through an echo
+  upstream; 16 concurrent valid + 16 concurrent malformed requests run
+  interleaved with no cross-contamination between per-request markers; and a
+  final subtest asserts no panic/goroutine-dump/fatal-error marker leaked into
+  the serve log after the whole adversarial batch.
 
 Run one (`go test ./test/livetls/...`) or all sequentially
-(`go test ./test/live/... ./test/livetls/... ./test/livereload/... ./test/liveload/... -p 1`).
+(`go test ./test/live/... ./test/livetls/... ./test/livereload/... ./test/liveload/... ./test/livegraceful/... ./test/liveprod/... ./test/liveedge/... -p 1`).
 The free-port helpers retry a transient ephemeral-bind failure, so heavy
 concurrent port churn does not spuriously fail a run.
 

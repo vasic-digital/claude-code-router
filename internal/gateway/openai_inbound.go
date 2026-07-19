@@ -125,13 +125,24 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 		defer cancel()
 	}
 
+	// Attribute the upstream call for observability, symmetric with the
+	// Anthropic single-provider branch (handleMessages). This facade does no
+	// cross-provider fallback — it calls doUpstreamWithRetry with canFallback
+	// false — so exactly one provider is ever attempted, hence one record here.
+	// Without this, a /v1/chat/completions request reached the upstream yet
+	// contributed nothing to ccr_gen_ai_upstream_requests_total; only the RED
+	// ccr_http_requests_total middleware counted it — an attribution gap.
+	if s.Metrics != nil {
+		s.Metrics.RecordUpstream(provider.Name, model)
+	}
+
 	resp, ok, _ := s.doUpstreamWithRetry(c, ctx, provider, outBody, openAIResponder{}, false)
 	if !ok {
 		return
 	}
 	defer resp.Body.Close()
 
-	relayOpenAIResponse(c, resp, in.Stream)
+	s.relayOpenAIResponse(c, resp, in.Stream, provider.Name, model)
 }
 
 // overrideModelField sets the top-level "model" on a JSON object body while
@@ -159,7 +170,14 @@ func overrideModelField(raw []byte, model string) ([]byte, error) {
 // unchanged (the client asked for OpenAI shape and the provider produced it).
 // Like every other response path here, it copies NO upstream header — the
 // response is rebuilt from the body alone.
-func relayOpenAIResponse(c *gin.Context, resp *http.Response, stream bool) {
+//
+// On the non-streaming path it also records token usage for observability,
+// parsing the OpenAI usage block best-effort from the SAME buffered body it
+// relays (the body is still emitted verbatim — parsing is read-only). Streaming
+// is NOT recorded: relayRawStream copies the SSE byte-for-byte without decoding
+// the per-chunk usage, a documented gap symmetric with the Anthropic-native
+// streaming relay (see relayAnthropicResponse).
+func (s *Server) relayOpenAIResponse(c *gin.Context, resp *http.Response, stream bool, provider, model string) {
 	if stream {
 		relayRawStream(c.Writer, resp.Body)
 		return
@@ -168,6 +186,16 @@ func relayOpenAIResponse(c *gin.Context, resp *http.Response, stream bool) {
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
 		return
+	}
+	// Best-effort token accounting: the body is OpenAI-shaped, so its
+	// usage.{prompt,completion}_tokens are read directly. A body without a usage
+	// block (or one that does not parse) simply records nothing — RecordTokens
+	// ignores non-positive counts. The bytes relayed below are unchanged.
+	if s.Metrics != nil {
+		var oa openAIChatResponse
+		if json.Unmarshal(raw, &oa) == nil && oa.Usage != nil {
+			s.Metrics.RecordTokens(provider, model, oa.Usage.PromptTokens, oa.Usage.CompletionTokens)
+		}
 	}
 	c.Data(http.StatusOK, "application/json", raw)
 }

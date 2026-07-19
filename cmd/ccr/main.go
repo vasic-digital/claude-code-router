@@ -56,6 +56,14 @@ Flags (start, ui, serve, web):
                             Set 0.0.0.0 inside a container, where 127.0.0.1
                             is the container's own loopback and a published
                             port can never reach it.
+  --tls-cert <path>        PEM certificate for the gateway TLS listener (env
+                            CCR_TLS_CERT). Serves HTTPS (HTTP/2 over TLS via
+                            ALPN) instead of cleartext HTTP. Must be paired
+                            with --tls-key.
+  --tls-key <path>         PEM private key for --tls-cert (env CCR_TLS_KEY).
+  --http3, --no-http3      Advertise and serve HTTP/3 (QUIC) on the gateway
+                            alongside TLS (env CCR_HTTP3). Requires --tls-cert
+                            and --tls-key — QUIC has no cleartext mode.
 
   -h, --help                Show this help
 `

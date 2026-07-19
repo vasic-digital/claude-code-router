@@ -225,7 +225,7 @@ bin/ccr config show
 
 ## 5. TLS and HTTP/3
 
-`internal/gateway.Options` supports TLS and HTTP/3 (`internal/gateway/gateway.go:35-47`), but `cmd/ccr` does **not** currently expose `--cert`/`--key`/`--http3` flags — `cmdServe` always constructs `gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort}` with no TLS fields set (`cmd/ccr/serve.go:46`). Reaching TLS/HTTP-3 today means using `internal/gateway` as a library directly, calling `gateway.New(cfg, gateway.Options{CertFile: ..., KeyFile: ..., EnableHTTP3: true})` yourself. Treat CLI flags for this as **PLANNED**.
+`cmd/ccr` exposes TLS and HTTP/3 directly as CLI flags, shared by `start`/`ui`/`serve`/`web`: `--tls-cert <path>` / `--tls-key <path>` (env `CCR_TLS_CERT` / `CCR_TLS_KEY`) supply the PEM cert+key pair that switches the gateway from cleartext HTTP to HTTPS, and `--http3` / `--no-http3` (env `CCR_HTTP3`) additionally serves HTTP/3 (QUIC) alongside the TLS listener. `cmdServe` forwards them straight into `internal/gateway.Options{CertFile: flags.TLSCert, KeyFile: flags.TLSKey, EnableHTTP3: flags.HTTP3}` (`cmd/ccr/serve.go:54-60`); `parseCommonFlags` parses and validates them, rejecting a cert without a key and `--http3` without both (`cmd/ccr/flags.go:89-101`, `146-178`).
 
 - Plain HTTP on `127.0.0.1` is the default because that is what Claude Code and the existing toolkit expect out of the box; TLS/HTTP-3 are opt-in (`internal/gateway/gateway.go:12-16`).
 - Setting **both** `CertFile` and `KeyFile` enables TLS for the HTTP/1.1 and HTTP/2 listener (`internal/gateway/gateway.go:219`, `233-234`).

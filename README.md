@@ -172,14 +172,14 @@ Notes, all grounded in `cmd/ccr/*.go`:
 - `-h`, `--help`, `help`, and no arguments at all all print the same usage text and exit `0` (`cmd/ccr/main.go:71-79`, tested at `cmd/ccr/main_test.go:26-37`).
 - **`ccr config validate [path]`** and **`ccr config show [path]`** are also implemented (`cmd/ccr/config_cmd.go`, dispatched at `cmd/ccr/main.go:88-89`), even though they are not part of the usage text above (which is pinned to the upstream v3.0.6 grammar `claude_toolkit` greps). `validate` loads a config and reports **every** structural problem in a single pass — exit `0` iff valid, `1` otherwise (`config.LoadForValidation` + `config.CheckAll`). `show` prints the effective config as indented JSON with every provider's `api_key` replaced by the fixed marker `[REDACTED]` — the real key's bytes are never marshalled at all, so it is safe to paste into a bug report (`internal/config/validate_cmd.go`). `path` defaults to the same `~/.claude-code-router/config.json` that `serve` reads.
 
-The gateway's remaining transport knobs (TLS, HTTP/3, upstream timeout, retry attempts, inbound API keys) exist as `internal/gateway.Options` (`internal/gateway/gateway.go:35-74`) but are **not yet exposed as CLI flags** — `cmdServe` constructs `gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort}` only (`cmd/ccr/serve.go:46`), so TLS/HTTP-3/custom retry budgets/inbound auth are only reachable today by using `internal/gateway` as a library directly:
+The gateway's remaining transport knobs (upstream timeout, retry attempts, inbound API keys) exist as `internal/gateway.Options` (`internal/gateway/gateway.go:35-74`) but are **not yet exposed as CLI flags**. TLS and HTTP/3 **are** CLI-exposed — `cmdServe` constructs `gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort, CertFile: flags.TLSCert, KeyFile: flags.TLSKey, EnableHTTP3: flags.HTTP3}` (`cmd/ccr/serve.go:54-60`), fed by the `--tls-cert`/`--tls-key`/`--http3` flags and their `CCR_TLS_CERT`/`CCR_TLS_KEY`/`CCR_HTTP3` env equivalents (`cmd/ccr/flags.go:89-101`, `146-161`). Custom retry budgets and inbound auth are still only reachable today by using `internal/gateway` as a library directly:
 
 | `internal/gateway.Options` field | Default | CLI-exposed? |
 |---|---|---|
 | `Host` | `127.0.0.1` | **Yes** — `--gateway-host` / `CCR_GATEWAY_HOST` |
 | `Port` | `3456` | **Yes** — `--gateway-port` / `CCR_GATEWAY_PORT` |
-| `CertFile`, `KeyFile` | unset | **No** — PLANNED |
-| `EnableHTTP3` | `false` | **No** — PLANNED |
+| `CertFile`, `KeyFile` | unset | **Yes** — `--tls-cert` / `CCR_TLS_CERT` and `--tls-key` / `CCR_TLS_KEY` (must be provided together, or `serve` exits 2) |
+| `EnableHTTP3` | `false` | **Yes** — `--http3` / `--no-http3` / `CCR_HTTP3` (requires `--tls-cert`/`--tls-key`; `serve` exits 2 without them) |
 | `UpstreamTimeout` | 10 minutes | **No** — PLANNED (also see the differing streaming/non-streaming semantics note in `docs/FAQ.md` Q18) |
 | `MaxAttempts` | 3 (1 initial try + 2 retries) | **No** — the retry loop itself is implemented (see "Known limitations" and the Feature table below) but its attempt budget has no flag/env/config surface yet |
 | `APIKeys` | empty (auth disabled) | **No** — `RequireAPIKey` is now mounted on `POST /v1/messages`, but nothing populates this list; see "Known limitations" |
@@ -206,7 +206,7 @@ The gateway's remaining transport knobs (TLS, HTTP/3, upstream timeout, retry at
 | Deterministic `LocalEmbedder` for the semantic cache tier (lexical near-duplicate, **not** a learned model) | Implemented (seam) | `internal/cache/embedder_local.go`, `internal/cache/semantic.go` |
 | Cross-provider fallback (`Router.crossProviderFallback` + `Router.fallback` chain) | **v0.3.0** — schema + policy this release; planning primitives implemented and unit-tested | `internal/router/plan.go`, `internal/router/fallback.go` |
 | HTTP/1.1, HTTP/2 | Implemented | `internal/gateway/gateway.go:212-245` |
-| HTTP/3 (QUIC), TLS-gated | Implemented (library); not yet exposed as a CLI flag | `internal/gateway/gateway.go:226-229` |
+| HTTP/3 (QUIC), TLS-gated | Implemented; CLI-exposed via `--http3` (requires `--tls-cert`/`--tls-key`) | `internal/gateway/gateway.go:226-229`, `cmd/ccr/flags.go:146-161` |
 | brotli → gzip → identity content negotiation | Implemented | `internal/gateway/compress.go:39-81` |
 | `GET /health`, `GET /ready` | Implemented | `internal/gateway/gateway.go:160-182` |
 | `POST /v1/messages`: non-streaming request/response translation | Implemented | `internal/gateway/messages.go:189-296`, `538-608` |

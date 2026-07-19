@@ -5,6 +5,7 @@ package gateway
 // anthropic_passthrough_test.go (same package).
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -71,6 +72,73 @@ func TestOpenAIInboundPassthroughNonStreaming(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Errorf("Content-Type = %q, want application/json", ct)
 	}
+}
+
+// The OpenAI inbound facade must attribute its upstream call and token usage in
+// metrics, exactly like the Anthropic path — a /v1/chat/completions request that
+// reaches the upstream was previously invisible to ccr_gen_ai_upstream_requests_total
+// and the token counters (only the RED http_requests middleware counted it). This
+// pins the fix AND guards that metric parsing never mutates the verbatim-relayed
+// body.
+func TestOpenAIInboundRecordsUpstreamAndTokenMetrics(t *testing.T) {
+	const upstreamOpenAIResponse = `{"id":"chatcmpl-1","object":"chat.completion",` +
+		`"choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],` +
+		`"usage":{"prompt_tokens":7,"completion_tokens":11}}`
+
+	up := &recordingUpstream{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamOpenAIResponse)),
+	}}
+	s := New(openaiCfg(""), Options{})
+	s.Upstream = up
+
+	clientBody := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(clientBody))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	// The body must still be relayed byte-for-byte — recording tokens reads the
+	// buffered body but must not alter what the client receives.
+	if got := rec.Body.String(); got != upstreamOpenAIResponse {
+		t.Errorf("body not relayed verbatim after metric parsing:\n got: %s\nwant: %s", got, upstreamOpenAIResponse)
+	}
+
+	var buf bytes.Buffer
+	s.Metrics.WriteExposition(&buf)
+	out := buf.String()
+
+	// Upstream attributed exactly once (no fallback on this path), to the routed
+	// provider+model.
+	wantUpstream := `ccr_gen_ai_upstream_requests_total{provider="oai",model="routed-model"} 1`
+	if !metricLinePresent(out, wantUpstream) {
+		t.Errorf("missing/incorrect upstream metric line %q in:\n%s", wantUpstream, out)
+	}
+	// Token counters carry the OpenAI usage block's prompt/completion tokens.
+	wantInput := `ccr_gen_ai_input_tokens_total{provider="oai",model="routed-model"} 7`
+	if !metricLinePresent(out, wantInput) {
+		t.Errorf("missing/incorrect input-tokens metric line %q in:\n%s", wantInput, out)
+	}
+	wantOutput := `ccr_gen_ai_output_tokens_total{provider="oai",model="routed-model"} 11`
+	if !metricLinePresent(out, wantOutput) {
+		t.Errorf("missing/incorrect output-tokens metric line %q in:\n%s", wantOutput, out)
+	}
+}
+
+// metricLinePresent reports whether the Prometheus exposition contains a line
+// exactly equal to want (trimmed), tolerant of surrounding whitespace but strict
+// on the value so a double-count (…} 2) fails.
+func metricLinePresent(exposition, want string) bool {
+	for _, line := range strings.Split(exposition, "\n") {
+		if strings.TrimSpace(line) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestOpenAIInboundPassthroughStreaming(t *testing.T) {

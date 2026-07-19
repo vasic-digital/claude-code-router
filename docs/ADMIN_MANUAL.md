@@ -76,12 +76,13 @@ Notes:
 
 ## 2. TLS certificates
 
-TLS is opt-in and controlled by two `internal/gateway.Options` fields, `CertFile`/`KeyFile` (`internal/gateway/gateway.go:39-42`):
+TLS is opt-in and controlled by two `internal/gateway.Options` fields, `CertFile`/`KeyFile` (`internal/gateway/gateway.go:39-42`), which `cmd/ccr` exposes as CLI flags: `--tls-cert <path>` / `--tls-key <path>` (env `CCR_TLS_CERT` / `CCR_TLS_KEY`), shared by `start`/`ui`/`serve`/`web` (`cmd/ccr/flags.go:146-157`). HTTP/3 is likewise a flag, `--http3` / `--no-http3` (env `CCR_HTTP3`):
 
-- Neither set → plain HTTP only (the default; matches what Claude Code and `claude_toolkit` expect out of the box).
+- Neither `--tls-cert` nor `--tls-key` set → plain HTTP only (the default; matches what Claude Code and `claude_toolkit` expect out of the box).
 - Both set → HTTP/1.1 and HTTP/2 (ALPN `h2`) are served over TLS.
-- Both set **and** `EnableHTTP3` → QUIC/HTTP-3 is additionally served, and every response advertises it via `Alt-Svc: h3=":<port>"; ma=86400` (`internal/gateway/compress.go:120-128`).
-- `EnableHTTP3` set with **either** cert field missing → `Start()` returns an explicit error and refuses to boot, rather than silently serving HTTP/1.1 while claiming HTTP/3 support (`internal/gateway/gateway.go:223`).
+- Both set **and** `--http3` → QUIC/HTTP-3 is additionally served, and every response advertises it via `Alt-Svc: h3=":<port>"; ma=86400` (`internal/gateway/compress.go:120-128`).
+- `--tls-cert` without `--tls-key` (or vice versa) → `ccr serve` refuses to start, exit code `2`, before ever touching the gateway (`cmd/ccr/flags.go:170-172`).
+- `--http3` without both `--tls-cert` and `--tls-key` → `ccr serve` refuses to start with `"--http3 requires TLS: pass --tls-cert and --tls-key (QUIC has no cleartext mode)"`, exit code `2` (`cmd/ccr/flags.go:173-178`) — the gateway itself enforces the same rule at `Start()` (`internal/gateway/gateway.go:223`) as a second line of defense for library callers who bypass the CLI.
 
 Recommended certificate sources:
 - **Public deployment**: a real CA (e.g. ACME/Let's Encrypt via a sidecar or reverse proxy that terminates TLS and hands the router plain HTTP on localhost — see §5).
@@ -98,13 +99,13 @@ Certificate rotation is the operator's responsibility — there is no hot-reload
 
 | Port | Default | Purpose |
 |---|---|---|
-| TCP/UDP `3456` | default `internal/gateway/gateway.go:106-108` (host `103-105`); configurable via `--gateway-host`/`--gateway-port`/`CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT` (`cmd/ccr/flags.go:37,43`) | **Gateway** — TCP for HTTP/1.1 and HTTP/2, UDP for HTTP/3 (QUIC) when `EnableHTTP3` is set (library-only today; not CLI-exposed — see §2). Both protocols share the same port number by design (`s.Addr()`, `internal/gateway/gateway.go:127`, used for both `h1h2` and `h3` servers in `Start()` at `212-245`). |
+| TCP/UDP `3456` | default `internal/gateway/gateway.go:106-108` (host `103-105`); configurable via `--gateway-host`/`--gateway-port`/`CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT` (`cmd/ccr/flags.go:37,43`) | **Gateway** — TCP for HTTP/1.1 and HTTP/2, UDP for HTTP/3 (QUIC) when `--http3` is set (see §2). Both protocols share the same port number by design (`s.Addr()`, `internal/gateway/gateway.go:127`, used for both `h1h2` and `h3` servers in `Start()` at `212-245`). |
 | TCP `3458` | `cmd/ccr/flags.go:27-28`, configurable via `--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT` | **Management** control-plane server (`cmd/ccr/management.go`) — always started by `serve`/`start`/`ui`, cannot be disabled. Serves `GET /health`, the Prometheus `GET /metrics` endpoint (see §9), and a placeholder `GET /`. |
 
 Guidance:
 - Keep both bind addresses at the default `127.0.0.1` (gateway host default `internal/gateway/gateway.go:103-105`; management defaults the same — `cmd/ccr/flags.go:27`) unless you have a specific reason to accept remote connections — see §5. The gateway's bind address is now itself configurable (`--gateway-host`/`CCR_GATEWAY_HOST`); binding it off-loopback should be a deliberate act, since it holds live provider API keys.
 - If you do bind either to a non-loopback address, firewall the port to only the networks/clients that should reach it (Claude Code instances, or an internal load balancer, for the gateway; whoever administers the router, for the management interface). `GET /health`/`GET /ready` are deliberately never authenticated (dependency-free liveness/readiness — `internal/gateway/gateway.go:158-159`). `POST /v1/messages` now carries route-scoped `RequireAPIKey` middleware (`internal/gateway/gateway.go:201`), but `cmd/ccr` never populates `Options.APIKeys` (no CLI flag or `config.json` field), and an empty key list disables authentication entirely — so on a CLI-launched gateway `POST /v1/messages` is still unauthenticated today. The management server's own `/health`/`/` are unauthenticated too. Net: anyone who can reach the gateway port can send requests billed to your configured provider keys, and the management server cannot be disabled independently of the whole service.
-- If `EnableHTTP3` is set (library use only, not yet via `cmd/ccr`), remember to open the **UDP** port in addition to TCP — QUIC runs over UDP.
+- If `--http3` is set, remember to open the **UDP** port in addition to TCP — QUIC runs over UDP.
 
 ## 4. Log management
 
@@ -297,6 +298,6 @@ If you expose the management server off loopback to let an external Prometheus r
 - [ ] `GET :3458/metrics` returns `200` text-exposition output and is reachable by your Prometheus scraper (§9) — and is **not** exposed unauthenticated off loopback.
 - [ ] Deployed via `ccr serve` under a supervisor (§1), not `ccr start`/`ui` — the latter detaches and would confuse `Type=simple`/container process models.
 - [ ] Both the gateway (3456) and management (3458) bind addresses are `127.0.0.1` unless intentionally exposed behind an authenticating reverse proxy — remember the management interface **cannot be disabled**, only relocated.
-- [ ] If TLS is enabled (library use only — not yet CLI-exposed), certificate is valid and not near expiry.
-- [ ] If `EnableHTTP3` is enabled (library use only), both TCP **and** UDP for the bound port are open in the firewall.
+- [ ] If TLS is enabled (`--tls-cert`/`--tls-key`), certificate is valid and not near expiry.
+- [ ] If `--http3` is enabled, both TCP **and** UDP for the bound port are open in the firewall.
 - [ ] Backups of `config.json` are encrypted at rest (it contains provider API keys in plain text); `service.json`/`service.log` are regenerable operational state, not backup-worthy.

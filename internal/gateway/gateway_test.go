@@ -3,13 +3,16 @@ package gateway
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
@@ -174,6 +177,45 @@ func TestHTTP3WithoutTLSIsAnExplicitError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "TLS") {
 		t.Errorf("error should explain the TLS requirement, got: %v", err)
+	}
+}
+
+// Start must load the certificate SYNCHRONOUSLY: a bad --tls-cert/--tls-key path
+// is the single most common operator error for the TLS feature, and it must be
+// a returned error — never a nil return followed by the caller printing
+// "listening on https://…" while the bind silently failed in a goroutine.
+func TestStartBadCertPathReturnsError(t *testing.T) {
+	s := New(testCfg(), Options{Host: "127.0.0.1", Port: 0,
+		CertFile: "/nonexistent/cert.pem", KeyFile: "/nonexistent/key.pem"})
+	err := s.Start()
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = s.Shutdown(ctx)
+		cancel()
+		t.Fatal("Start() with a nonexistent cert path must return an error, not report listening")
+	}
+	if !strings.Contains(err.Error(), "cert") {
+		t.Errorf("error should mention the cert load failure, got: %v", err)
+	}
+}
+
+// Start must bind the TCP listener SYNCHRONOUSLY: an already-in-use port must be
+// a returned error, not a swallowed goroutine failure after Start() already
+// returned nil.
+func TestStartPortInUseReturnsError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port to occupy: %v", err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	s := New(testCfg(), Options{Host: "127.0.0.1", Port: port})
+	if serr := s.Start(); serr == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = s.Shutdown(ctx)
+		cancel()
+		t.Fatalf("Start() on already-bound port %d must return an error", port)
 	}
 }
 

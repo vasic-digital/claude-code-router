@@ -4,9 +4,72 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.4.1` were tagged 2026-07-19; `v0.4.2` (below) is the current
+`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3` (below) is the current
 release. Entries are drawn from this repository's real `git log` history —
 nothing here is speculative.
+
+## [0.4.3] - 2026-07-19
+
+TLS and HTTP/3 become first-class `ccr serve` CLI flags (previously reachable
+only through the `gateway.Options` library struct), a metrics-parity fix so the
+OpenAI-compatible facade is attributed like the Anthropic path, and three more
+LIVE end-to-end suites for production hardening.
+
+### Added
+
+- `ccr serve` (and `start`/`ui`/`web`) now accept `--tls-cert <path>` /
+  `--tls-key <path>` (env `CCR_TLS_CERT` / `CCR_TLS_KEY`) to serve HTTPS
+  (HTTP/2 over TLS via ALPN) and `--http3` / `--no-http3` (env `CCR_HTTP3`) to
+  additionally serve QUIC with the `Alt-Svc: h3` advertisement. These map
+  straight into `gateway.Options{CertFile, KeyFile, EnableHTTP3}`. The cert and
+  key must be supplied together, and `--http3` requires TLS — both are rejected
+  at parse time with a clear usage message (exit 2) rather than deep in the
+  gateway (QUIC has no cleartext mode). The startup log now reports the actual
+  scheme (`https://…`) and `(+HTTP/3)`.
+
+### Fixed
+
+- The OpenAI-compatible inbound facade (`POST /v1/chat/completions`) now records
+  `ccr_gen_ai_upstream_requests_total` and the input/output token counters,
+  exactly like the Anthropic `POST /v1/messages` path. Previously a
+  chat-completions request reached the upstream but was invisible to those
+  gen_ai metrics — only the RED `ccr_http_requests_total` middleware counted it.
+  The upstream response is still relayed byte-for-byte; token usage is parsed
+  read-only from the same buffered body (non-streaming only — streaming remains
+  a documented, byte-for-byte relay that is not token-accounted). Surfaced by the
+  new `test/liveprod` matrix and pinned by unit + live tests.
+- `Server.Start()` now binds the TCP listener and loads the TLS certificate
+  **synchronously**, so a bad `--tls-cert`/`--tls-key` path or an already-in-use
+  port is a returned error instead of a nil return followed by a
+  `listening on https://…` log line while the bind silently failed in a
+  background goroutine. The QUIC/UDP socket is bound synchronously too (its error
+  was previously swallowed entirely). TLS/HTTP2/HTTP3 negotiation is unchanged
+  (the live transport suite still passes); pinned by new unit tests.
+
+### Tests / Docs
+
+- `test/livetls/` now drives the **real `ccr serve` subprocess** with
+  `--tls-cert`/`--tls-key`/`--http3` (closing the prior gap where TLS/HTTP3 were
+  reachable only in-process): HTTP/2-over-TLS (`proto=HTTP/2.0`, ALPN h2), the
+  `Alt-Svc: h3=":port"` advertisement, a real HTTP/3-over-QUIC request
+  (`proto=HTTP/3.0`), and `ccr serve --http3` without certs cleanly rejected
+  (exit 2, correct message).
+- `test/livegraceful/`: graceful SIGTERM shutdown under 16-concurrent load —
+  clean exit 0 within the grace window, in-flight requests drain to well-formed
+  Anthropic messages, upstream `started == finished` (nothing cut off), no
+  panic/goroutine-dump/leak; plus an idle-shutdown case.
+- `test/liveprod/`: a broad production matrix (endpoint surface, plain/memory/
+  sqlite/semantic cache, cross-provider fallback, transformer flags, think-tier
+  routing, and multi-provider selection) asserting exact RED + gen_ai metric
+  deltas across BOTH the Anthropic and OpenAI-facade paths.
+- `test/liveedge/`: adversarial robustness — 33MiB body → 413 and survives,
+  malformed JSON → 400, malformed/empty/zero-choice upstream → clean `api_error`
+  (never a broken 200), mid-stream EOF → well-formed SSE termination, a canary
+  api_key never leaking into any client body or metric label, unicode/control
+  round-trip, and concurrent valid+malformed with no cross-contamination.
+- New CLI flags documented across `README.md`, `docs/USER_GUIDE.md`,
+  `docs/ARCHITECTURE.md`, `docs/ADMIN_MANUAL.md`, and `docs/LIVE_TESTING.md`
+  (the earlier "PLANNED / library-only" TLS/HTTP3 notes are retired).
 
 ## [0.4.2] - 2026-07-19
 

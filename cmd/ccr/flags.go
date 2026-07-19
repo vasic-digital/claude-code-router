@@ -18,6 +18,14 @@ type commonFlags struct {
 	// GatewayHost is the gateway's bind address, separate from Host (the
 	// management interface). Defaults to 127.0.0.1.
 	GatewayHost string
+	// TLSCert / TLSKey are the PEM cert+key that switch the gateway listener
+	// from cleartext HTTP to HTTPS (HTTP/2 over TLS via ALPN). Both must be set
+	// together; one without the other is a usage error.
+	TLSCert string
+	TLSKey  string
+	// HTTP3 advertises and serves the gateway over HTTP/3 (QUIC) alongside the
+	// TLS TCP listener. QUIC has no cleartext mode, so it REQUIRES TLSCert+TLSKey.
+	HTTP3 bool
 }
 
 // defaultManagementHost/Port match the Node implementation's management
@@ -78,6 +86,20 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 		f.GatewayPort = port
 	}
 
+	if c := os.Getenv("CCR_TLS_CERT"); c != "" {
+		f.TLSCert = c
+	}
+	if k := os.Getenv("CCR_TLS_KEY"); k != "" {
+		f.TLSKey = k
+	}
+	if v := os.Getenv("CCR_HTTP3"); v != "" {
+		enabled, err := strconv.ParseBool(v)
+		if err != nil {
+			return f, nil, fmt.Errorf("CCR_HTTP3=%q is not a valid boolean: %w", v, err)
+		}
+		f.HTTP3 = enabled
+	}
+
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -121,9 +143,39 @@ func parseCommonFlags(args []string, defaultOpen, defaultGateway bool) (commonFl
 			f.Gateway = true
 		case "--no-gateway":
 			f.Gateway = false
+		case "--tls-cert":
+			i++
+			if i >= len(args) {
+				return f, nil, fmt.Errorf("--tls-cert requires a value")
+			}
+			f.TLSCert = args[i]
+		case "--tls-key":
+			i++
+			if i >= len(args) {
+				return f, nil, fmt.Errorf("--tls-key requires a value")
+			}
+			f.TLSKey = args[i]
+		case "--http3":
+			f.HTTP3 = true
+		case "--no-http3":
+			f.HTTP3 = false
 		default:
 			rest = append(rest, args[i])
 		}
 	}
+
+	// TLS cert and key are a matched pair: one without the other cannot start a
+	// TLS listener, so reject it here with a clear message rather than deep in
+	// the gateway.
+	if (f.TLSCert == "") != (f.TLSKey == "") {
+		return f, nil, fmt.Errorf("--tls-cert and --tls-key must be provided together (got only one)")
+	}
+	// QUIC has no cleartext mode, so HTTP/3 is meaningless without TLS. The
+	// gateway also enforces this, but a CLI-level message is clearer to an
+	// operator who passed --http3 alone.
+	if f.HTTP3 && f.TLSCert == "" {
+		return f, nil, fmt.Errorf("--http3 requires TLS: pass --tls-cert and --tls-key (QUIC has no cleartext mode)")
+	}
+
 	return f, rest, nil
 }
