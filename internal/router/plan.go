@@ -12,10 +12,11 @@ package router
 // already implies: a single model id served by more than one configured
 // provider (e.g. "gpt-4o" listed by both an "openai" and an "azure" provider).
 //
-// This is deliberately ADDITIVE. Select's signature and behaviour are
-// unchanged; nothing here is wired into the gateway yet. See the "Gateway
-// seam" section on BuildProviderPlan for exactly how a future
-// doUpstreamWithRetry would consume it.
+// This is deliberately ADDITIVE: Select's signature and behaviour are
+// unchanged. As of v0.3.0 the gateway CONSUMES this — internal/gateway's
+// acquireOpenAIWithFallback (opt-in via Router.crossProviderFallback) builds a
+// plan here and iterates its attempts. See the "Gateway seam" section on
+// BuildProviderPlan for the consumption contract.
 
 import (
 	"fmt"
@@ -71,13 +72,15 @@ func providerSelector(providerName, model string) string {
 // NextFallbackProvider. A nil primary (a caller bug — Select never returns a
 // nil provider without an error) yields a nil plan rather than panicking.
 //
-// # Gateway seam
+// # Gateway seam (wired as of v0.3.0)
 //
-// This is the function a future internal/gateway doUpstreamWithRetry would
-// call to gain cross-provider fallback. Today that loop retries a single fixed
-// provider (internal/gateway/messages.go, doUpstreamWithRetry(c, ctx,
-// provider config.Provider, body)). The wired-up shape, using ONLY this
-// package's existing exports, is:
+// internal/gateway consumes this: acquireOpenAIWithFallback (gated by
+// Router.crossProviderFallback) builds a plan here and iterates it,
+// re-translating the request per (provider, model). The illustrative shape
+// below uses ONLY this package's exports; the SHIPPED loop differs in detail —
+// it advances via a canFallback flag on doUpstreamWithRetry rather than the
+// NextFallbackProvider walk sketched here — but the plan/order contract is the
+// same:
 //
 //	primary, primaryModel, err := router.Select(cfg, req)      // unchanged
 //	plan := router.BuildProviderPlan(cfg, primary, primaryModel, nil)
@@ -94,12 +97,10 @@ func providerSelector(providerName, model string) string {
 //	    i++
 //	}
 //
-// The gateway needs no new selector plumbing: it reads each failed attempt's
-// selector straight off plan[i].Model (a public field) and lets
-// NextFallbackProvider gate advancement on the Terminal/Retryable
-// classification. Wiring that loop — and re-transforming the request body for
-// each new model id — is an internal/gateway change, intentionally left undone
-// here.
+// The gateway needs no new selector plumbing: it reads each attempt's selector
+// straight off plan[i].Model (a public field) and resolves it via
+// ResolveAttempt. Re-transforming the request body for each new model id is
+// done in acquireOpenAIWithFallback (internal/gateway/messages.go).
 func BuildProviderPlan(cfg *config.Config, primary *config.Provider, primaryModel string, explicitFallbacks []string) []Attempt {
 	if primary == nil {
 		return nil

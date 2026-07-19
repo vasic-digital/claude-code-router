@@ -4,35 +4,52 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0` (the initial clean-room Go port) was tagged 2026-07-19; `v0.2.0`
-(below) is the current release. Entries are drawn from this repository's real
-`git log` history — nothing here is speculative.
+`v0.1.0` (the initial clean-room Go port) and `v0.2.0` were tagged 2026-07-19;
+`v0.3.0` (below) is the current release. Entries are drawn from this
+repository's real `git log` history — nothing here is speculative.
 
-## [Unreleased]
+## [0.3.0] - 2026-07-19
 
-Post-`v0.2.0` development. The groundwork below is tested but NOT yet wired into
-the gateway — it lands live in a future tagged release.
+Response cache and cross-provider fallback are now WIRED and live on the
+gateway's request path — both opt-in and default OFF, so an existing config's
+request path stays byte-identical to v0.2.0. Full suite green under `-race`
+incl. chaos/security/mutation/helixqa.
+
+### Added
+
+- Response cache (`internal/cache`, wired in `internal/gateway`): an optional
+  top-level `Cache` config block (default OFF). On the non-streaming,
+  OpenAI-provider path a cacheable request is served from a local store on a HIT
+  with NO upstream call; a MISS stores the response. Backends: in-memory LRU or
+  pure-Go SQLite (no CGO). Safety gates never cache temperature>0, streaming,
+  tool-call, or error responses. `config show` displays the (secret-free) Cache
+  block. (`025f8e9`, `609bc60`)
+- Cross-provider fallback (`Router.crossProviderFallback` + `Router.fallback`,
+  default OFF): when enabled, a RETRYABLE failure (5xx/429/transport) that
+  exhausts the primary's same-provider retries advances to the next provider
+  serving the model (via `router.BuildProviderPlan`), re-translating the request
+  per provider. A Terminal failure (400/401/404) never falls back; streaming and
+  Anthropic-native primaries are not eligible. (`13d222f`)
+- Semantic cache tier (`SemanticCache`, opt-in, not yet returned by the gateway
+  cache builder): exact-first, near-duplicate on an exact miss via a
+  deterministic local lexical embedder (`LocalEmbedder`); a bounded per-scope
+  registry and a short-turn guard prevent unbounded growth and cross-serving.
+  Honestly a lexical near-duplicate signal, not a learned model. (`59ad10e`,
+  `681789e`, `609bc60`)
+- Content-aware routing: `Router.longContext` fires from an estimated token
+  threshold (Anthropic inbound); `Router.think` wired but inert pending a
+  caller-side signal. (`914f002`)
+- `internal/metrics`: self-contained Prometheus text-exposition recorder (RED +
+  `gen_ai.*` token/cache counters), no `client_golang` dependency. Package
+  available; gateway/management endpoint wiring pending. (`8fac80c`)
 
 ### Fixed
 
 - Panicking request handlers are now access-logged: `gin.Recovery()` is mounted
-  INSIDE `LoggingMiddleware` (previously outside, so panics unwound past the
-  logger), and a recovered 500 is logged with the correct status. Reload-test
-  fixtures now differ in length; the reload-coalescing caveat is documented.
-  (`c881086`)
-
-### Added (groundwork, not yet wired)
-
-- `internal/cache`: self-contained response-cache package — exact-hash tier
-  (in-memory LRU + pure-Go SQLite persistence, no CGO), TTL/eviction, safety
-  gates (temperature > 0 / streaming / tool-call / error bodies refused),
-  scope-isolated fingerprints, and a semantic-index seam that fails explicitly
-  with `ErrNoEmbedder` rather than fabricating a vector. (`280469b`)
-- `internal/router` cross-provider execution-plan API (`BuildProviderPlan` /
-  `ResolveAttempt`): ordered, de-duplicated fallback attempts across providers,
-  composing with the existing classify/backoff primitives. The gateway retry
-  loop still targets one fixed provider; consumption is a documented seam.
-  (`196ed0c`)
+  INSIDE `LoggingMiddleware`, so a recovered 500 is logged with the correct
+  status. (`c881086`)
+- `config show` no longer drops the `Cache` block (`config.Redacted` now carries
+  it through, still redacting api_keys). (`609bc60`)
 
 ## [0.2.0] - 2026-07-19
 
