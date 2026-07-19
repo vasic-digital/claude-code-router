@@ -181,6 +181,17 @@ type CacheConfig struct {
 	// AllowToolResponses opts the response-side gate into caching tool-call
 	// responses (off by default, since a tool answer depends on live state).
 	AllowToolResponses bool `json:"allow_tool_responses,omitempty"`
+	// Semantic turns on the Tier-2 semantic (near-duplicate) cache layer on top
+	// of the exact tier. OFF by default: an ABSENT Semantic leaves the cache
+	// byte-identical to exact-only fingerprint matching, so no request is ever
+	// cross-served on similarity unless the operator opts in.
+	Semantic bool `json:"semantic,omitempty"`
+	// SemanticThreshold is the minimum cosine similarity (in (0,1]) a
+	// near-duplicate must clear to be served from the semantic tier. 0 (the zero
+	// value) means "use the built-in default" (see gateway.defaultSemanticThreshold).
+	// It is validated only when the cache is enabled; a non-zero value outside
+	// (0,1] is rejected (ErrCacheSemanticThresholdRange).
+	SemanticThreshold float64 `json:"semantic_threshold,omitempty"`
 }
 
 // Cache validation errors, exported so callers (and tests) can match them with
@@ -192,6 +203,9 @@ var (
 	// ErrCacheSQLitePathRequired is returned when an enabled cache selects the
 	// sqlite backend without a path.
 	ErrCacheSQLitePathRequired = errors.New(`cache path is required when backend is "sqlite"`)
+	// ErrCacheSemanticThresholdRange is returned when an enabled cache sets a
+	// non-zero semantic_threshold outside the (0,1] cosine range.
+	ErrCacheSemanticThresholdRange = errors.New(`cache semantic_threshold must be in (0,1]`)
 )
 
 // Dir returns the platform configuration directory, matching the Node
@@ -302,6 +316,13 @@ func (c *Config) Validate() error {
 		}
 		if c.Cache.Backend == "sqlite" && c.Cache.Path == "" {
 			return fmt.Errorf("Cache: %w", ErrCacheSQLitePathRequired)
+		}
+		// An absent (0) threshold means "use the default"; a set value must be a
+		// valid cosine floor in (0,1]. Semantic without a threshold is fine — it
+		// falls back to the built-in default at BuildCache time.
+		if c.Cache.SemanticThreshold != 0 &&
+			(c.Cache.SemanticThreshold < 0 || c.Cache.SemanticThreshold > 1) {
+			return fmt.Errorf("Cache: %w", ErrCacheSemanticThresholdRange)
 		}
 	}
 	return nil

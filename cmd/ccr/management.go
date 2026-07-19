@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
+	"github.com/vasic-digital/claude-code-router/internal/metrics"
 )
 
 // managementServer is the small control-plane HTTP server "ccr serve" (and
@@ -23,7 +24,7 @@ type managementServer struct {
 	ln      net.Listener
 }
 
-func newManagementServer(host string, port int, cfg *config.Config) (*managementServer, error) {
+func newManagementServer(host string, port int, cfg *config.Config, rec *metrics.Recorder) (*managementServer, error) {
 	addr := fmt.Sprintf("%s:%d", host, port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -31,6 +32,13 @@ func newManagementServer(host string, port int, cfg *config.Config) (*management
 	}
 
 	mux := http.NewServeMux()
+	// Prometheus text-exposition endpoint. It lives on the loopback MANAGEMENT
+	// server — deliberately OFF the gateway hot path and un-compressed — so a
+	// scrape never contends with a live /v1/messages request. A nil Recorder
+	// (only in tests that do not pass one) simply omits the endpoint.
+	if rec != nil {
+		mux.Handle("/metrics", rec.Handler())
+	}
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{

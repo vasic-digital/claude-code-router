@@ -31,6 +31,8 @@ import (
 
 	"github.com/vasic-digital/claude-code-router/internal/cache"
 	"github.com/vasic-digital/claude-code-router/internal/config"
+	"github.com/vasic-digital/claude-code-router/internal/metrics"
+	"github.com/vasic-digital/claude-code-router/internal/translate"
 )
 
 // Options configures a Server.
@@ -103,17 +105,74 @@ type Server struct {
 	// is byte-identical to a build with no cache — no lookup, no store. A
 	// caller that wants caching builds a store with BuildCache and assigns it
 	// (serve.go does this from Config.Cache), before Start.
-	Cache cache.Cache
+	//
+	// Its type is the local ResponseCache interface, NOT cache.Cache, so the
+	// gateway can be handed either the exact-only store (wrapped in
+	// exactCacheAdapter) or a *cache.SemanticCache without the request path
+	// caring which — both expose the same request-aware Lookup/Store.
+	Cache ResponseCache
 	// CacheAllowToolResponses mirrors Config.Cache.AllowToolResponses: it is the
 	// argument handed to cache.ResponseCacheable on the store side, so a
 	// tool-call response is only ever cached when the operator opted in. It is
 	// inert when Cache is nil.
 	CacheAllowToolResponses bool
+
+	// Metrics records the RED HTTP triple plus the GenAI token/upstream/cache
+	// counters (see internal/metrics). New sets a non-nil default Recorder so a
+	// standalone gateway (and every test) records without any wiring; serve.go
+	// overrides it with the ONE process-wide Recorder it also mounts on the
+	// management server's /metrics. The recording seams (the routes() middleware
+	// and the messages.go hooks) tolerate a nil value, so a caller that
+	// deliberately clears it keeps the request path byte-identical.
+	Metrics *metrics.Recorder
 }
+
+// ResponseCache is the gateway's view of the response cache. It is REQUEST-aware
+// (every method takes the routed *translate.AnthropicRequest alongside the
+// fingerprint key) so the same call site drives either the exact-only tier or
+// the semantic tier without branching:
+//
+//   - exactCacheAdapter wraps a plain cache.Cache (fingerprint-only); it ignores
+//     req and always reports HitExact / HitNone.
+//   - *cache.SemanticCache satisfies this interface directly: it consults the
+//     exact tier first, then (on an exact miss) the request's salient text.
+//
+// Keeping this an EXPORTED interface lets serve.go type BuildCache's result and
+// gw.Cache uniformly, and lets tests inject either shape.
+type ResponseCache interface {
+	Lookup(key string, req *translate.AnthropicRequest) (*cache.Entry, cache.HitKind, bool)
+	Store(key string, req *translate.AnthropicRequest, e *cache.Entry) error
+	Close() error
+}
+
+// exactCacheAdapter adapts a fingerprint-only cache.Cache to the request-aware
+// ResponseCache interface. It discards req (the exact tier keys purely on the
+// fingerprint) and reports every hit as HitExact — there is no similarity tier
+// behind it.
+type exactCacheAdapter struct{ c cache.Cache }
+
+func (a exactCacheAdapter) Lookup(key string, _ *translate.AnthropicRequest) (*cache.Entry, cache.HitKind, bool) {
+	if e, ok := a.c.Lookup(key); ok {
+		return e, cache.HitExact, true
+	}
+	return nil, cache.HitNone, false
+}
+
+func (a exactCacheAdapter) Store(key string, _ *translate.AnthropicRequest, e *cache.Entry) error {
+	return a.c.Store(key, e)
+}
+
+func (a exactCacheAdapter) Close() error { return a.c.Close() }
 
 // defaultCacheMaxEntries bounds the in-memory LRU when Config.Cache.MaxEntries
 // is left at 0 ("use a sane default").
 const defaultCacheMaxEntries = 1024
+
+// defaultSemanticThreshold is the cosine floor a near-duplicate must clear when
+// Config.Cache.Semantic is on but SemanticThreshold is left at 0. ~0.85 is the
+// documented near-duplicate band for the local lexical embedder (a re-ask, a
+// retry, or a one-word edit clears it; unrelated text does not).
+const defaultSemanticThreshold = 0.85
 
 // BuildCache constructs the Cache described by c, or (nil, nil) when caching is
 // disabled (c == nil or c.Enabled == false). It is the single place that turns
@@ -126,26 +185,46 @@ const defaultCacheMaxEntries = 1024
 // New never calls this (it must not fail, and must not touch the filesystem);
 // the caller does, so a sqlite open error is surfaced to a place that can log
 // it and fall back to caching-disabled rather than crash the process.
-func BuildCache(c *config.CacheConfig) (cache.Cache, error) {
+//
+// The result is a ResponseCache: the exact store (memory or sqlite) is built as
+// before, then EITHER wrapped in exactCacheAdapter (byte-identical, exact-only
+// behaviour — the default) OR, when c.Semantic is set, wrapped in a
+// cache.SemanticCache driven by the local lexical embedder and c's threshold
+// (or defaultSemanticThreshold when the threshold is left at 0).
+func BuildCache(c *config.CacheConfig) (ResponseCache, error) {
 	if c == nil || !c.Enabled {
 		return nil, nil
 	}
 	ttl := time.Duration(c.TTLSeconds) * time.Second
+	var exact cache.Cache
 	switch c.Backend {
 	case "", "memory":
 		maxEntries := c.MaxEntries
 		if maxEntries <= 0 {
 			maxEntries = defaultCacheMaxEntries
 		}
-		return cache.NewMemoryLRU(cache.MemoryOptions{MaxEntries: maxEntries, TTL: ttl}), nil
+		exact = cache.NewMemoryLRU(cache.MemoryOptions{MaxEntries: maxEntries, TTL: ttl})
 	case "sqlite":
 		if c.Path == "" {
 			return nil, fmt.Errorf("cache: sqlite backend requires a path")
 		}
-		return cache.NewSQLiteCache(c.Path, ttl)
+		s, err := cache.NewSQLiteCache(c.Path, ttl)
+		if err != nil {
+			return nil, err
+		}
+		exact = s
 	default:
 		return nil, fmt.Errorf("cache: unknown backend %q", c.Backend)
 	}
+
+	if c.Semantic {
+		threshold := c.SemanticThreshold
+		if threshold == 0 {
+			threshold = defaultSemanticThreshold
+		}
+		return cache.NewSemanticCache(exact, cache.NewLocalEmbedder(0), threshold), nil
+	}
+	return exactCacheAdapter{c: exact}, nil
 }
 
 // New builds a Server. It does not listen until Start is called.
@@ -174,6 +253,10 @@ func New(cfg *config.Config, opt Options) *Server {
 	s := &Server{opt: opt, cfg: cfg, eng: eng, ready: make(chan struct{})}
 	s.Router = defaultRouter{cfg: cfg}
 	s.Upstream = &defaultUpstream{}
+	// A non-nil default Recorder so a standalone gateway (and every test)
+	// records metrics without any wiring. serve.go overrides this with the ONE
+	// process-wide Recorder it also exposes on the management /metrics endpoint.
+	s.Metrics = metrics.New()
 	s.routes()
 	return s
 }
@@ -205,6 +288,16 @@ func (s *Server) routes() {
 	//     from the log; the internal/logging redactor backing the logger is a
 	//     second line of defence, not the primary guarantee.
 	s.eng.Use(LoggingMiddleware(s.opt.Logger))
+
+	// Metrics is mounted alongside logging and, like it, OUTSIDE compression and
+	// panic recovery so it observes the FINAL response status (a recovered 500
+	// included) after the whole chain has run. It records the RED HTTP triple for
+	// EVERY request — /health and /ready included — and, exactly like
+	// LoggingMiddleware, it never gates: it always calls c.Next(). The route
+	// TEMPLATE (c.FullPath(), e.g. "/v1/messages"), never the raw path, is the
+	// label, so cardinality stays bounded and secret-free; an unmatched path
+	// (404) collapses to a single low-cardinality "/(unmatched)" bucket.
+	s.eng.Use(s.metricsMiddleware())
 
 	// Panic recovery is mounted INSIDE LoggingMiddleware (registered after it,
 	// so it wraps the handlers but is itself wrapped by logging). gin.Recovery
@@ -269,6 +362,35 @@ func (s *Server) routes() {
 		"/v1/chat/completions", "/proxy/v1/chat/completions",
 	} {
 		s.eng.POST(p, inbound, s.handleInbound)
+	}
+}
+
+// metricsMiddleware records the RED HTTP triple for every request. It bumps the
+// in-flight gauge on entry, defers the decrement, times the whole chain, and —
+// after c.Next() has run so the status and byte count are final — records the
+// request against its route TEMPLATE. It always calls c.Next() and never gates,
+// so /health and /ready keep answering exactly as before; they are merely
+// counted. A nil s.Metrics (a caller that deliberately cleared the default)
+// makes this a transparent pass-through.
+func (s *Server) metricsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		rec := s.Metrics
+		if rec == nil {
+			c.Next()
+			return
+		}
+		rec.IncInFlight()
+		defer rec.DecInFlight()
+		start := time.Now()
+		c.Next()
+		routeTemplate := c.FullPath()
+		if routeTemplate == "" {
+			// An unmatched path (404) has no template; collapse every such
+			// request to one bounded bucket rather than leaking the raw URL as a
+			// high-cardinality (and potentially secret-bearing) label.
+			routeTemplate = "/(unmatched)"
+		}
+		rec.RecordRequest(c.Request.Method, routeTemplate, c.Writer.Status(), time.Since(start))
 	}
 }
 

@@ -81,6 +81,53 @@ func TestCacheEnabledBadBackendErrors(t *testing.T) {
 	}
 }
 
+// Semantic without a threshold is valid: the 0 (absent) threshold means "use
+// the built-in default" at BuildCache time, so no cross-serve happens on a bad
+// value.
+func TestCacheSemanticWithoutThresholdValid(t *testing.T) {
+	c := baseValidConfig()
+	c.Cache = &CacheConfig{Enabled: true, Semantic: true}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Semantic with no threshold (uses default) must validate, got: %v", err)
+	}
+}
+
+// A threshold inside (0,1] is valid, whether or not Semantic itself is set (the
+// field is a plain cosine floor).
+func TestCacheSemanticThresholdInRangeValid(t *testing.T) {
+	for _, thr := range []float64{0.01, 0.5, 0.85, 1.0} {
+		c := baseValidConfig()
+		c.Cache = &CacheConfig{Enabled: true, Semantic: true, SemanticThreshold: thr}
+		if err := c.Validate(); err != nil {
+			t.Errorf("semantic_threshold %v must validate, got: %v", thr, err)
+		}
+	}
+}
+
+// A non-zero threshold outside (0,1] is rejected with the named error.
+func TestCacheSemanticThresholdOutOfRangeErrors(t *testing.T) {
+	for _, thr := range []float64{-0.1, 1.01, 2.0} {
+		c := baseValidConfig()
+		c.Cache = &CacheConfig{Enabled: true, Semantic: true, SemanticThreshold: thr}
+		err := c.Validate()
+		if err == nil {
+			t.Fatalf("semantic_threshold %v must fail validation", thr)
+		}
+		if !errors.Is(err, ErrCacheSemanticThresholdRange) {
+			t.Errorf("semantic_threshold %v: error must wrap ErrCacheSemanticThresholdRange, got: %v", thr, err)
+		}
+	}
+}
+
+// A disabled cache never validates the threshold — its fields are inert.
+func TestCacheSemanticThresholdInertWhenDisabled(t *testing.T) {
+	c := baseValidConfig()
+	c.Cache = &CacheConfig{Enabled: false, SemanticThreshold: 9.0}
+	if err := c.Validate(); err != nil {
+		t.Errorf("a disabled cache must not validate its (inert) threshold, got: %v", err)
+	}
+}
+
 // The Cache block round-trips through Load (parse + Validate) from the exact
 // on-disk JSON shape the schema documents.
 func TestCacheLoadsFromDiskShape(t *testing.T) {

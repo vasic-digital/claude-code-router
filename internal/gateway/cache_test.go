@@ -57,7 +57,10 @@ func cacheTestServer(t *testing.T, up Upstream, c cache.Cache) *Server {
 	t.Helper()
 	s := testServerWithUpstream(t, "http://unused.invalid")
 	s.Upstream = up
-	s.Cache = c
+	// s.Cache is the request-aware ResponseCache interface now; wrap the plain
+	// exact store in exactCacheAdapter (unexported, same package) so these tests
+	// exercise the exact-tier path through the same seam production uses.
+	s.Cache = exactCacheAdapter{c: c}
 	return s
 }
 

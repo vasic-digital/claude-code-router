@@ -9,9 +9,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vasic-digital/claude-code-router/internal/cache"
 	"github.com/vasic-digital/claude-code-router/internal/config"
 	"github.com/vasic-digital/claude-code-router/internal/gateway"
+	"github.com/vasic-digital/claude-code-router/internal/metrics"
 )
 
 // shutdownGrace bounds how long "serve" waits for in-flight requests to
@@ -42,8 +42,14 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// ONE process-wide metrics Recorder, shared by the gateway data plane (it
+	// records the RED triple + token/upstream/cache counters) and the management
+	// control plane (which exposes it on /metrics, off the hot path). Created
+	// unconditionally so /metrics works even with --no-gateway.
+	rec := metrics.New()
+
 	var gw *gateway.Server
-	var responseCache cache.Cache
+	var responseCache gateway.ResponseCache
 	if flags.Gateway {
 		gw = gateway.New(cfg, gateway.Options{Host: flags.GatewayHost, Port: flags.GatewayPort})
 		// Install the real router and upstream client. Without this the
@@ -51,6 +57,9 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		// Router.default — so haiku-tier background requests would be sent to
 		// the expensive model instead of the configured cheap one.
 		gw.WireDefaults(0)
+		// Override the gateway's default per-instance Recorder with the shared
+		// one, so the counters the management /metrics scrapes are the gateway's.
+		gw.Metrics = rec
 		// Optional response cache. Default OFF (cfg.Cache nil/disabled →
 		// BuildCache returns nil, gateway behaves exactly as before). A sqlite
 		// build error must NEVER crash serve: log it and continue with caching
@@ -73,7 +82,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "gateway listening on %s\n", gw.Addr())
 	}
 
-	mgmt, err := newManagementServer(flags.Host, flags.Port, cfg)
+	mgmt, err := newManagementServer(flags.Host, flags.Port, cfg, rec)
 	if err != nil {
 		fmt.Fprintf(stderr, "start management interface: %v\n", err)
 		if gw != nil {

@@ -288,13 +288,31 @@ func (s *Server) handleMessages(c *gin.Context) {
 	if s.Cache != nil && !anthropicNative && !in.Stream {
 		if ok, _ := cache.Cacheable(&in); ok {
 			cacheKey = cache.Fingerprint(&in, provider.Name, model)
-			if entry, hit := s.Cache.Lookup(cacheKey); hit {
+			entry, hitKind, hit := s.Cache.Lookup(cacheKey, &in)
+			// tier is the hit kind ("exact"|"semantic") on a hit; on a miss the
+			// lookup was an exact-tier probe, so it is recorded as "exact".
+			tier := "exact"
+			if hit {
+				tier = hitKind.String()
+			}
+			if s.Metrics != nil {
+				s.Metrics.RecordCache(tier, hit)
+			}
+			if hit {
 				// HIT: serve from the buffered upstream body through the SAME
 				// translation the miss path uses. No upstream call is made.
-				respondNonStreamingBytes(c, entry.OpenAIBody, model)
+				s.respondNonStreamingBytes(c, entry.OpenAIBody, provider.Name, model)
 				return
 			}
 		}
+	}
+
+	// One upstream request is about to be made for this (provider, model). A
+	// cache HIT returned above WITHOUT reaching here, so this counter cleanly
+	// excludes served-from-cache requests. It covers both the anthropic-native
+	// and the OpenAI (single-call or fallback) transports below.
+	if s.Metrics != nil {
+		s.Metrics.RecordUpstream(provider.Name, model)
 	}
 
 	// Cross-provider fallback (opt-in) applies ONLY to the non-streaming,
@@ -321,7 +339,7 @@ func (s *Server) handleMessages(c *gin.Context) {
 		return
 	}
 	if in.Stream {
-		streamAnthropicSSE(c, resp.Body, model)
+		s.streamAnthropicSSE(c, resp.Body, provider.Name, model)
 		return
 	}
 
@@ -337,7 +355,7 @@ func (s *Server) handleMessages(c *gin.Context) {
 		// or a Store error must NEVER fail the request — it only forgoes a
 		// future hit.
 		if storeOK, _ := cache.ResponseCacheable(raw, s.CacheAllowToolResponses); storeOK {
-			_ = s.Cache.Store(cacheKey, &cache.Entry{
+			_ = s.Cache.Store(cacheKey, &in, &cache.Entry{
 				Key:          cacheKey,
 				ProviderName: provider.Name,
 				Model:        model,
@@ -345,7 +363,7 @@ func (s *Server) handleMessages(c *gin.Context) {
 			})
 		}
 	}
-	respondNonStreamingBytes(c, raw, model)
+	s.respondNonStreamingBytes(c, raw, provider.Name, model)
 }
 
 // openAIBodyFor translates the Anthropic request into the OpenAI upstream body
@@ -685,13 +703,13 @@ func relayAnthropicResponse(c *gin.Context, resp *http.Response, stream bool) {
 // re-encodes it as a single Anthropic message. It is a thin reader wrapper
 // around respondNonStreamingBytes so a caller that only has the stream (and
 // does not need the buffered bytes for anything else) keeps a one-call path.
-func respondNonStreaming(c *gin.Context, body io.Reader, model string) {
+func (s *Server) respondNonStreaming(c *gin.Context, body io.Reader, provider, model string) {
 	raw, err := io.ReadAll(io.LimitReader(body, 32<<20))
 	if err != nil {
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("read upstream response: %v", err))
 		return
 	}
-	respondNonStreamingBytes(c, raw, model)
+	s.respondNonStreamingBytes(c, raw, provider, model)
 }
 
 // respondNonStreamingBytes decodes an already-buffered OpenAI chat-completion
@@ -700,7 +718,7 @@ func respondNonStreaming(c *gin.Context, body io.Reader, model string) {
 // fresh upstream body and translates it here (after optionally storing it), and
 // a HIT translates the replayed entry.OpenAIBody through this exact same code —
 // so a cached reply is byte-for-byte what the client would have received live.
-func respondNonStreamingBytes(c *gin.Context, raw []byte, model string) {
+func (s *Server) respondNonStreamingBytes(c *gin.Context, raw []byte, provider, model string) {
 	var oa openAIChatResponse
 	// A malformed body must produce a clean typed error, not a panic — the
 	// upstream is an untrusted third party and can send anything.
@@ -737,6 +755,13 @@ func respondNonStreamingBytes(c *gin.Context, raw []byte, model string) {
 	if oa.Usage != nil {
 		usage.InputTokens = oa.Usage.PromptTokens
 		usage.OutputTokens = oa.Usage.CompletionTokens
+	}
+	// Token accounting for both cache outcomes flows through here: a MISS records
+	// the fresh generation's usage, a HIT records the replayed entry's usage
+	// (the tokens the client received). RecordTokens ignores non-positive counts,
+	// so an absent upstream usage block is simply not counted.
+	if s.Metrics != nil {
+		s.Metrics.RecordTokens(provider, model, usage.InputTokens, usage.OutputTokens)
 	}
 
 	id := oa.ID
@@ -777,7 +802,7 @@ func emitSSE(w gin.ResponseWriter, event string, payload any) {
 
 // streamAnthropicSSE reads an OpenAI-compatible chat-completions SSE stream
 // from upstream and re-emits it as an Anthropic Messages SSE stream.
-func streamAnthropicSSE(c *gin.Context, upstream io.Reader, model string) {
+func (s *Server) streamAnthropicSSE(c *gin.Context, upstream io.Reader, provider, model string) {
 	w := c.Writer
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -919,4 +944,11 @@ func streamAnthropicSSE(c *gin.Context, upstream io.Reader, model string) {
 		"usage": anthropicUsage{InputTokens: inputTokens, OutputTokens: outputTokens},
 	})
 	emitSSE(w, "message_stop", ssePayload{"type": "message_stop"})
+
+	// The final usage is now known (it arrives late in the stream, on the chunk
+	// carrying stream_options.include_usage). Record it so streaming generations
+	// contribute to the token counters exactly as non-streaming ones do.
+	if s.Metrics != nil {
+		s.Metrics.RecordTokens(provider, model, inputTokens, outputTokens)
+	}
 }
