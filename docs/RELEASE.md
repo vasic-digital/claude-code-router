@@ -58,10 +58,11 @@ don't. That is exactly what `§11.4.156` exists to catch.
 `linux`/`darwin`/`windows` × `amd64`/`arm64` archives + checksums). It is a
 `0.x` release because the project's own `README.md` "What is implemented
 today" / "Feature table" sections still mark several behaviours as not fully
-wired — `Router.think` routing is wired and unit-tested but inert (no `thinking`
-signal reaches the router yet; `Router.longContext` is live), and
-the retry loop's attempt budget and inbound auth have no CLI/config surface
-(the middleware is mounted but its accepted-key list is always empty). (The
+wired — the retry loop's attempt budget and inbound auth have no CLI/config
+surface (the middleware is mounted but its accepted-key list is always empty).
+(As of `v0.4.0`, `Router.think` routing is live for the Anthropic-inbound path,
+alongside `Router.longContext`; that release also added the Prometheus
+`/metrics` endpoint and the opt-in semantic response-cache tier.) (The
 retry/fallback loop, vision/image support, structured logging, the provider
 `protocol` field with Anthropic-native passthrough, and an OpenAI
 chat-completions inbound facade — several listed as PLANNED or GAP in an

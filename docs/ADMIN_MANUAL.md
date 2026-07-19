@@ -99,7 +99,7 @@ Certificate rotation is the operator's responsibility — there is no hot-reload
 | Port | Default | Purpose |
 |---|---|---|
 | TCP/UDP `3456` | default `internal/gateway/gateway.go:106-108` (host `103-105`); configurable via `--gateway-host`/`--gateway-port`/`CCR_GATEWAY_HOST`/`CCR_GATEWAY_PORT` (`cmd/ccr/flags.go:37,43`) | **Gateway** — TCP for HTTP/1.1 and HTTP/2, UDP for HTTP/3 (QUIC) when `EnableHTTP3` is set (library-only today; not CLI-exposed — see §2). Both protocols share the same port number by design (`s.Addr()`, `internal/gateway/gateway.go:127`, used for both `h1h2` and `h3` servers in `Start()` at `212-245`). |
-| TCP `3458` | `cmd/ccr/flags.go:27-28`, configurable via `--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT` | **Management** control-plane server (`cmd/ccr/management.go`) — always started by `serve`/`start`/`ui`, cannot be disabled. Only `GET /health` and a placeholder `GET /` today. |
+| TCP `3458` | `cmd/ccr/flags.go:27-28`, configurable via `--host`/`--port`/`CCR_WEB_HOST`/`CCR_WEB_PORT` | **Management** control-plane server (`cmd/ccr/management.go`) — always started by `serve`/`start`/`ui`, cannot be disabled. Serves `GET /health`, the Prometheus `GET /metrics` endpoint (see §9), and a placeholder `GET /`. |
 
 Guidance:
 - Keep both bind addresses at the default `127.0.0.1` (gateway host default `internal/gateway/gateway.go:103-105`; management defaults the same — `cmd/ccr/flags.go:27`) unless you have a specific reason to accept remote connections — see §5. The gateway's bind address is now itself configurable (`--gateway-host`/`CCR_GATEWAY_HOST`); binding it off-loopback should be a deliberate act, since it holds live provider API keys.
@@ -210,6 +210,7 @@ There are **two, differently-shaped** `/health` endpoints — do not point a pro
 | Gateway | 3456 | `GET /health` | `{"status":"ok","providers":N}` |
 | Gateway | 3456 | `GET /ready` | see below |
 | Management | 3458 | `GET /health` | `{"providers":N,"service":"ccr-management","status":"ok"}` (a `map[string]any`, so `encoding/json` emits keys alphabetically, not in this listed order — `cmd/ccr/management.go:34-41`) |
+| Management | 3458 | `GET /metrics` | Prometheus text-exposition metrics — for scraping, not liveness probing (see §9). |
 
 The gateway's two endpoints are implemented and require no authentication (`internal/gateway/gateway.go:102-124`):
 
@@ -248,12 +249,52 @@ readinessProbe:
 
 **systemd** has no native HTTP probe primitive; pair the unit in §1.1 with an external watchdog (e.g. a `curl -f http://127.0.0.1:3456/health` timer, or `Restart=on-failure` alone if you accept crash-only recovery).
 
-## 9. Operational checklist
+## 9. Metrics (Prometheus `/metrics`)
+
+The router exposes a Prometheus text-exposition endpoint at **`GET /metrics`** on the **management** server (default `127.0.0.1:3458`) — deliberately **not** on the gateway (3456), so a scrape never contends with a live `/v1/messages` request on the hot path. It is created unconditionally by `ccr serve` (even with `--no-gateway`), un-compressed, and needs no authentication token of its own — protect it the same way as the rest of the management interface (keep it on loopback, or put an authenticating reverse proxy in front — see §5). The endpoint is **self-contained**: the router hand-renders the exposition format and pulls in **no** `github.com/prometheus/client_golang` dependency (`internal/metrics/exposition.go`), preserving the static-binary property.
+
+```bash
+curl -s http://127.0.0.1:3458/metrics
+```
+
+A single process-wide `metrics.Recorder` is shared between the gateway data plane (which records into it per request) and the management control plane (which exposes it), wired in `cmd/ccr/serve.go:45-62` and `cmd/ccr/management.go:39-41`; the gateway's recording middleware and per-response hooks live in `internal/gateway/gateway.go:375-393` and `internal/gateway/messages.go`.
+
+### 9.1 Metric families
+
+All names carry a stable `ccr_` prefix and follow OpenTelemetry `http.*` / `gen_ai.*` naming where reasonable (`internal/metrics/metrics.go`):
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `ccr_http_requests_total` | counter | `method`, `path`, `status` | Total HTTP requests handled, by method, route **template**, and status code. |
+| `ccr_http_request_duration_seconds` | histogram | `method`, `path` | Request duration; classic Prometheus `DefBuckets` layout, plus `_sum`/`_count`/`_bucket{le=…}`. |
+| `ccr_http_inflight_requests` | gauge | — | Requests currently being served (lock-free atomic). |
+| `ccr_gen_ai_upstream_requests_total` | counter | `provider`, `model` | Upstream provider requests. A cache HIT does **not** increment this — the served-from-cache request never reaches the upstream. |
+| `ccr_gen_ai_input_tokens_total` | counter | `provider`, `model` | Accumulated `gen_ai.usage.input_tokens`. |
+| `ccr_gen_ai_output_tokens_total` | counter | `provider`, `model` | Accumulated `gen_ai.usage.output_tokens`. |
+| `ccr_gen_ai_cache_lookups_total` | counter | `tier`, `result` | Response-cache lookups; `tier` is `exact`\|`semantic`, `result` is `hit`\|`miss`. |
+
+**Labels are bounded and secret-free by construction.** `path` is the route **template** (`/v1/messages`, never a raw URL carrying ids; an unmatched path collapses to `/(unmatched)`), `provider` is the resolved provider **name** (never its API key), and `model` is the resolved model id — so the label sets stay low-cardinality and no secret can leak into a scrape.
+
+### 9.2 Scraping
+
+A minimal Prometheus scrape config, assuming the management server is reachable at `127.0.0.1:3458`:
+
+```yaml
+scrape_configs:
+  - job_name: ccr
+    static_configs:
+      - targets: ["127.0.0.1:3458"]
+```
+
+If you expose the management server off loopback to let an external Prometheus reach it (`CCR_WEB_HOST=0.0.0.0`), firewall the port and/or front it with an authenticating reverse proxy — `/metrics` (like `/health`) is unauthenticated.
+
+## 10. Operational checklist
 
 - [ ] `config.json` present, `0600`, owned by the service account.
 - [ ] `GET :3456/health` returns `200` after (re)start (gateway liveness).
 - [ ] `GET :3456/ready` returns `200` (confirms at least one provider + a default route).
 - [ ] `GET :3458/health` returns `200` (management interface liveness — remember it's a *different* shape than the gateway's).
+- [ ] `GET :3458/metrics` returns `200` text-exposition output and is reachable by your Prometheus scraper (§9) — and is **not** exposed unauthenticated off loopback.
 - [ ] Deployed via `ccr serve` under a supervisor (§1), not `ccr start`/`ui` — the latter detaches and would confuse `Type=simple`/container process models.
 - [ ] Both the gateway (3456) and management (3458) bind addresses are `127.0.0.1` unless intentionally exposed behind an authenticating reverse proxy — remember the management interface **cannot be disabled**, only relocated.
 - [ ] If TLS is enabled (library use only — not yet CLI-exposed), certificate is valid and not near expiry.

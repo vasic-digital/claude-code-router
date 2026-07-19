@@ -191,12 +191,14 @@ Current, honest list (mirrored in `README.md`):
    (no flag/env/config), so the key list is always empty ⇒ auth disabled.
 2. **`--gateway-host`/`--gateway-port` are not forwarded by `ccr start`/`ui`** to
    the detached `serve` child (only the `CCR_GATEWAY_*` env form survives).
-3. **`Router.think` routing is wired but inert** (narrowed post-audit — see the
-   reconciliation note below). The `chooseRoute` branch exists and is unit-tested,
-   but `translate.AnthropicRequest` has no `thinking` field, so
-   `requestWantsThinking` always returns false and think-routing never fires until
-   a caller-side thinking signal is added. `Router.longContext` is **no longer a
-   limitation** — it fires in production when an estimated prompt exceeds
+3. **`Router.think` routing — RESOLVED in v0.4.0** (was: "wired but inert"). As of
+   v0.4.0 `translate.AnthropicRequest` models Anthropic's `thinking` field
+   (`internal/translate/anthropic.go:51-60`), so a `POST /v1/messages` request
+   carrying a non-null `thinking` block routes to `Router.think` when configured
+   (`requestWantsThinking`, `internal/router/selector.go:150-174`; `chooseRoute`,
+   `router.go:164-175`). This is no longer a limitation — the only remaining scope
+   caveat is that the OpenAI-inbound facade routes on model alone. `Router.longContext`
+   likewise fires in production when an estimated prompt exceeds
    `DefaultLongContextThreshold` (60000 tokens) and the route is set
    (`internal/router/selector.go:95-138`, `router.go:130-175`).
 4. **The retry loop's attempt budget (`MaxAttempts`, default 3) has no CLI/config
@@ -235,9 +237,9 @@ in the code:
 - `Router.longContext` now fires in production — an estimated prompt over
   `DefaultLongContextThreshold` (60000 tokens) routes there when configured
   (`internal/router/router.go:130-175`, `internal/router/selector.go:95-138`);
-  `Router.think` routing is wired and unit-tested but inert, because
-  `translate.AnthropicRequest` has no `thinking` field for `requestWantsThinking`
-  to read (`internal/router/selector.go:140-167`).
+  `Router.think` routing is **also live as of v0.4.0** — `translate.AnthropicRequest`
+  now carries the `thinking` field, so a request that asks for extended reasoning
+  routes to `Router.think` when configured (`internal/router/selector.go:150-174`).
 - Config hot-reload **is** now wired into `ccr serve`/`start`/`ui`/`web`
   (`cmd/ccr/serve.go:93-112`, `cmd/ccr/reload.go`): a validated change is logged
   and kept as latest-known-good, an invalid change is rejected with the previous

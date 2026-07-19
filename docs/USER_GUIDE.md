@@ -65,7 +65,7 @@ Field reference (`internal/config/config.go:46-144`):
 | `Providers[].protocol` | `Provider.Protocol` | No | `"openai"` (default) or `"anthropic"`. **Absent** → inferred from `api_base_url` (an `api.anthropic.com`/`*.anthropic.com` host or an `/anthropic` path segment → `anthropic`; else `openai`). An `anthropic` provider receives the Anthropic-shaped request **unchanged** and its response is relayed back verbatim, instead of the OpenAI translation (`internal/config/config.go:87-130`, `internal/gateway/messages.go:233-295`). Any other value is a validation error |
 | `Router.default` | `Route.Default` | No | `"provider,model"` string |
 | `Router.background` | `Route.Background` | No | `"provider,model"` string; used for Claude Code's cheap/background ("haiku") tier |
-| `Router.think` | `Route.Think` | No | Accepted and validated; routing branch is **wired and unit-tested but inert today** — no `thinking` signal reaches the router, so it never fires (see `docs/FAQ.md` Q11) |
+| `Router.think` | `Route.Think` | No | Accepted and validated, and **live** (v0.4.0): a `POST /v1/messages` request carrying a non-null Anthropic `thinking` field routes here when this is set (see `docs/FAQ.md` Q11) |
 | `Router.longContext` | `Route.LongContext` | No | Accepted and validated, and **live**: a request whose estimated prompt exceeds ~60000 tokens routes here when this is set (see `docs/FAQ.md` Q11) |
 | `Router.crossProviderFallback` | — (**v0.3.0**) | No | Opt-in bool. When `true`, a **retryable** primary failure advances to the next configured provider that also serves the model; absent/`false` → today's single-provider retry. See §9 |
 | `Router.fallback` | — (**v0.3.0**) | No | Optional ordered `["provider,model", …]` chain tried before the auto-discovered same-model providers. See §9 |
@@ -303,12 +303,14 @@ Add a top-level `Cache` block alongside `Providers`/`Router`:
     "path": "/home/you/.claude-code-router/cache.db",
     "ttl_seconds": 3600,
     "max_entries": 1024,
-    "allow_tool_responses": false
+    "allow_tool_responses": false,
+    "semantic": true,
+    "semantic_threshold": 0.85
   }
 }
 ```
 
-Field reference (`internal/config/config.go:152-171`, validated in `Validate()` at `internal/config/config.go:272-281`):
+Field reference (`internal/config/config.go` `CacheConfig`, validated in `Validate()`):
 
 | JSON key | Type | Default | Notes |
 |---|---|---|---|
@@ -318,6 +320,8 @@ Field reference (`internal/config/config.go:152-171`, validated in `Validate()` 
 | `ttl_seconds` | int | `0` | Per-entry lifetime in seconds; `0` means no expiry |
 | `max_entries` | int | `1024` | Bounds the in-memory LRU; `0` uses the default (`gateway.defaultCacheMaxEntries`, 1024) |
 | `allow_tool_responses` | bool | `false` | When `false`, a response carrying tool calls is never cached (its answer depends on live tool state). Set `true` only if you understand that trade-off |
+| `semantic` | bool | `false` | Turns on the Tier-2 semantic (near-duplicate) layer on top of the exact tier. **Off by default** — absent/`false` leaves the cache byte-identical to exact-only fingerprint matching, so no request is ever cross-served on similarity unless you opt in. See §8.4 |
+| `semantic_threshold` | float | `0.85` | Minimum cosine similarity (in `(0,1]`) a near-duplicate must clear to be served from the semantic tier. `0` (the zero value) means "use the built-in default" (`gateway.defaultSemanticThreshold`, 0.85). A non-zero value outside `(0,1]` is a validation error (`ErrCacheSemanticThresholdRange`). Only meaningful when `semantic` is `true` |
 
 On startup `ccr serve` prints `response cache enabled (backend "…")` when a cache is built; if a `sqlite` store fails to open it logs `response cache disabled (build failed): …` and **continues serving with caching off** rather than refusing to boot (`cmd/ccr/serve.go:46-65`).
 
@@ -337,7 +341,18 @@ Like every other config change, editing the `Cache` block is **validated and log
 
 ### 8.4 Semantic tier and the local embedder
 
-Alongside the exact-match tier, the cache ships a semantic tier keyed on a text embedding. Its default embedder is `LocalEmbedder` — a **deterministic, dependency-free, offline** embedder that maps text to a vector by feature-hashing character trigrams and L2-normalising the result (`internal/cache/embedder_local.go`). Be honest about its scope: it is a **lexical near-duplicate** signal (a re-asked prompt, a retried request, a one-word edit score close), **not a learned/neural embedding model** — genuine paraphrase with little surface overlap is not reliably captured. For deep paraphrase equivalence a real embedding provider is still the right tool; `LocalEmbedder` is a working local approximation that activates the semantic seam without a model or a network call.
+Set `Cache.semantic: true` (optionally with `Cache.semantic_threshold`) to enable the Tier-2 **semantic (near-duplicate)** layer on top of the exact tier. It is **off by default**: with `semantic` absent/`false` the cache is byte-identical to exact-only fingerprint matching, so no request is ever cross-served on similarity unless you opt in (`gateway.BuildCache`, `internal/gateway/gateway.go`).
+
+When on, the exact tier is wrapped in a `SemanticCache` driven by `LocalEmbedder` — a **deterministic, dependency-free, offline** embedder that maps text to a vector by feature-hashing character trigrams and L2-normalising the result (`internal/cache/embedder_local.go`). Be honest about its scope: it is a **lexical near-duplicate** signal (a re-asked prompt, a retried request, a one-word edit score close), **not a learned/neural embedding model** — genuine paraphrase with little surface overlap (e.g. "reverse a list" vs "flip an array") is not reliably captured. For deep paraphrase equivalence a real embedding provider is still the right tool; `LocalEmbedder` is a working local approximation that activates the semantic tier without a model or a network call.
+
+How the semantic tier behaves (`internal/cache/semantic_cache.go`):
+
+- **Exact-first.** Every lookup consults the exact tier first and returns its verbatim result on a hit; the semantic tier is consulted **only on an exact miss**. A semantic match then re-reads the exact tier as the single authority for the entry's body and liveness, so a stale (TTL-expired/evicted) candidate is never served — it is pruned instead.
+- **Scope-isolated.** Candidates are filtered by scope (a hash of the system prompt + tools), so a near-duplicate is only ever matched against requests made under the same system/tools context.
+- **Short-turn-guarded.** A request whose salient text is too short to be a reliable signal (a bare "yes"/"continue") skips the semantic tier entirely — neither queried nor registered — so it can never cross-serve a wrong answer from an unrelated conversation.
+- **Bounded.** The per-scope candidate registry is capped; when it overflows the oldest candidates are dropped (the exact tier remains the authority, so a dropped candidate only forgoes a future semantic hit, never a correct exact hit).
+
+A semantic HIT is counted under `ccr_gen_ai_cache_lookups_total{tier="semantic",result="hit"}` on the `/metrics` endpoint (see `docs/ADMIN_MANUAL.md`); an exact-tier probe that misses is recorded as `tier="exact"`.
 
 ## 9. Cross-provider fallback (v0.3.0)
 

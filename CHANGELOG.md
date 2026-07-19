@@ -4,9 +4,35 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.3.0` were tagged 2026-07-19; `v0.4.0` (below) is the current
+`v0.1.0`–`v0.4.0` were tagged 2026-07-19; `v0.4.1` (below) is the current
 release. Entries are drawn from this repository's real `git log` history —
 nothing here is speculative.
+
+## [0.4.1] - 2026-07-19
+
+Metrics-attribution polish plus a comprehensive LIVE end-to-end test harness. No
+behavior change to served responses; every opt-in feature behaves as in v0.4.0.
+
+### Changed
+
+- The `ccr_gen_ai_upstream_requests_total` metric is attributed per ATTEMPTED
+  provider — cross-provider fallback now records EACH provider tried, not only
+  the primary (pinned by a unit test). Anthropic-native non-streaming responses
+  now record token usage; the 32MiB upstream-response cap is a named const; and
+  `SemanticCache.Stats()` reports its own lookup accounting instead of
+  double-counting the exact tier. (`ad11c24`)
+
+### Tests / Docs
+
+- `test/live/`: a genuine end-to-end harness — it builds `ccr`, starts a fake
+  upstream and `ccr serve` as a SUBPROCESS on loopback, then drives real HTTP and
+  scrapes the management server's `/metrics`. Nine scenarios pass: non-streaming
+  translation, streaming SSE, the OpenAI facade (relay + 501), upstream 401 error
+  mapping (no key leak), exact cache HIT + temperature bypass, cross-provider
+  fallback (with per-provider metric attribution), semantic-cache near-duplicate,
+  and `ccr config validate`/`show` redaction.
+- New `docs/LIVE_TESTING.md`; v0.4.0 feature docs (metrics, semantic cache,
+  Router.think) across README and `docs/*`.
 
 ## [0.4.0] - 2026-07-19
 
