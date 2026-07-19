@@ -1,0 +1,193 @@
+{
+  "version": "1.0",
+  "name": "tool_use",
+  "description": "Anthropic tool_use content blocks becoming OpenAI message.tool_calls, with Arguments kept as a JSON *string* (an OpenAI-specific quirk).",
+  "test_cases": [
+    {
+      "id": "tooluse-01-basic-object-input",
+      "description": "A single tool_use block with an object input becomes one tool call whose Arguments is that object JSON-encoded as a string.",
+      "category": "tool_use",
+      "tags": ["tool_use", "happy-path"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "call_1", "name": "get_weather", "input": { "city": "Paris" } }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [
+          {
+            "role": "assistant",
+            "content_null": true,
+            "tool_calls_count": 1,
+            "tool_call_names": ["get_weather"],
+            "tool_call_arguments_contains": "Paris"
+          }
+        ]
+      }
+    },
+    {
+      "id": "tooluse-02-empty-object-input",
+      "description": "An explicit empty-object input ({}) is preserved as the literal string \"{}\".",
+      "category": "tool_use",
+      "tags": ["tool_use", "empty"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "assistant", "content": [{ "type": "tool_use", "id": "call_1", "name": "ping", "input": {} }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "tool_call_arguments_contains": "{}" }]
+      }
+    },
+    {
+      "id": "tooluse-03-input-key-omitted-defaults-to-empty-object",
+      "description": "When the \"input\" key is omitted entirely (not merely empty), the converter still emits the default \"{}\" arguments rather than an empty string OpenAI upstreams would reject.",
+      "category": "tool_use",
+      "tags": ["tool_use", "empty"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "assistant", "content": [{ "type": "tool_use", "id": "call_1", "name": "ping" }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "tool_call_arguments_contains": "{}" }]
+      }
+    },
+    {
+      "id": "tooluse-04-deeply-nested-object-input",
+      "description": "A multi-level-nested input object round-trips through Arguments intact.",
+      "category": "tool_use",
+      "tags": ["tool_use", "nested"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "book_flight",
+                "input": {
+                  "passenger": { "name": "A. Traveler", "seat": { "row": 12, "letter": "C" } },
+                  "legs": [{ "from": "LHR", "to": "JFK" }, { "from": "JFK", "to": "LHR" }]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "tool_call_arguments_contains": "\"letter\": \"C\"" }]
+      }
+    },
+    {
+      "id": "tooluse-05-input-as-bare-string-passes-through-unvalidated",
+      "description": "Characterisation case: the converter does not validate that tool_use.input is a JSON object -- a bare string input is forwarded verbatim (JSON-quoted) as Arguments. This is a pass-through, not a crash: a strict upstream will reject the resulting call, but the router itself does not corrupt or panic on it.",
+      "category": "tool_use",
+      "tags": ["tool_use", "malformed", "characterisation"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "assistant", "content": [{ "type": "tool_use", "id": "call_1", "name": "f", "input": "oops" }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "tool_calls_count": 1, "tool_call_arguments_contains": "oops" }]
+      }
+    },
+    {
+      "id": "tooluse-06-mixed-leading-text-and-tool-use",
+      "description": "A single assistant turn with both a text block and a tool_use block keeps the text as Content and still emits the tool call.",
+      "category": "tool_use",
+      "tags": ["tool_use", "mixed-content"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "text", "text": "Let me check that." },
+              { "type": "tool_use", "id": "call_1", "name": "lookup", "input": {} }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [
+          { "role": "assistant", "content": "Let me check that.", "tool_calls_count": 1 }
+        ]
+      }
+    },
+    {
+      "id": "tooluse-07-ensure-tool-parameters-injects-empty-schema",
+      "description": "With EnsureToolParameters, a declared tool with no input_schema gets an injected {\"type\":\"object\",\"properties\":{}} -- the exact fix for Poe's misleading \"Field required\" 400.",
+      "category": "tool_use",
+      "tags": ["tool_use", "options", "ensure_tool_parameters"],
+      "options": { "ensure_tool_parameters": true },
+      "input": {
+        "model": "m",
+        "tools": [{ "name": "noparams", "description": "a tool with no declared schema" }],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "tools_count": 1,
+        "tools": [{ "name": "noparams", "parameters_object": true }]
+      }
+    },
+    {
+      "id": "tooluse-08-without-ensure-tool-parameters-stays-absent",
+      "description": "The same no-schema tool, WITHOUT the option, keeps parameters absent (opt-in only -- must not inject unasked-for schema for upstreams that reject an unexpected \"parameters\" key).",
+      "category": "tool_use",
+      "tags": ["tool_use", "options"],
+      "input": {
+        "model": "m",
+        "tools": [{ "name": "noparams", "description": "a tool with no declared schema" }],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "tools": [{ "name": "noparams", "parameters_absent": true }]
+      }
+    },
+    {
+      "id": "tooluse-09-unicode-tool-name-and-input",
+      "description": "A tool_use block with a unicode/emoji tool name and unicode argument values converts correctly.",
+      "category": "tool_use",
+      "tags": ["tool_use", "unicode", "emoji"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "call_1", "name": "翻译_tool", "input": { "text": "こんにちは 👋" } }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [
+          { "tool_call_names": ["翻译_tool"], "tool_call_arguments_contains": "こんにちは 👋" }
+        ]
+      }
+    }
+  ]
+}

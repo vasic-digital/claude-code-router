@@ -1,0 +1,189 @@
+{
+  "version": "1.0",
+  "name": "cache_control",
+  "description": "cache_control is Anthropic-only. translate.AnthropicToOpenAI itself simply has no field to put it in (so it is silently ignored when left in place), while translate.StripCacheControl is the real mechanism a \"cleancache\" provider transformer uses to remove it from the raw request bytes BEFORE conversion, at every nesting level the field can legally appear at: system blocks, message content blocks, tool_result blocks, and tool definitions. Cases here use options.strip_cache_control_first to model that real two-stage pipeline.",
+  "test_cases": [
+    {
+      "id": "cachectrl-01-system-block-stripped-then-converts",
+      "description": "cache_control on a system content block is stripped before conversion; the system message still carries its text.",
+      "category": "cache_control",
+      "tags": ["cache_control", "system", "strip"],
+      "options": { "strip_cache_control_first": true },
+      "input": {
+        "model": "m",
+        "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "system", "content": "sys" }]
+      }
+    },
+    {
+      "id": "cachectrl-02-message-content-block-stripped-then-converts",
+      "description": "cache_control on a message content block is stripped before conversion; the message text is unaffected.",
+      "category": "cache_control",
+      "tags": ["cache_control", "message", "strip"],
+      "options": { "strip_cache_control_first": true },
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": [{ "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "user", "content": "hi" }]
+      }
+    },
+    {
+      "id": "cachectrl-03-tool-definition-stripped-then-converts",
+      "description": "cache_control on a tool definition object is stripped before conversion; the tool's name/description survive.",
+      "category": "cache_control",
+      "tags": ["cache_control", "tool_use", "strip"],
+      "options": { "strip_cache_control_first": true },
+      "input": {
+        "model": "m",
+        "tools": [{ "name": "t", "description": "d", "cache_control": { "type": "ephemeral" } }],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "tools_count": 1,
+        "tools": [{ "name": "t", "description": "d" }]
+      }
+    },
+    {
+      "id": "cachectrl-04-all-nesting-levels-simultaneously",
+      "description": "cache_control appears at system, message-content, and tool-definition levels all in one request; a single strip pass catches every occurrence and the whole request still converts correctly.",
+      "category": "cache_control",
+      "tags": ["cache_control", "strip", "every-nesting-level"],
+      "options": { "strip_cache_control_first": true },
+      "input": {
+        "model": "m",
+        "system": [{ "type": "text", "text": "sys", "cache_control": { "type": "ephemeral" } }],
+        "messages": [
+          { "role": "user", "content": [{ "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }] }
+        ],
+        "tools": [{ "name": "t", "cache_control": { "type": "ephemeral" } }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 2,
+        "tools_count": 1,
+        "messages": [
+          { "role": "system", "content": "sys" },
+          { "role": "user", "content": "hi" }
+        ]
+      }
+    },
+    {
+      "id": "cachectrl-05-left-in-place-does-not-break-conversion",
+      "description": "Characterisation case: WITHOUT stripping, a cache_control field left in a message content block does not error and does not affect the converted text -- AnthropicToOpenAI has no field to route it into, so it is silently, harmlessly dropped by omission rather than by an explicit strip step.",
+      "category": "cache_control",
+      "tags": ["cache_control", "characterisation", "no-strip"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": [{ "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "user", "content": "hi" }]
+      }
+    },
+    {
+      "id": "cachectrl-06-tool-result-block-stripped-then-converts",
+      "description": "cache_control on a tool_result block is stripped before conversion; the flattened tool message content is unaffected.",
+      "category": "cache_control",
+      "tags": ["cache_control", "tool_result", "strip"],
+      "options": { "strip_cache_control_first": true },
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              { "type": "tool_result", "tool_use_id": "call_1", "content": "22C", "cache_control": { "type": "ephemeral" } }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "tool", "content": "22C", "tool_call_id": "call_1" }]
+      }
+    },
+    {
+      "id": "cachectrl-07-key-collision-with-a-real-tool-argument",
+      "description": "Characterisation case flagging a real risk (see test/challenges for the adversarial write-up with a corrupted tool SCHEMA): StripCacheControl deletes ANY JSON key literally named \"cache_control\" anywhere in the tree, with no awareness of JSON path. Here a tool_use call argument that happens to be legitimately named \"cache_control\" (e.g. a caching-policy parameter) is silently deleted along with Anthropic's own metadata key, changing what the model actually asked the tool to do.",
+      "category": "cache_control",
+      "tags": ["cache_control", "characterisation", "key-collision", "see-challenges"],
+      "options": { "strip_cache_control_first": true },
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "configure_cache",
+                "input": { "cache_control": "aggressive", "ttl_seconds": 60 }
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [
+          {
+            "tool_calls_count": 1,
+            "tool_call_names": ["configure_cache"],
+            "tool_call_arguments_contains": "ttl_seconds"
+          }
+        ]
+      }
+    },
+    {
+      "id": "cachectrl-08-strip-is-a-no-op-when-nothing-to-strip",
+      "description": "Running the strip step on a request that never had cache_control anywhere converts identically to the un-stripped path.",
+      "category": "cache_control",
+      "tags": ["cache_control", "strip", "no-op"],
+      "options": { "strip_cache_control_first": true },
+      "input": {
+        "model": "m",
+        "system": "plain",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 2,
+        "messages": [
+          { "role": "system", "content": "plain" },
+          { "role": "user", "content": "hi" }
+        ]
+      }
+    },
+    {
+      "id": "cachectrl-09-clean-cache-option-flag-is-inert-inside-anthropictoopenai",
+      "description": "Architectural characterisation: Options.CleanCache is never read inside translate.AnthropicToOpenAI itself (only Options.Model, Options.StreamOptions, and Options.EnsureToolParameters are). Setting clean_cache:true WITHOUT also stripping the raw bytes first has zero effect here -- the actual removal mechanism is the separate translate.StripCacheControl function, which the caller (a provider with the \"cleancache\" transformer) is responsible for invoking on the raw request BEFORE conversion. This case pins down that the flag alone does nothing, so nobody mistakes it for a self-sufficient switch.",
+      "category": "cache_control",
+      "tags": ["cache_control", "characterisation", "options"],
+      "options": { "clean_cache": true },
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": [{ "type": "text", "text": "hi", "cache_control": { "type": "ephemeral" } }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "user", "content": "hi" }]
+      }
+    }
+  ]
+}

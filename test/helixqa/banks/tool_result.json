@@ -1,0 +1,195 @@
+{
+  "version": "1.0",
+  "name": "tool_result",
+  "description": "Anthropic tool_result content blocks becoming a separate role:tool OpenAI message keyed by tool_call_id, emitted BEFORE any remaining content in the same turn.",
+  "test_cases": [
+    {
+      "id": "toolresult-01-plain-string-content",
+      "description": "A bare-string tool_result content becomes the tool message's Content exactly, unquoted.",
+      "category": "tool_result",
+      "tags": ["tool_result", "happy-path"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": "22C sunny" }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [{ "role": "tool", "tool_call_id": "call_1", "content": "22C sunny" }]
+      }
+    },
+    {
+      "id": "toolresult-02-block-array-content-flattened-with-newline",
+      "description": "A block-array tool_result content flattens its text blocks joined by a single newline.",
+      "category": "tool_result",
+      "tags": ["tool_result", "block-form"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": [
+                  { "type": "text", "text": "line one" },
+                  { "type": "text", "text": "line two" }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "tool", "content": "line one\nline two" }]
+      }
+    },
+    {
+      "id": "toolresult-03-content-key-omitted-is-empty",
+      "description": "A tool_result with no \"content\" key at all converts to an empty-string tool message content, not an error.",
+      "category": "tool_result",
+      "tags": ["tool_result", "empty"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "call_1" }] }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "tool", "content": "" }]
+      }
+    },
+    {
+      "id": "toolresult-04-is-error-flag-currently-not-surfaced",
+      "description": "Characterisation case: is_error:true is parsed but has no effect on the emitted OpenAI payload today (OpenAITool/OpenAIMessage carry no error flag) -- the tool's error content is forwarded as ordinary text.",
+      "category": "tool_result",
+      "tags": ["tool_result", "is_error", "characterisation"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": "rate limit exceeded", "is_error": true }]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "tool", "content": "rate limit exceeded", "tool_call_id": "call_1" }]
+      }
+    },
+    {
+      "id": "toolresult-05-followed-by-trailing-text-emits-two-messages",
+      "description": "A tool_result plus trailing text in the same turn produces the tool message FIRST, then a separate user message for the text.",
+      "category": "tool_result",
+      "tags": ["tool_result", "ordering"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              { "type": "tool_result", "tool_use_id": "call_1", "content": "22C sunny" },
+              { "type": "text", "text": "thanks!" }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 2,
+        "messages": [
+          { "role": "tool", "content": "22C sunny", "tool_call_id": "call_1" },
+          { "role": "user", "content": "thanks!" }
+        ]
+      }
+    },
+    {
+      "id": "toolresult-06-only-tool-results-no-trailing-empty-message",
+      "description": "Two tool_result blocks with no trailing text/tool_use produce exactly two tool messages -- the guard that skips emitting an empty combined message must not leave a stray blank message behind.",
+      "category": "tool_result",
+      "tags": ["tool_result", "parallel", "edge-case"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              { "type": "tool_result", "tool_use_id": "a", "content": "1" },
+              { "type": "tool_result", "tool_use_id": "b", "content": "2" }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 2,
+        "messages": [
+          { "role": "tool", "tool_call_id": "a", "content": "1" },
+          { "role": "tool", "tool_call_id": "b", "content": "2" }
+        ]
+      }
+    },
+    {
+      "id": "toolresult-07-empty-tool-use-id",
+      "description": "An empty tool_use_id string is preserved as-is (empty), not rejected.",
+      "category": "tool_result",
+      "tags": ["tool_result", "empty", "edge-case"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "", "content": "x" }] }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "tool", "tool_call_id": "" }]
+      }
+    },
+    {
+      "id": "toolresult-08-unicode-content",
+      "description": "Unicode and emoji tool_result content survives the flatten step.",
+      "category": "tool_result",
+      "tags": ["tool_result", "unicode", "emoji"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": "结果: 成功 ✅" }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "tool", "content": "结果: 成功 ✅" }]
+      }
+    },
+    {
+      "id": "toolresult-09-non-text-inner-block-ignored-when-flattening",
+      "description": "A block-array tool_result content with a non-text block mixed in only flattens the text blocks, same as the system/message flatten rules.",
+      "category": "tool_result",
+      "tags": ["tool_result", "block-form", "forward-compat"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "call_1",
+                "content": [
+                  { "type": "text", "text": "kept" },
+                  { "type": "foo", "text": "dropped" }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "tool", "content": "kept" }]
+      }
+    }
+  ]
+}

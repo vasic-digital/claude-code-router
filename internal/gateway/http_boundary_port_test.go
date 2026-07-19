@@ -27,15 +27,25 @@ package gateway
 //     Node-specific allocation-avoidance pattern; internal/translate decodes
 //     each request once into typed Go structs and does not need a manual
 //     parse cache.
-//   - shouldSendBody(method) — N/A, proxy.Client.Do always POSTs a body; the
-//     gateway never needs a GET/HEAD upstream call.
+//   - shouldSendBody(method) — N/A, the gateway's Upstream seam always POSTs
+//     a body; there is no GET/HEAD upstream call to gate.
 //
-// Two pieces, however, describe real, in-scope gateway behaviour this
-// repository does not implement yet and plausibly should once the
-// /v1/messages handler (internal/gateway/messages.go, out of scope for this
-// change) exists — those are recorded as GAPs below.
+// Two pieces describe real, in-scope gateway behaviour:
+//   - inbound Authorization/x-api-key parsing is genuinely missing (GAP);
+//   - response-header filtering, once messages.go's handleMessages/
+//     streamAnthropicSSE/respondNonStreaming existed to relay a response at
+//     all, turned out to already hold — PORTED, not GAP, see below.
 
-import "testing"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/vasic-digital/claude-code-router/internal/config"
+)
 
 // TestInboundAuthTokenParsing_GAP documents upstream's readAuthToken/
 // readHeader contract: a client may authenticate with either
@@ -44,13 +54,12 @@ import "testing"
 // module does for repeated headers) resolves to its first value.
 //
 // This repository's gateway has no inbound-authentication concept at all:
-// grep the package for "Authorization" and the only hits are proxy.Client.Do
-// setting the OUTBOUND header from config.Provider.APIKey — nothing reads an
-// incoming Authorization/x-api-key header from a Claude Code request. That
-// may be intentional for a purely-localhost-bound default (opt.Host
-// defaults to 127.0.0.1), but once EnableHTTP3/TLS or a non-default Host is
-// used the gateway would accept unauthenticated requests from any reachable
-// caller.
+// handleMessages (internal/gateway/messages.go) never reads c.Request's
+// Authorization or x-api-key header — it goes straight from body to router
+// to upstream. That may be intentional for a purely-localhost-bound default
+// (opt.Host defaults to 127.0.0.1), but once EnableHTTP3/TLS or a
+// non-default Host is used the gateway would accept unauthenticated
+// requests from any reachable caller.
 func TestInboundAuthTokenParsing_GAP(t *testing.T) {
 	cases := []struct {
 		headers map[string]string
@@ -62,39 +71,77 @@ func TestInboundAuthTokenParsing_GAP(t *testing.T) {
 	}
 	_ = cases
 	t.Skip("GAP: no inbound Authorization/x-api-key token parsing exists anywhere in " +
-		"this repository; the gateway does not authenticate incoming requests at all. " +
+		"this repository; handleMessages does not authenticate incoming requests at all. " +
 		"(upstream: test/unit/gateway/http-boundary.test.mjs)")
 }
 
-// TestUpstreamResponseHeaderFiltering_GAP documents upstream's
-// filteredResponseHeaders contract: when relaying an upstream provider's
-// response back to the client, only a small allowlist of headers survives
-// (content-type, x-request-id-shaped headers); hop-by-hop headers like
-// "connection" and transport headers like "content-encoding" are dropped
-// because the gateway's own encoding (see compress.go) — not the upstream's
-// — governs what actually goes over the wire to Claude Code.
+// TestUpstreamResponseHeaderNeverLeaksToClient is the PORTED counterpart of
+// upstream's filteredResponseHeaders (an allowlist of content-type/
+// x-request-id-shaped headers survives the relay to the client; hop-by-hop
+// and transport headers like "connection"/"content-encoding" do not).
 //
-// proxy.Client.Do returns the raw *http.Response completely unfiltered;
-// nothing in this repository currently relays that response to a client at
-// all (no /v1/messages handler exists yet), so there is no header-filtering
-// step for this test to exercise. Once that relay exists, it must not
-// blindly copy every upstream response header — in particular a stale
-// upstream Content-Encoding or Connection header reaching the client would
-// conflict with compress.go's own negotiated encoding.
-func TestUpstreamResponseHeaderFiltering_GAP(t *testing.T) {
-	upstream := map[string]string{
-		"connection":       "close",
-		"content-encoding": "gzip",
-		"content-type":     "application/json",
-		"x-request-id":     "request-1",
+// handleMessages (internal/gateway/messages.go, added after this
+// test-porting task began) achieves a STRICTER version of the same
+// guarantee by construction rather than by filtering a forwarded set: both
+// respondNonStreaming and streamAnthropicSSE build the client response
+// entirely from the upstream response BODY, and never read or copy a single
+// header off the upstream *http.Response at all. So whatever an upstream
+// sends — including headers upstream's own sanitizer would need to
+// explicitly strip, like "Connection: close" or a stale
+// "Content-Encoding" — categorically cannot reach the client, in either the
+// streaming or non-streaming path.
+func TestUpstreamResponseHeaderNeverLeaksToClient(t *testing.T) {
+	tests := []struct {
+		name   string
+		stream bool
+	}{
+		{"non-streaming", false},
+		{"streaming", true},
 	}
-	want := map[string]string{
-		"content-type": "application/json",
-		"x-request-id": "request-1",
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				// A header no legitimate client-facing response would ever
+				// carry — the one an eavesdropping client absolutely must
+				// never see. (Content-Encoding/Connection are deliberately
+				// NOT used here: net/http's own transport transparently
+				// strips/decodes Content-Encoding on the way in, and
+				// streamAnthropicSSE legitimately sets its OWN Connection
+				// value for SSE keep-alive, so neither is a clean signal for
+				// "did an upstream header leak" — this header name is.)
+				w.Header().Set("X-Upstream-Internal-Secret", "must-not-leak")
+				if tc.stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, "data: [DONE]\n\n")
+					w.(http.Flusher).Flush()
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprint(w, `{"id":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`)
+			}))
+			defer upstream.Close()
+
+			cfg := &config.Config{
+				Providers: []config.Provider{{Name: "p", APIBaseURL: upstream.URL, APIKey: "k", Models: []string{"m"}}},
+				Router:    config.Route{Default: "p,m"},
+			}
+			s := New(cfg, Options{})
+			body, _ := json.Marshal(map[string]any{
+				"model": "claude-3-5-sonnet", "max_tokens": 10, "stream": tc.stream,
+				"messages": []map[string]any{{"role": "user", "content": "hi"}},
+			})
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			if v := rec.Header().Get("X-Upstream-Internal-Secret"); v != "" {
+				t.Errorf("client response leaked an upstream-only header: X-Upstream-Internal-Secret: %q", v)
+			}
+		})
 	}
-	_, _ = upstream, want
-	t.Skip("GAP: no response-header filtering exists when relaying an upstream response " +
-		"to the client, because no code path relays an upstream response to a client yet " +
-		"(no /v1/messages handler in this snapshot). (upstream: " +
-		"test/unit/gateway/http-boundary.test.mjs)")
 }

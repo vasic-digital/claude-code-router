@@ -51,13 +51,16 @@ func realistic50KBJSON(b *testing.B) []byte {
 	}
 
 	var choices []choice
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 90; i++ {
 		msg := message{
 			Role: "assistant",
 			Content: fmt.Sprintf(
 				"This is a representative response chunk %d containing prose that a real "+
 					"model completion would produce: explanation, some repeated structure, and "+
-					"enough text to approximate realistic entropy for a compression benchmark.", i),
+					"enough text to approximate realistic entropy for a compression benchmark. "+
+					"Padding the sentence further so the overall payload lands close to fifty "+
+					"kilobytes, which is a realistic size for a Claude Code turn with several "+
+					"tool calls and a few paragraphs of assistant prose mixed together.", i),
 		}
 		if i%3 == 0 {
 			tc := toolCall{ID: fmt.Sprintf("tu_%d", i), Type: "function"}
@@ -79,8 +82,11 @@ func realistic50KBJSON(b *testing.B) []byte {
 	if err != nil {
 		b.Fatalf("marshal benchmark body: %v", err)
 	}
-	if len(raw) < 20000 {
-		b.Fatalf("benchmark body only %d bytes, want a realistically sized (~50KB) payload", len(raw))
+	// "Realistic ~50KB" is a target, not an exact figure; the acceptable band
+	// just needs to keep this from silently regressing to a trivially small
+	// (and therefore unrepresentative) payload.
+	if len(raw) < 40000 || len(raw) > 65000 {
+		b.Fatalf("benchmark body is %d bytes, want it in the ~40-65KB band (~50KB target)", len(raw))
 	}
 	return raw
 }

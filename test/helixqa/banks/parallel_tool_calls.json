@@ -1,0 +1,173 @@
+{
+  "version": "1.0",
+  "name": "parallel_tool_calls",
+  "description": "Multiple tool_use (and tool_result) blocks issued in a single Anthropic turn -- must collapse into one OpenAI message carrying multiple tool_calls (or several sibling role:tool messages), never dropped, never merged incorrectly.",
+  "test_cases": [
+    {
+      "id": "paralleltools-01-two-parallel-calls",
+      "description": "Two tool_use blocks in one assistant turn become one message with two tool_calls and a null Content.",
+      "category": "parallel_tool_calls",
+      "tags": ["parallel_tool_calls", "happy-path"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "call_1", "name": "get_weather", "input": { "city": "Paris" } },
+              { "type": "tool_use", "id": "call_2", "name": "get_weather", "input": { "city": "London" } }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [
+          {
+            "role": "assistant",
+            "content_null": true,
+            "tool_calls_count": 2,
+            "tool_call_names": ["get_weather", "get_weather"]
+          }
+        ]
+      }
+    },
+    {
+      "id": "paralleltools-02-three-distinct-parallel-calls",
+      "description": "Three distinct tool_use blocks preserve order and each function's identity.",
+      "category": "parallel_tool_calls",
+      "tags": ["parallel_tool_calls"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "t1", "name": "f1", "input": {} },
+              { "type": "tool_use", "id": "t2", "name": "f2", "input": {} },
+              { "type": "tool_use", "id": "t3", "name": "f3", "input": {} }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "tool_calls_count": 3, "tool_call_names": ["f1", "f2", "f3"] }]
+      }
+    },
+    {
+      "id": "paralleltools-03-distinct-nested-inputs-preserved",
+      "description": "Two parallel calls with different nested input objects each keep their own arguments -- the first call's arguments are checked explicitly.",
+      "category": "parallel_tool_calls",
+      "tags": ["parallel_tool_calls", "nested"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "t1", "name": "search", "input": { "query": "alpha-marker" } },
+              { "type": "tool_use", "id": "t2", "name": "search", "input": { "query": "beta-marker" } }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [
+          { "tool_calls_count": 2, "tool_call_arguments_contains": "alpha-marker" }
+        ]
+      }
+    },
+    {
+      "id": "paralleltools-04-three-parallel-tool-results",
+      "description": "Three parallel tool_result blocks in one user turn (answering three parallel calls from the prior turn) become three sibling role:tool messages, no trailing empty message.",
+      "category": "parallel_tool_calls",
+      "tags": ["parallel_tool_calls", "tool_result"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              { "type": "tool_result", "tool_use_id": "t1", "content": "10C" },
+              { "type": "tool_result", "tool_use_id": "t2", "content": "20C" },
+              { "type": "tool_result", "tool_use_id": "t3", "content": "30C" }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 3,
+        "messages": [
+          { "role": "tool", "tool_call_id": "t1", "content": "10C" },
+          { "role": "tool", "tool_call_id": "t2", "content": "20C" },
+          { "role": "tool", "tool_call_id": "t3", "content": "30C" }
+        ]
+      }
+    },
+    {
+      "id": "paralleltools-05-parallel-calls-then-parallel-results-two-turns",
+      "description": "A full round trip: one assistant turn issuing two parallel calls, followed by one user turn carrying both results -- three total messages in the right order.",
+      "category": "parallel_tool_calls",
+      "tags": ["parallel_tool_calls", "round-trip"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "t1", "name": "get_weather", "input": { "city": "Paris" } },
+              { "type": "tool_use", "id": "t2", "name": "get_weather", "input": { "city": "Rome" } }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              { "type": "tool_result", "tool_use_id": "t1", "content": "18C" },
+              { "type": "tool_result", "tool_use_id": "t2", "content": "25C" }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 3,
+        "messages": [
+          { "role": "assistant", "tool_calls_count": 2 },
+          { "role": "tool", "tool_call_id": "t1", "content": "18C" },
+          { "role": "tool", "tool_call_id": "t2", "content": "25C" }
+        ]
+      }
+    },
+    {
+      "id": "paralleltools-06-five-parallel-calls-stress",
+      "description": "Five simultaneous tool_use blocks all survive with correct count and ordering (a light stress variant of the parallel-call path).",
+      "category": "parallel_tool_calls",
+      "tags": ["parallel_tool_calls", "stress"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "t1", "name": "fn_a", "input": {} },
+              { "type": "tool_use", "id": "t2", "name": "fn_b", "input": {} },
+              { "type": "tool_use", "id": "t3", "name": "fn_c", "input": {} },
+              { "type": "tool_use", "id": "t4", "name": "fn_d", "input": {} },
+              { "type": "tool_use", "id": "t5", "name": "fn_e", "input": {} }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [
+          { "tool_calls_count": 5, "tool_call_names": ["fn_a", "fn_b", "fn_c", "fn_d", "fn_e"] }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/vasic-digital/claude-code-router/test/helixqa/bank_schema.json",
+  "title": "HelixQA Anthropic->OpenAI translation bank",
+  "description": "Shape of a banks/*.json file consumed by runner_test.go. Validated structurally (not semantically) so a malformed bank file is a loud go test failure rather than a set of silently-skipped cases. This is intentionally a small, hand-checked subset of JSON Schema draft 2020-12 (type/required/properties/additionalProperties/items/minItems/minLength/pattern/enum) -- exactly the keywords schema.go implements.",
+  "type": "object",
+  "required": ["version", "name", "test_cases"],
+  "additionalProperties": false,
+  "properties": {
+    "version": { "type": "string", "minLength": 1 },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "test_cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "description", "category", "input", "expect_error"],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          },
+          "description": { "type": "string", "minLength": 1 },
+          "category": { "type": "string", "minLength": 1 },
+          "tags": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "options": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "clean_cache": { "type": "boolean" },
+              "stream_options": { "type": "boolean" },
+              "ensure_tool_parameters": { "type": "boolean" },
+              "model": { "type": "string" },
+              "strip_cache_control_first": { "type": "boolean" }
+            }
+          },
+          "input": { "type": "object" },
+          "expect_error": { "type": "boolean" },
+          "error_contains": { "type": "string" },
+          "expect": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "model": { "type": "string" },
+              "max_tokens": { "type": "integer" },
+              "stream": { "type": "boolean" },
+              "temperature": { "type": "number" },
+              "temperature_null": { "type": "boolean" },
+              "top_p": { "type": "number" },
+              "top_p_null": { "type": "boolean" },
+              "stop": {
+                "type": "array",
+                "items": { "type": "string" }
+              },
+              "stream_options_include_usage": { "type": "boolean" },
+              "stream_options_null": { "type": "boolean" },
+              "messages_count": { "type": "integer" },
+              "messages": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "role": { "type": "string" },
+                    "content": { "type": "string" },
+                    "content_contains": { "type": "string" },
+                    "content_null": { "type": "boolean" },
+                    "tool_calls_count": { "type": "integer" },
+                    "tool_call_names": {
+                      "type": "array",
+                      "items": { "type": "string" }
+                    },
+                    "tool_call_arguments_contains": { "type": "string" },
+                    "tool_call_id": { "type": "string" }
+                  }
+                }
+              },
+              "tools_count": { "type": "integer" },
+              "tools": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": { "type": "string" },
+                    "description": { "type": "string" },
+                    "parameters_object": { "type": "boolean" },
+                    "parameters_absent": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

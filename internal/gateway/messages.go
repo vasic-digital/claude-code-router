@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,14 @@ import (
 	"github.com/vasic-digital/claude-code-router/internal/config"
 	"github.com/vasic-digital/claude-code-router/internal/translate"
 )
+
+// maxRequestBodyBytes caps an inbound POST /v1/messages body.
+//
+// 32MiB matches the cap already applied to upstream completion responses, so
+// the two directions are symmetric. It is far above any realistic Claude Code
+// request (the largest observed are a few MiB of conversation history) while
+// still bounding what a single client can force the gateway to allocate.
+const maxRequestBodyBytes = 32 << 20
 
 // ---------- Seams: Router and Upstream ----------
 //
@@ -176,8 +185,28 @@ func mapFinishReason(fr string) string {
 // route it, translate to OpenAI, call the upstream, and translate the result
 // back to Anthropic shape — streaming or not.
 func (s *Server) handleMessages(c *gin.Context) {
+	// Cap the INBOUND body. Both upstream-response reads already use
+	// io.LimitReader (64KiB for error bodies, 32MiB for completions), but the
+	// request path was an unbounded io.ReadAll: a single client could stream
+	// an arbitrarily large body and drive the gateway to OOM, taking down
+	// every other in-flight request with it. Found by the security suite.
+	//
+	// http.MaxBytesReader (rather than a bare io.LimitReader) is deliberate:
+	// a LimitReader silently TRUNCATES at the cap, which would hand the JSON
+	// decoder a body cut mid-token and surface as a confusing "invalid JSON"
+	// for what is really an oversized request. MaxBytesReader instead returns
+	// a distinct error, so the client is told the real reason.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBodyBytes)
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		// A *http.MaxBytesError means the cap was hit; 413 is the honest
+		// status for that, not the generic 400 used for unreadable bodies.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeAnthropicError(c, http.StatusRequestEntityTooLarge, "invalid_request_error",
+				fmt.Sprintf("request body exceeds the %d-byte limit", maxRequestBodyBytes))
+			return
+		}
 		writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", fmt.Sprintf("read request body: %v", err))
 		return
 	}

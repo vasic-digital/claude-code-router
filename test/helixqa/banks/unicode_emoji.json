@@ -1,0 +1,114 @@
+{
+  "version": "1.0",
+  "name": "unicode_emoji",
+  "description": "Non-ASCII content -- CJK, RTL scripts, combining diacritics, and multi-codepoint emoji sequences -- must survive translation byte-for-byte since Go strings are UTF-8 throughout and the converter never truncates or re-encodes text.",
+  "test_cases": [
+    {
+      "id": "unicode-01-cjk-mixed-message",
+      "description": "A user message mixing Chinese, Japanese, and Korean text converts unchanged.",
+      "category": "unicode_emoji",
+      "tags": ["unicode", "cjk"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "你好世界 こんにちは世界 안녕하세요 세계" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "content": "你好世界 こんにちは世界 안녕하세요 세계" }]
+      }
+    },
+    {
+      "id": "unicode-02-rtl-arabic-and-hebrew",
+      "description": "Right-to-left Arabic and Hebrew script content converts unchanged (no accidental byte reordering).",
+      "category": "unicode_emoji",
+      "tags": ["unicode", "rtl"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "مرحبا بالعالم שלום עולם" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "content": "مرحبا بالعالم שלום עולם" }]
+      }
+    },
+    {
+      "id": "unicode-03-zwj-family-and-skin-tone-emoji",
+      "description": "Multi-codepoint emoji sequences (ZWJ family emoji, Fitzpatrick skin-tone modifiers) survive as a whole -- these are exactly the sequences naive byte-truncation bugs mangle.",
+      "category": "unicode_emoji",
+      "tags": ["unicode", "emoji", "zwj"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "family: 👨‍👩‍👧‍👦 thumbs up: 👍🏽 flag: 🏳️‍🌈" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [
+          { "content_contains": "👨‍👩‍👧‍👦" }
+        ]
+      }
+    },
+    {
+      "id": "unicode-04-combining-diacritics",
+      "description": "Text using combining-character diacritics (not precomposed) is preserved codepoint-for-codepoint.",
+      "category": "unicode_emoji",
+      "tags": ["unicode", "combining-characters"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "café naïve résumé" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "content_contains": "café" }]
+      }
+    },
+    {
+      "id": "unicode-05-multilingual-multi-turn-history",
+      "description": "A multi-turn history that switches language every turn keeps every turn's script intact.",
+      "category": "unicode_emoji",
+      "tags": ["unicode", "multi-turn"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": "Bonjour" },
+          { "role": "assistant", "content": "Здравствуйте" },
+          { "role": "user", "content": "こんにちは" }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 3,
+        "messages": [
+          { "content": "Bonjour" },
+          { "content": "Здравствуйте" },
+          { "content": "こんにちは" }
+        ]
+      }
+    },
+    {
+      "id": "unicode-06-emoji-in-stop-sequences",
+      "description": "A stop sequence containing an emoji round-trips through the stop_sequences -> stop rename unchanged.",
+      "category": "unicode_emoji",
+      "tags": ["unicode", "emoji", "sampling_params"],
+      "input": {
+        "model": "m",
+        "stop_sequences": ["🛑STOP🛑"],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "stop": ["🛑STOP🛑"] }
+    },
+    {
+      "id": "unicode-07-unicode-model-id",
+      "description": "A router-supplied model override id containing unicode characters is forwarded unchanged.",
+      "category": "unicode_emoji",
+      "tags": ["unicode", "model-override"],
+      "options": { "model": "モデル-プレミアム-v1" },
+      "input": {
+        "model": "claude-sonnet-4-5",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "model": "モデル-プレミアム-v1" }
+    }
+  ]
+}

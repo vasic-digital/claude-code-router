@@ -12,28 +12,66 @@ package gateway
 // Upstream Node CCR resolves, for every inbound HTTP request, which wire
 // protocol it speaks (Anthropic Messages, OpenAI chat-completions, OpenAI
 // Responses, Gemini generateContent, Gemini "Interactions") purely from the
-// request path, and separately decides whether that request is eligible for
-// model-based routing at all (POST + a small path allowlist; sub-resource
-// paths like ".../interaction-1/cancel" are explicitly excluded even though
-// they share a path prefix with a routable one).
+// request path via a reusable requestProtocolForPath classifier, and
+// separately decides whether that request is eligible for model-based
+// routing at all via shouldApplyGatewayRouting (POST + a small path
+// allowlist; sub-resource paths like ".../interaction-1/cancel" are
+// explicitly excluded even though they share a path prefix with a routable
+// one, because the model for an in-flight interaction is fixed by the
+// interaction record, not the request body).
 //
-// This repository's gateway currently only registers /health and /ready
-// (see gateway.go's routes()); the Anthropic Messages endpoint itself
-// (internal/gateway/messages.go) does not exist yet in this snapshot and is
-// being built by another agent concurrently, so there is no
-// requestProtocolForPath/shouldApplyGatewayRouting equivalent anywhere in
-// this package to call. Every case below is GAP, not PORTED: the tests
-// document the exact contract upstream enforces so the eventual endpoint
-// wiring in messages.go has a ready-made acceptance table.
+// gateway.go now registers a real POST /v1/messages route (see
+// internal/gateway/messages.go, added after this test-porting task began —
+// it is off-limits to edit here), so the single-protocol subset of this
+// contract (Anthropic Messages, POST-only) is real and PORTED below.
+// Everything beyond that single hardcoded route is still GAP:
+//   - there is no REUSABLE path->protocol classifier function anywhere —
+//     "POST /v1/messages routes, everything else 404s" is an artifact of
+//     gin's route table (routes() in gateway.go), not a callable function
+//     upstream's requestProtocolForPath equivalent could be ported as;
+//   - none of OpenAI chat-completions ("/chat/completions"), OpenAI
+//     Responses ("/responses"), Gemini generateContent, Gemini
+//     Interactions, or the "/proxy/v1/*" path aliases are recognised at
+//     all — Claude Code is this gateway's only supported client shape.
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/vasic-digital/claude-code-router/internal/config"
+)
+
+func portTestCfg() *config.Config {
+	return &config.Config{
+		Providers: []config.Provider{{Name: "p1", APIBaseURL: "https://up.example/v1/chat/completions", APIKey: "k", Models: []string{"m1"}}},
+		Router:    config.Route{Default: "p1,m1"},
+	}
+}
+
+// TestOnlyPOSTMessagesIsRoutingEligible is the real, narrow analogue of
+// upstream's "gateway routing applies only to POST model-selection
+// endpoints": for the one endpoint this gateway actually implements
+// (/v1/messages), only POST is routing-eligible — every other method 404s
+// rather than being silently accepted or misrouted.
+func TestOnlyPOSTMessagesIsRoutingEligible(t *testing.T) {
+	s := New(portTestCfg(), Options{})
+	for _, method := range []string{http.MethodGet, http.MethodDelete, http.MethodPut, http.MethodPatch} {
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest(method, "/v1/messages", nil))
+		if rec.Code == http.StatusOK {
+			t.Errorf("%s /v1/messages = 200, want routing NOT to apply to a non-POST method", method)
+		}
+	}
+}
 
 // TestRequestProtocolForPath_GAP documents upstream's requestProtocolForPath
 // contract (protocol-endpoints.test.mjs, "request protocol detection covers
-// every supported public endpoint shape"). Our gateway has no function that
-// maps an inbound path to a wire protocol at all — every request this
-// package currently serves is a fixed health/readiness probe, not a
-// model-routed call.
+// every supported public endpoint shape") in full. Only the first row
+// ("/messages" family -> anthropic_messages, via the literal POST
+// /v1/messages route) has any counterpart in this repository; there is no
+// reusable classifier function, and none of the other protocol families are
+// recognised at any path.
 func TestRequestProtocolForPath_GAP(t *testing.T) {
 	cases := []struct {
 		path string
@@ -56,18 +94,21 @@ func TestRequestProtocolForPath_GAP(t *testing.T) {
 	}
 	_ = cases
 	t.Skip("GAP: no requestProtocolForPath (or equivalent) exists in internal/gateway; " +
-		"this package registers only /health and /ready today. Once the /v1/messages " +
-		"handler (internal/gateway/messages.go) lands, it should expose a path->protocol " +
-		"classifier with the table encoded above (upstream: " +
-		"test/unit/routing/protocol-endpoints.test.mjs).")
+		"routing to /v1/messages is a single hardcoded gin route (see gateway.go's " +
+		"routes()), not a reusable path->protocol classifier, and no other protocol " +
+		"family (OpenAI chat-completions, OpenAI Responses, Gemini generateContent, " +
+		"Gemini Interactions, or any \"/proxy/v1/*\" alias) is recognised at any path. " +
+		"(upstream: test/unit/routing/protocol-endpoints.test.mjs)")
 }
 
-// TestShouldApplyGatewayRouting_GAP documents upstream's shouldApplyGatewayRouting
-// contract: routing applies only to POST requests on a path allowlist, and
-// sub-resource paths under an otherwise-routable prefix (Gemini Interactions
-// "get status" / "cancel") are explicitly excluded even though they share
-// the prefix, because the model is fixed by the interaction record — not by
-// the request body — so a second routing decision would be meaningless.
+// TestShouldApplyGatewayRouting_GAP documents upstream's full
+// shouldApplyGatewayRouting contract across every protocol family. The
+// POST-vs-other-methods slice of it, restricted to /v1/messages, is real —
+// see TestOnlyPOSTMessagesIsRoutingEligible — but the path-allowlist and
+// sub-resource-exclusion behaviour (Gemini Interactions "get status" /
+// "cancel" sharing a prefix with a routable path yet being excluded from
+// routing) has no counterpart, because none of those paths exist here at
+// all.
 func TestShouldApplyGatewayRouting_GAP(t *testing.T) {
 	cases := []struct {
 		method string
@@ -85,10 +126,10 @@ func TestShouldApplyGatewayRouting_GAP(t *testing.T) {
 		{"DELETE", "/v1beta/interactions", false},
 	}
 	_ = cases
-	t.Skip("GAP: no shouldApplyGatewayRouting (or equivalent) exists anywhere in this " +
-		"repository — routing today is entirely internal/router.Select, which is never " +
-		"invoked from an HTTP path/method pair because no request-handling route besides " +
-		"/health and /ready is registered yet. (upstream: " +
+	t.Skip("GAP: no shouldApplyGatewayRouting (or equivalent) exists as a callable function " +
+		"anywhere in this repository, and only one of the paths in upstream's table " +
+		"(/v1/messages) is implemented at all — see TestOnlyPOSTMessagesIsRoutingEligible " +
+		"for the real subset of this contract that is PORTED. (upstream: " +
 		"test/unit/routing/protocol-endpoints.test.mjs, " +
 		"test/unit/gateway/routing-architecture.test.mjs)")
 }

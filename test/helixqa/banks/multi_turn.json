@@ -1,0 +1,189 @@
+{
+  "version": "1.0",
+  "name": "multi_turn",
+  "description": "Multi-turn conversation histories: role ordering, count, and content must all survive the Anthropic -> OpenAI conversion unchanged.",
+  "test_cases": [
+    {
+      "id": "multiturn-01-three-turns",
+      "description": "user -> assistant -> user history preserves order, roles, and content exactly.",
+      "category": "multi_turn",
+      "tags": ["multi-turn", "happy-path"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": "What is 2+2?" },
+          { "role": "assistant", "content": "4." },
+          { "role": "user", "content": "And 3+3?" }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 3,
+        "messages": [
+          { "role": "user", "content": "What is 2+2?" },
+          { "role": "assistant", "content": "4." },
+          { "role": "user", "content": "And 3+3?" }
+        ]
+      }
+    },
+    {
+      "id": "multiturn-02-with-system-prefix",
+      "description": "A system prompt plus four alternating turns yields five messages, system first.",
+      "category": "multi_turn",
+      "tags": ["multi-turn", "system"],
+      "input": {
+        "model": "m",
+        "system": "Answer briefly.",
+        "messages": [
+          { "role": "user", "content": "hi" },
+          { "role": "assistant", "content": "hello" },
+          { "role": "user", "content": "bye" },
+          { "role": "assistant", "content": "goodbye" }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 5,
+        "messages": [
+          { "role": "system", "content": "Answer briefly." },
+          { "role": "user", "content": "hi" },
+          { "role": "assistant", "content": "hello" },
+          { "role": "user", "content": "bye" },
+          { "role": "assistant", "content": "goodbye" }
+        ]
+      }
+    },
+    {
+      "id": "multiturn-03-ten-turn-history",
+      "description": "A ten-message alternating history converts with the right count and endpoints.",
+      "category": "multi_turn",
+      "tags": ["multi-turn", "long-history"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": "turn 1" },
+          { "role": "assistant", "content": "turn 2" },
+          { "role": "user", "content": "turn 3" },
+          { "role": "assistant", "content": "turn 4" },
+          { "role": "user", "content": "turn 5" },
+          { "role": "assistant", "content": "turn 6" },
+          { "role": "user", "content": "turn 7" },
+          { "role": "assistant", "content": "turn 8" },
+          { "role": "user", "content": "turn 9" },
+          { "role": "assistant", "content": "turn 10" }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 10,
+        "messages": [
+          { "role": "user", "content": "turn 1" }
+        ]
+      }
+    },
+    {
+      "id": "multiturn-04-consecutive-same-role",
+      "description": "Two consecutive user turns (no assistant reply between them) are not rejected -- the converter does not enforce strict role alternation.",
+      "category": "multi_turn",
+      "tags": ["multi-turn", "edge-case"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": "first" },
+          { "role": "user", "content": "second" }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 2,
+        "messages": [
+          { "role": "user", "content": "first" },
+          { "role": "user", "content": "second" }
+        ]
+      }
+    },
+    {
+      "id": "multiturn-05-assistant-first-no-user",
+      "description": "A history that starts with an assistant turn (unusual, but not structurally invalid) still converts.",
+      "category": "multi_turn",
+      "tags": ["multi-turn", "edge-case"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "assistant", "content": "I'll begin." }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [{ "role": "assistant", "content": "I'll begin." }]
+      }
+    },
+    {
+      "id": "multiturn-06-text-tool-and-result-across-turns",
+      "description": "user text -> assistant tool_use -> user tool_result -> assistant text: the full 4-message conversation shape survives with tool linkage intact.",
+      "category": "multi_turn",
+      "tags": ["multi-turn", "tool_use", "tool_result"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": "What's the weather in Paris?" },
+          {
+            "role": "assistant",
+            "content": [
+              { "type": "tool_use", "id": "call_1", "name": "get_weather", "input": { "city": "Paris" } }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": "18C, cloudy" }]
+          },
+          { "role": "assistant", "content": "It's 18C and cloudy in Paris." }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 4,
+        "messages": [
+          { "role": "user", "content": "What's the weather in Paris?" },
+          { "role": "assistant", "content_null": true, "tool_calls_count": 1, "tool_call_names": ["get_weather"] },
+          { "role": "tool", "content": "18C, cloudy", "tool_call_id": "call_1" },
+          { "role": "assistant", "content": "It's 18C and cloudy in Paris." }
+        ]
+      }
+    },
+    {
+      "id": "multiturn-07-mixed-string-and-block-content-across-turns",
+      "description": "Some turns use plain-string content, others use a single-element block array -- both forms coexist correctly in one history.",
+      "category": "multi_turn",
+      "tags": ["multi-turn", "content-shape"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": "plain string turn" },
+          { "role": "assistant", "content": [{ "type": "text", "text": "block array turn" }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 2,
+        "messages": [
+          { "role": "user", "content": "plain string turn" },
+          { "role": "assistant", "content": "block array turn" }
+        ]
+      }
+    },
+    {
+      "id": "multiturn-08-single-turn-no-system",
+      "description": "The minimal one-turn, no-system conversation still converts to exactly one message.",
+      "category": "multi_turn",
+      "tags": ["multi-turn", "minimal"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hello" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1
+      }
+    }
+  ]
+}

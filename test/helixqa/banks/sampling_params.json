@@ -1,0 +1,123 @@
+{
+  "version": "1.0",
+  "name": "sampling_params",
+  "description": "Sampling parameters (temperature, top_p) and stop_sequences -> stop must survive the pointer-preserving copy exactly, including the distinction between \"unset\" (nil pointer) and \"explicitly zero\".",
+  "test_cases": [
+    {
+      "id": "sampling-01-temperature-and-top-p-both-set",
+      "description": "Both temperature and top_p are set and both survive with their exact values.",
+      "category": "sampling_params",
+      "tags": ["sampling_params", "happy-path"],
+      "input": {
+        "model": "m",
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "temperature": 0.5, "top_p": 0.9 }
+    },
+    {
+      "id": "sampling-02-temperature-only",
+      "description": "temperature set, top_p omitted: top_p must stay nil, not default to 0 or 1.",
+      "category": "sampling_params",
+      "tags": ["sampling_params"],
+      "input": {
+        "model": "m",
+        "temperature": 0.2,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "temperature": 0.2, "top_p_null": true }
+    },
+    {
+      "id": "sampling-03-top-p-only",
+      "description": "top_p set, temperature omitted: temperature must stay nil.",
+      "category": "sampling_params",
+      "tags": ["sampling_params"],
+      "input": {
+        "model": "m",
+        "top_p": 0.8,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "top_p": 0.8, "temperature_null": true }
+    },
+    {
+      "id": "sampling-04-neither-temperature-nor-top-p-set",
+      "description": "Neither sampling parameter set: both stay nil, no defaults are invented.",
+      "category": "sampling_params",
+      "tags": ["sampling_params"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "temperature_null": true, "top_p_null": true }
+    },
+    {
+      "id": "sampling-05-temperature-explicit-zero-is-not-unset",
+      "description": "An explicit temperature of 0.0 must be distinguished from \"not provided\": the pointer must be non-nil and equal to 0.0.",
+      "category": "sampling_params",
+      "tags": ["sampling_params", "boundary"],
+      "input": {
+        "model": "m",
+        "temperature": 0,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "temperature": 0 }
+    },
+    {
+      "id": "sampling-06-temperature-outside-typical-range-passes-through",
+      "description": "Characterisation case: the converter performs no range validation/clamping on temperature -- a value above Anthropic's typical 0..1 range still passes through unchanged (any range enforcement is the upstream provider's job).",
+      "category": "sampling_params",
+      "tags": ["sampling_params", "characterisation"],
+      "input": {
+        "model": "m",
+        "temperature": 1.7,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "temperature": 1.7 }
+    },
+    {
+      "id": "sampling-07-multiple-stop-sequences",
+      "description": "Three stop sequences survive in order under the renamed \"stop\" key.",
+      "category": "sampling_params",
+      "tags": ["sampling_params", "stop_sequences"],
+      "input": {
+        "model": "m",
+        "stop_sequences": ["END", "STOP", "###"],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "stop": ["END", "STOP", "###"] }
+    },
+    {
+      "id": "sampling-08-single-stop-sequence",
+      "description": "A single stop sequence converts to a one-element stop array.",
+      "category": "sampling_params",
+      "tags": ["sampling_params", "stop_sequences"],
+      "input": {
+        "model": "m",
+        "stop_sequences": ["DONE"],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "stop": ["DONE"] }
+    },
+    {
+      "id": "sampling-09-stop-sequences-omitted",
+      "description": "No stop_sequences key at all converts to an empty stop list, not an error.",
+      "category": "sampling_params",
+      "tags": ["sampling_params", "stop_sequences", "empty"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "stop": [] }
+    }
+  ]
+}

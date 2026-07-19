@@ -1,0 +1,155 @@
+{
+  "version": "1.0",
+  "name": "system_prompt",
+  "description": "Anthropic's top-level \"system\" field (string or block-array form) becoming a leading role:system OpenAI message. Losing this is the highest-stakes translation bug: the model silently never receives its instructions.",
+  "test_cases": [
+    {
+      "id": "sysprompt-01-string-form",
+      "description": "A plain string system prompt becomes messages[0] = {role: system, content: <string>}.",
+      "category": "system_prompt",
+      "tags": ["system", "happy-path"],
+      "input": {
+        "model": "m",
+        "max_tokens": 100,
+        "system": "You are a helpful assistant.",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 2,
+        "messages": [
+          { "role": "system", "content": "You are a helpful assistant." },
+          { "role": "user", "content": "hi" }
+        ]
+      }
+    },
+    {
+      "id": "sysprompt-02-block-form-single",
+      "description": "A single-element block-array system prompt flattens to the same plain-text system message.",
+      "category": "system_prompt",
+      "tags": ["system", "block-form"],
+      "input": {
+        "model": "m",
+        "system": [{ "type": "text", "text": "Be concise." }],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "system", "content": "Be concise." }]
+      }
+    },
+    {
+      "id": "sysprompt-03-block-form-multi-joined-with-blank-line",
+      "description": "Multiple text blocks in a system block-array join with a blank line (\\n\\n), not a single newline -- distinct from how per-message content blocks join.",
+      "category": "system_prompt",
+      "tags": ["system", "block-form"],
+      "input": {
+        "model": "m",
+        "system": [
+          { "type": "text", "text": "Rule A." },
+          { "type": "text", "text": "Rule B." }
+        ],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "system", "content": "Rule A.\n\nRule B." }]
+      }
+    },
+    {
+      "id": "sysprompt-04-empty-string-produces-no-system-message",
+      "description": "An explicit empty-string system prompt is present (len > 0 as raw JSON) but flattens to empty text, so no system message is emitted at all -- characterises a real edge case, not an error.",
+      "category": "system_prompt",
+      "tags": ["system", "empty"],
+      "input": {
+        "model": "m",
+        "system": "",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [{ "role": "user", "content": "hi" }]
+      }
+    },
+    {
+      "id": "sysprompt-05-mixed-block-types-non-text-ignored",
+      "description": "A system block array may contain a non-text block type (e.g. a future/unrecognised block); it is silently skipped while text blocks around it still join correctly.",
+      "category": "system_prompt",
+      "tags": ["system", "block-form", "forward-compat"],
+      "input": {
+        "model": "m",
+        "system": [
+          { "type": "text", "text": "A" },
+          { "type": "foo", "text": "should be ignored" },
+          { "type": "text", "text": "B" }
+        ],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "role": "system", "content": "A\n\nB" }]
+      }
+    },
+    {
+      "id": "sysprompt-06-omitted-produces-no-system-message",
+      "description": "A request with no \"system\" key at all (not even an empty one) converts cleanly with no system message.",
+      "category": "system_prompt",
+      "tags": ["system", "empty"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1
+      }
+    },
+    {
+      "id": "sysprompt-07-malformed-object-is-error",
+      "description": "A system value that is neither a string nor a block array (a bare JSON object) is rejected with a clear, prefixed error rather than silently dropped or half-converted.",
+      "category": "system_prompt",
+      "tags": ["system", "malformed"],
+      "input": {
+        "model": "m",
+        "system": { "unexpected": "shape" },
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": true,
+      "error_contains": "neither string nor block array"
+    },
+    {
+      "id": "sysprompt-08-malformed-number-is-error",
+      "description": "A bare numeric system value is rejected the same way as an object.",
+      "category": "system_prompt",
+      "tags": ["system", "malformed"],
+      "input": {
+        "model": "m",
+        "system": 42,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": true,
+      "error_contains": "neither string nor block array"
+    },
+    {
+      "id": "sysprompt-09-unicode-and-emoji",
+      "description": "A system prompt carrying CJK, Arabic (RTL), and emoji text survives byte-for-byte.",
+      "category": "system_prompt",
+      "tags": ["system", "unicode", "emoji"],
+      "input": {
+        "model": "m",
+        "system": "You are a 🤖 assistant who speaks 中文 and العربية fluently.",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a 🤖 assistant who speaks 中文 and العربية fluently."
+          }
+        ]
+      }
+    }
+  ]
+}

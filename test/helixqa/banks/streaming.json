@@ -1,0 +1,100 @@
+{
+  "version": "1.0",
+  "name": "streaming",
+  "description": "The stream flag and the opt-in stream_options.include_usage addition (transformer \"streamoptions\"), which some upstreams need to report token usage on the final SSE chunk but which must never appear on a non-streaming request.",
+  "test_cases": [
+    {
+      "id": "streaming-01-stream-true-with-stream-options-enabled",
+      "description": "stream:true plus the stream_options option adds stream_options.include_usage=true.",
+      "category": "streaming",
+      "tags": ["streaming", "happy-path"],
+      "options": { "stream_options": true },
+      "input": {
+        "model": "m",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "stream": true, "stream_options_include_usage": true }
+    },
+    {
+      "id": "streaming-02-stream-true-without-stream-options-option",
+      "description": "stream:true WITHOUT the option leaves stream_options entirely absent (opt-in only).",
+      "category": "streaming",
+      "tags": ["streaming"],
+      "input": {
+        "model": "m",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "stream": true, "stream_options_null": true }
+    },
+    {
+      "id": "streaming-03-stream-false-with-stream-options-option-must-stay-absent",
+      "description": "A non-streaming request must NOT carry stream_options even when the option is enabled -- some upstreams 400 on an unexpected stream_options key on a non-streaming call.",
+      "category": "streaming",
+      "tags": ["streaming", "non-streaming"],
+      "options": { "stream_options": true },
+      "input": {
+        "model": "m",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "stream": false, "stream_options_null": true }
+    },
+    {
+      "id": "streaming-04-stream-key-omitted-defaults-to-false",
+      "description": "No \"stream\" key at all defaults to non-streaming, and stream_options stays absent even with the option enabled.",
+      "category": "streaming",
+      "tags": ["streaming", "default"],
+      "options": { "stream_options": true },
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "stream": false, "stream_options_null": true }
+    },
+    {
+      "id": "streaming-05-stream-and-model-override-combo",
+      "description": "Streaming, stream_options, and a router-supplied model override all compose correctly in the same request.",
+      "category": "streaming",
+      "tags": ["streaming", "model-override"],
+      "options": { "stream_options": true, "model": "glm-5.2" },
+      "input": {
+        "model": "claude-sonnet-4-5",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "model": "glm-5.2", "stream": true, "stream_options_include_usage": true }
+    },
+    {
+      "id": "streaming-06-stream-true-with-tool-use-in-history",
+      "description": "Streaming composes correctly with a history that also contains a completed tool call round trip -- streaming is orthogonal to message shape.",
+      "category": "streaming",
+      "tags": ["streaming", "tool_use"],
+      "options": { "stream_options": true },
+      "input": {
+        "model": "m",
+        "stream": true,
+        "messages": [
+          { "role": "user", "content": "weather?" },
+          {
+            "role": "assistant",
+            "content": [{ "type": "tool_use", "id": "call_1", "name": "get_weather", "input": {} }]
+          },
+          { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": "sunny" }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "stream": true,
+        "stream_options_include_usage": true,
+        "messages_count": 3
+      }
+    }
+  ]
+}

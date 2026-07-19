@@ -1,0 +1,110 @@
+{
+  "version": "1.0",
+  "name": "empty_null_content",
+  "description": "Empty and null shapes of message content, tools, and the messages list itself. These are all characterisation cases (documenting real, verified behaviour) rather than error cases: none of them causes translate.AnthropicToOpenAI to error, but several of them cause a whole turn to silently disappear from the output, which is worth pinning down explicitly.",
+  "test_cases": [
+    {
+      "id": "emptynull-01-empty-string-content-drops-the-turn",
+      "description": "A message whose content is the empty string \"\" produces NO output message at all -- the turn silently vanishes rather than becoming an empty-content message.",
+      "category": "empty_null_content",
+      "tags": ["empty", "silent-drop"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": "" }]
+      },
+      "expect_error": false,
+      "expect": { "messages_count": 0 }
+    },
+    {
+      "id": "emptynull-02-empty-array-content-drops-the-turn",
+      "description": "A message whose content is an empty block array [] behaves the same as an empty string: no output message.",
+      "category": "empty_null_content",
+      "tags": ["empty", "silent-drop"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": [] }]
+      },
+      "expect_error": false,
+      "expect": { "messages_count": 0 }
+    },
+    {
+      "id": "emptynull-03-json-null-content-drops-the-turn",
+      "description": "A literal JSON null content value decodes without error (Go's encoding/json accepts null into the polymorphic RawMessage/string paths) and, like the empty forms, drops the turn rather than erroring.",
+      "category": "empty_null_content",
+      "tags": ["empty", "silent-drop"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user", "content": null }]
+      },
+      "expect_error": false,
+      "expect": { "messages_count": 0 }
+    },
+    {
+      "id": "emptynull-04-content-key-omitted-drops-the-turn",
+      "description": "A message object with no \"content\" key at all (not even null) behaves identically to an explicit null/empty content.",
+      "category": "empty_null_content",
+      "tags": ["empty", "silent-drop"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "user" }]
+      },
+      "expect_error": false,
+      "expect": { "messages_count": 0 }
+    },
+    {
+      "id": "emptynull-05-empty-messages-array-with-system-keeps-system",
+      "description": "An explicit empty messages array combined with a system prompt still emits exactly the system message.",
+      "category": "empty_null_content",
+      "tags": ["empty", "system"],
+      "input": {
+        "model": "m",
+        "system": "sys",
+        "messages": []
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [{ "role": "system", "content": "sys" }]
+      }
+    },
+    {
+      "id": "emptynull-06-fully-empty-request-no-system-no-messages",
+      "description": "A request with neither \"system\" nor \"messages\" keys at all converts cleanly to zero output messages, no error.",
+      "category": "empty_null_content",
+      "tags": ["empty", "minimal"],
+      "input": {
+        "model": "m",
+        "max_tokens": 10
+      },
+      "expect_error": false,
+      "expect": { "messages_count": 0 }
+    },
+    {
+      "id": "emptynull-07-tool-use-with-empty-string-name",
+      "description": "A tool_use block whose name is the empty string is preserved as an empty (not dropped) function name -- worth pinning down since an empty function name is exactly the kind of value an upstream might reject.",
+      "category": "empty_null_content",
+      "tags": ["empty", "tool_use", "edge-case"],
+      "input": {
+        "model": "m",
+        "messages": [{ "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "", "input": {} }] }]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages": [{ "tool_calls_count": 1, "tool_call_names": [""] }]
+      }
+    },
+    {
+      "id": "emptynull-08-empty-tools-array-is-not-an-error",
+      "description": "An explicit empty tools array converts to zero OpenAI tools, not an error and not omitted-vs-empty confusion.",
+      "category": "empty_null_content",
+      "tags": ["empty", "tools"],
+      "input": {
+        "model": "m",
+        "tools": [],
+        "messages": [{ "role": "user", "content": "hi" }]
+      },
+      "expect_error": false,
+      "expect": { "tools_count": 0 }
+    }
+  ]
+}
