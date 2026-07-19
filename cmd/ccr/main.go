@@ -47,6 +47,9 @@ Flags (start, ui, serve, web):
   --open, --no-open        Open (or don't open) the management UI in a browser
   --gateway, --no-gateway  Start (or don't start) the Anthropic-compatible gateway
                             (default: on, port 3456)
+  --gateway-port <port>    Gateway port (default 3456, env CCR_GATEWAY_PORT).
+                            Distinct from --port, which sets the management
+                            interface. Use this when 3456 is already taken.
 
   -h, --help                Show this help
 `

@@ -43,7 +43,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) int {
 
 	var gw *gateway.Server
 	if flags.Gateway {
-		gw = gateway.New(cfg, gateway.Options{Port: defaultGatewayPort})
+		gw = gateway.New(cfg, gateway.Options{Port: flags.GatewayPort})
 		// Install the real router and upstream client. Without this the
 		// gateway keeps its minimal built-in defaults, which always resolve
 		// Router.default — so haiku-tier background requests would be sent to
