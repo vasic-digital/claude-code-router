@@ -4,9 +4,33 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.4` (below) are the
+`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.5` (below) are the
 current releases. Entries are drawn from this repository's real `git log`
 history — nothing here is speculative.
+
+## [0.4.5] - 2026-07-20
+
+The OpenAI-compatible inbound facade now routes on request size too, so the two
+inbound facades pick the long-context tier symmetrically. No change to any
+forwarded upstream body.
+
+### Fixed
+
+- `POST /v1/chat/completions` now trips `Router.longContext` for a large prompt,
+  closing a documented gap where the facade routed on model alone (it built a
+  routing request carrying only Model+Stream, so the content-based estimate saw
+  ~0 tokens and a big prompt always fell to `Router.default`). A new
+  `routingRequestFromOpenAI` helper builds a routing-ONLY request from the
+  inbound body — measuring each message's TEXT content (string content, or the
+  text parts of a multi-part array; `image_url` data-URIs are excluded, since a
+  base64 image's byte size is unrelated to its token cost) and folding tools
+  across so `estimateTokenCount` approximates the true size. The synthetic
+  request is used solely for `Route()`; the forwarded upstream body is unchanged
+  (still the verbatim client body with only `model` overridden). Inert when
+  `Router.longContext` is unset. Pinned by unit tests (large string / large
+  parts-array → long-context provider, small and image-heavy/text-light →
+  default, forwarded-body-unchanged for a large request, malformed body →
+  degrades to model+stream) and the helper's own test.
 
 ## [0.4.4] - 2026-07-20
 

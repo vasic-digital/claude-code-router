@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
 )
@@ -209,6 +210,164 @@ func TestOpenAIInboundStreamingNoUsageRecordsNothing(t *testing.T) {
 	// is created).
 	if strings.Contains(buf.String(), `ccr_gen_ai_input_tokens_total{provider="oai"`) {
 		t.Errorf("no-usage stream must not emit a token series:\n%s", buf.String())
+	}
+}
+
+// facadeRoutedModel drives one /v1/chat/completions request through a fresh
+// server+upstream and returns the model the upstream actually received — which
+// is the routed model overrideModelField stamped, i.e. proof of which route/
+// provider won.
+func facadeRoutedModel(t *testing.T, cfg *config.Config, body string) string {
+	t.Helper()
+	up := &recordingUpstream{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"id":"x","object":"chat.completion","choices":[],"usage":{}}`)),
+	}}
+	s := New(cfg, Options{})
+	// WireDefaults installs the REAL router (routerAdapter) that honors the
+	// long-context tier; the minimal built-in defaultRouter only resolves
+	// Router.Default. Override the upstream it installs with the fake.
+	s.WireDefaults(30 * time.Second)
+	s.Upstream = up
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(up.gotBody, &sent); err != nil {
+		t.Fatalf("upstream body not JSON: %v\n%s", err, up.gotBody)
+	}
+	m, _ := sent["model"].(string)
+	return m
+}
+
+// The OpenAI facade must trip Router.LongContext for a LARGE body, symmetric
+// with the Anthropic /v1/messages path — previously it routed on model alone and
+// a big prompt always fell to Router.Default. A large `messages[].content`
+// (string OR parts array) crosses the estimate threshold; a small one does not.
+func TestOpenAIInboundLongContextRouting(t *testing.T) {
+	cfg := &config.Config{
+		Providers: []config.Provider{
+			{Name: "oai", APIBaseURL: "https://up/v1/chat/completions", APIKey: "k", Models: []string{"m"}},
+			{Name: "lc", APIBaseURL: "https://up/v1/chat/completions", APIKey: "k", Models: []string{"m"}},
+		},
+		Router: config.Route{Default: "oai,routed-model", LongContext: "lc,lc-model"},
+	}
+	// > 60000 estimated tokens ⇒ > 240000 content bytes.
+	big := strings.Repeat("x", 248000)
+
+	// Large string content ⇒ longContext provider.
+	largeStr := `{"model":"gpt-4o","messages":[{"role":"user","content":"` + big + `"}]}`
+	if got := facadeRoutedModel(t, cfg, largeStr); got != "lc-model" {
+		t.Errorf("large string body routed to %q, want lc-model (longContext)", got)
+	}
+
+	// Large parts-array content ⇒ longContext (proves string-vs-array handling).
+	largeArr := `{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"text","text":"` + big + `"}]}]}`
+	if got := facadeRoutedModel(t, cfg, largeArr); got != "lc-model" {
+		t.Errorf("large array body routed to %q, want lc-model (longContext)", got)
+	}
+
+	// Small body ⇒ default provider (longContext must NOT trip).
+	small := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	if got := facadeRoutedModel(t, cfg, small); got != "routed-model" {
+		t.Errorf("small body routed to %q, want routed-model (default)", got)
+	}
+
+	// Image-heavy, text-light body ⇒ default. A large base64 image_url data-URI
+	// must NOT trip longContext — its byte size is unrelated to token cost.
+	bigImage := "data:image/png;base64," + strings.Repeat("A", 300000)
+	imgHeavy := `{"model":"gpt-4o","messages":[{"role":"user","content":[` +
+		`{"type":"image_url","image_url":{"url":"` + bigImage + `"}},` +
+		`{"type":"text","text":"what is this?"}]}]}`
+	if got := facadeRoutedModel(t, cfg, imgHeavy); got != "routed-model" {
+		t.Errorf("image-heavy/text-light body routed to %q, want routed-model (images not counted)", got)
+	}
+}
+
+// The forwarded upstream body for a LARGE request must remain the verbatim
+// client body with only `model` overridden — the synthetic routing request must
+// never leak into what is sent upstream. This pins finding #1 of the review as a
+// test, not just code inspection.
+func TestOpenAIFacadeLargeRequestForwardsBodyUnchanged(t *testing.T) {
+	cfg := &config.Config{
+		Providers: []config.Provider{
+			{Name: "oai", APIBaseURL: "https://up/v1/chat/completions", APIKey: "k", Models: []string{"m"}},
+			{Name: "lc", APIBaseURL: "https://up/v1/chat/completions", APIKey: "k", Models: []string{"m"}},
+		},
+		Router: config.Route{Default: "oai,routed-model", LongContext: "lc,lc-model"},
+	}
+	marker := strings.Repeat("Z", 248000) // > threshold, and a unique marker
+	body := `{"model":"gpt-4o","temperature":0.3,"messages":[{"role":"user","content":"` + marker + `"}]}`
+
+	up := &recordingUpstream{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"id":"x","object":"chat.completion","choices":[],"usage":{}}`)),
+	}}
+	s := New(cfg, Options{})
+	s.WireDefaults(30 * time.Second)
+	s.Upstream = up
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+
+	var sent map[string]any
+	if err := json.Unmarshal(up.gotBody, &sent); err != nil {
+		t.Fatalf("upstream body not JSON: %v", err)
+	}
+	// Routed to long-context (proves the big prompt tripped the tier)...
+	if sent["model"] != "lc-model" {
+		t.Errorf("large request routed to %v, want lc-model", sent["model"])
+	}
+	// ...yet the body is otherwise the verbatim client body — the huge content
+	// and the temperature survive; the synthetic routing request never leaked in.
+	if !bytes.Contains(up.gotBody, []byte(marker)) {
+		t.Error("forwarded body lost the original message content")
+	}
+	if sent["temperature"] == nil {
+		t.Error("forwarded body lost the temperature field")
+	}
+}
+
+// routingRequestFromOpenAI builds a byte-faithful routing request without a full
+// translation. Test it directly: content bytes carry across (string and array),
+// tools fold in, model/stream preserved, and a malformed body degrades to
+// Model+Stream only rather than erroring.
+func TestRoutingRequestFromOpenAI(t *testing.T) {
+	body := `{"model":"gpt-4o","stream":true,` +
+		`"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":[{"type":"text","text":"hi there"}]}],` +
+		`"tools":[{"type":"function","function":{"name":"f","description":"d","parameters":{"type":"object"}}}]}`
+	req := routingRequestFromOpenAI([]byte(body), "gpt-4o", true)
+	if req.Model != "gpt-4o" || !req.Stream {
+		t.Errorf("model/stream = %q/%v, want gpt-4o/true", req.Model, req.Stream)
+	}
+	if len(req.Messages) != 2 {
+		t.Fatalf("messages = %d, want 2", len(req.Messages))
+	}
+	if !strings.Contains(string(req.Messages[0].Content), "hello") {
+		t.Errorf("first message content lost the text: %s", req.Messages[0].Content)
+	}
+	if !strings.Contains(string(req.Messages[1].Content), "hi there") {
+		t.Errorf("array-content message lost its text: %s", req.Messages[1].Content)
+	}
+	if len(req.Tools) != 1 || req.Tools[0].Name != "f" {
+		t.Errorf("tools not folded: %+v", req.Tools)
+	}
+
+	// Malformed body ⇒ Model+Stream only, no panic.
+	deg := routingRequestFromOpenAI([]byte("not json"), "mm", false)
+	if deg.Model != "mm" || deg.Stream || len(deg.Messages) != 0 {
+		t.Errorf("malformed body should degrade to model+stream only, got %+v", deg)
 	}
 }
 

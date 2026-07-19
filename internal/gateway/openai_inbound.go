@@ -87,18 +87,14 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Reuse the same model-based router. It selects on model/stream, which a
-	// minimal AnthropicRequest carries — no OpenAI-specific Router method is
-	// needed, and the fuller internal/router selection logic applies unchanged.
-	//
-	// CAVEAT (no bluff): because this AnthropicRequest carries only Model+Stream
-	// (never the OpenAI body's messages), internal/router's content-based
-	// LongContext tier cannot see this request's true size — it estimates ~0
-	// tokens and never trips, so a large /v1/chat/completions body routes to
-	// Router.Default rather than Router.LongContext. See estimateTokenCount's
-	// doc in internal/router/selector.go. Estimating from the OpenAI body is a
-	// documented future item.
-	provider, model, rerr := s.Router.Route(&translate.AnthropicRequest{Model: in.Model, Stream: in.Stream})
+	// Reuse the same model-based router. It selects on model/stream plus a
+	// content-based long-context estimate, all of which routingRequestFromOpenAI
+	// supplies from THIS request's own body — so the OpenAI facade now trips
+	// Router.LongContext for a large prompt exactly as the Anthropic /v1/messages
+	// path does (the two inbound facades route symmetrically). The synthetic
+	// request is used ONLY for routing; the upstream body remains
+	// overrideModelField(body, model) below, forwarded verbatim.
+	provider, model, rerr := s.Router.Route(routingRequestFromOpenAI(body, in.Model, in.Stream))
 	if rerr != nil {
 		writeOpenAIError(c, http.StatusServiceUnavailable, "not_found_error", rerr.Error())
 		return
@@ -143,6 +139,92 @@ func (s *Server) handleOpenAIChatCompletions(c *gin.Context) {
 	defer resp.Body.Close()
 
 	s.relayOpenAIResponse(c, resp, in.Stream, provider.Name, model)
+}
+
+// routingRequestFromOpenAI builds a routing-ONLY AnthropicRequest from an
+// inbound OpenAI chat-completions body, so the router's content-based
+// long-context estimate (estimateTokenCount) sees the request's true size. This
+// closes the gap where the facade routed on Model+Stream alone and never
+// tripped Router.longContext. It is used SOLELY for Route(); it never becomes
+// the upstream body (that is still overrideModelField(body, model), verbatim).
+//
+// The mapping approximates TEXT size, which is what estimateTokenCount (a
+// coarse len/4 estimate) needs: a string content carries across as-is, a
+// multi-part array contributes only its text parts, and each tool folds
+// name/description/parameters across. image_url data-URIs are deliberately
+// EXCLUDED — a base64 image's byte length bears no relation to its token cost,
+// so counting it would falsely trip long-context for an image-heavy, text-light
+// request. A decode error is best-effort: fall back to Model+Stream (the prior
+// behaviour) rather than fail the request over a routing estimate.
+func routingRequestFromOpenAI(body []byte, model string, stream bool) *translate.AnthropicRequest {
+	req := &translate.AnthropicRequest{Model: model, Stream: stream}
+	var oa translate.OpenAIRequest
+	if json.Unmarshal(body, &oa) != nil {
+		return req
+	}
+	for _, m := range oa.Messages {
+		content := openAIRoutingContent(m.Content)
+		if content == nil {
+			continue
+		}
+		req.Messages = append(req.Messages, translate.AnthropicMessage{
+			Role:    m.Role,
+			Content: content,
+		})
+	}
+	for _, t := range oa.Tools {
+		req.Tools = append(req.Tools, translate.AnthropicTool{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			InputSchema: t.Function.Parameters,
+		})
+	}
+	return req
+}
+
+// openAIRoutingContent returns the routing-estimate Content for one OpenAI
+// message: the string content as-is, or — for a multi-part array — ONLY the
+// concatenated text parts (image_url data-URIs excluded; see
+// routingRequestFromOpenAI). Returns nil for empty/absent content. Values here
+// were produced by json.Unmarshal into `any`, so every json.Marshal below is
+// infallible.
+func openAIRoutingContent(content any) json.RawMessage {
+	switch v := content.(type) {
+	case nil:
+		return nil
+	case string:
+		if v == "" {
+			return nil
+		}
+		raw, _ := json.Marshal(v)
+		return raw
+	case []any:
+		var text strings.Builder
+		for _, part := range v {
+			pm, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if t, _ := pm["type"].(string); t != "text" {
+				continue // skip image_url and any non-text part
+			}
+			if s, _ := pm["text"].(string); s != "" {
+				text.WriteString(s)
+			}
+		}
+		if text.Len() == 0 {
+			return nil
+		}
+		raw, _ := json.Marshal(text.String())
+		return raw
+	default:
+		// Some other JSON scalar (number/bool) — count its encoded length.
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return nil
+		}
+		return raw
+	}
 }
 
 // overrideModelField sets the top-level "model" on a JSON object body while
