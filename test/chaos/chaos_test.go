@@ -314,33 +314,44 @@ func TestChaosTransientRecoveryAfterRateLimit(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// The gateway itself does not retry — the caller (Claude Code) does. This
-	// test proves the SAME server, across two independent calls, correctly
-	// reflects both states in turn: the first call must not "stick" the
-	// gateway into a failed condition that poisons the second.
+	// CONTRACT CHANGED — this test was updated deliberately, not to make a
+	// failure go away.
+	//
+	// It previously asserted that a 429 was surfaced to the caller and that
+	// recovery needed a SECOND client call ("the gateway itself does not
+	// retry — the caller does"). Since the retry loop landed, 429 is
+	// classified Retryable and one client call recovers transparently.
+	// Asserting the old behaviour would pin a regression in place rather than
+	// guard against one.
+	//
+	// What still matters, and is preserved: a transient failure must not leave
+	// the gateway in a poisoned state, and recovery happens WITHIN a single
+	// call instead of surfacing an error the caller has to handle itself.
 	s := gwServer(upstream.URL, 3*time.Second)
 
 	runBounded(t, defaultBound, func() {
 		rec1 := postMessages(s, false)
-		if rec1.Code != http.StatusTooManyRequests {
-			t.Fatalf("first call: status = %d, want 429", rec1.Code)
+		if rec1.Code != http.StatusOK {
+			t.Fatalf("first call: status = %d, body = %s, want 200 (a 429 must be retried transparently)",
+				rec1.Code, rec1.Body.String())
 		}
-		errType, _ := assertAnthropicErrorShape(t, rec1.Code, rec1.Body.Bytes())
-		if errType != "rate_limit_error" {
-			t.Errorf("first call: error.type = %q, want rate_limit_error", errType)
+		if !strings.Contains(rec1.Body.String(), "back online") {
+			t.Errorf("first call: recovered content missing: %s", rec1.Body.String())
 		}
 
+		// A later call must still succeed — the retry must leave no sticky
+		// state behind.
 		rec2 := postMessages(s, false)
 		if rec2.Code != http.StatusOK {
-			t.Fatalf("second call (after recovery): status = %d, body = %s, want 200", rec2.Code, rec2.Body.String())
-		}
-		if !strings.Contains(rec2.Body.String(), "back online") {
-			t.Errorf("second call: recovered content missing: %s", rec2.Body.String())
+			t.Fatalf("second call: status = %d, body = %s, want 200", rec2.Code, rec2.Body.String())
 		}
 	})
 
-	if got := atomic.LoadInt64(&calls); got != 2 {
-		t.Fatalf("upstream saw %d calls, want exactly 2", got)
+	// Exactly 3 upstream calls: attempt 1 (429) + its retry (200) for the
+	// first client call, then one for the second. Pinning the exact count
+	// proves the retry fired once and did not spin.
+	if got := atomic.LoadInt64(&calls); got != 3 {
+		t.Fatalf("upstream saw %d calls, want exactly 3 (429 + retry, then one more)", got)
 	}
 }
 

@@ -44,7 +44,28 @@ type Options struct {
 	// UpstreamTimeout bounds a single upstream call. Streaming responses are
 	// exempt: an SSE session legitimately outlives any fixed deadline.
 	UpstreamTimeout time.Duration
+	// MaxAttempts caps the number of upstream attempts a single /v1/messages
+	// request will make: one initial try plus up to MaxAttempts-1 automatic
+	// retries, gated by internal/router's Retryable/Terminal classification
+	// (see messages.go's doUpstreamWithRetry). Zero or negative means
+	// "unset" and falls back to defaultMaxAttempts; tests lower this to
+	// bound how many upstream calls a retry scenario needs to arrange.
+	MaxAttempts int
+	// APIKeys, when non-empty, are the client-presented keys RequireAPIKey
+	// accepts on POST /v1/messages (via "Authorization: Bearer <key>" or
+	// "x-api-key: <key>"). /health and /ready are never gated by this — a
+	// supervisor must always be able to probe liveness/readiness regardless
+	// of auth configuration. An EMPTY (the default, zero-value) list leaves
+	// /v1/messages unauthenticated too: see auth.go's package doc for why
+	// that default is deliberate — the toolkit that drives this gateway
+	// today sends no client key at all, on a loopback-only listener.
+	APIKeys []string
 }
+
+// defaultMaxAttempts is the number of upstream attempts a request gets when
+// Options.MaxAttempts is left unset (see doUpstreamWithRetry in
+// messages.go): one initial try plus up to two automatic retries.
+const defaultMaxAttempts = 3
 
 // Server is the gateway listener.
 type Server struct {
@@ -76,6 +97,9 @@ func New(cfg *config.Config, opt Options) *Server {
 	}
 	if opt.UpstreamTimeout == 0 {
 		opt.UpstreamTimeout = 10 * time.Minute
+	}
+	if opt.MaxAttempts <= 0 {
+		opt.MaxAttempts = defaultMaxAttempts
 	}
 	gin.SetMode(gin.ReleaseMode)
 	eng := gin.New()
@@ -127,7 +151,14 @@ func (s *Server) routes() {
 	})
 
 	// The Anthropic-compatible endpoint Claude Code actually talks to.
-	s.eng.POST("/v1/messages", s.handleMessages)
+	// RequireAPIKey is mounted HERE ONLY, as route-scoped middleware — NOT
+	// via s.eng.Use, which would also gate /health and /ready above and
+	// break liveness/readiness probing the moment APIKeys is configured.
+	// When s.opt.APIKeys is empty (the zero-value default), RequireAPIKey
+	// itself disables auth entirely (see auth.go's package doc): the
+	// toolkit that drives this gateway today sends no client key at all,
+	// and must keep working unchanged.
+	s.eng.POST("/v1/messages", RequireAPIKey(s.opt.APIKeys), s.handleMessages)
 }
 
 // Start binds and serves. It returns once the listener is up; serving

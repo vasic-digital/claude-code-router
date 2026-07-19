@@ -18,10 +18,17 @@
 //     message.tool_calls plus role:"tool" messages keyed by tool_call_id.
 //   - "cache_control" is Anthropic-only. Upstreams that do not know it reject
 //     the whole request, so the cleancache transformer strips it.
+//   - Anthropic image content blocks (base64 or url source) become OpenAI
+//     image_url parts. The plain-string-vs-array choice for message content
+//     is therefore conditional: text-only stays a plain string (some
+//     upstreams hard-reject an array there, see above), but the moment a
+//     message carries an image the content MUST be an array, because an
+//     image cannot be represented inside a plain string at all.
 package translate
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 )
@@ -101,6 +108,18 @@ type OpenAIMessage struct {
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
+// OpenAIContentPart is one element of an OpenAI multi-part message content
+// array. Only "text" and "image_url" are produced by this package.
+type OpenAIContentPart struct {
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *OpenAIImageURL `json:"image_url,omitempty"`
+}
+
+type OpenAIImageURL struct {
+	URL string `json:"url"`
+}
+
 type OpenAIToolCall struct {
 	ID       string       `json:"id"`
 	Type     string       `json:"type"`
@@ -178,6 +197,143 @@ func systemText(raw json.RawMessage) (string, error) {
 	return out, nil
 }
 
+// maxImageDecodedBytes caps how large a single base64-encoded image payload
+// may be once decoded (a generous allowance for a screenshot or photo, not a
+// generic file-transfer channel). Checked BEFORE decoding, so an oversized
+// payload is rejected without ever allocating a buffer for it.
+const maxImageDecodedBytes = 20 * 1024 * 1024 // 20MB
+
+// allowedImageMediaTypes are the four raster formats Anthropic's Messages API
+// documents for image content blocks. Anything else is rejected explicitly
+// here rather than forwarded for the upstream to reject less clearly.
+var allowedImageMediaTypes = map[string]bool{
+	"image/png":  true,
+	"image/jpeg": true,
+	"image/gif":  true,
+	"image/webp": true,
+}
+
+// anthropicImageSource mirrors the two shapes Anthropic's image content block
+// "source" field takes: an inline base64 payload, or a remote URL.
+type anthropicImageSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
+// convertImageBlock turns one Anthropic "image" content block into the OpenAI
+// image_url content part.
+//
+// Errors here never name a message index themselves: this helper is shared
+// between top-level message content and tool_result content (a computer-use
+// tool_result can itself carry a screenshot), and each call site knows which
+// Anthropic message index the error should be attributed to.
+//
+// A malformed or unsupported source is always an explicit, named error —
+// silently dropping an image would let the model answer confidently about a
+// picture it never actually saw, which is the whole reason vision content
+// used to be rejected outright rather than mishandled.
+func convertImageBlock(b ContentBlock) (OpenAIContentPart, error) {
+	if len(b.Source) == 0 {
+		return OpenAIContentPart{}, fmt.Errorf("image block has no source")
+	}
+	var src anthropicImageSource
+	if err := json.Unmarshal(b.Source, &src); err != nil {
+		return OpenAIContentPart{}, fmt.Errorf("image source is malformed: %w", err)
+	}
+
+	switch src.Type {
+	case "base64":
+		if !allowedImageMediaTypes[src.MediaType] {
+			return OpenAIContentPart{}, fmt.Errorf(
+				"image media_type %q is not one of image/png, image/jpeg, image/gif, image/webp", src.MediaType)
+		}
+		if src.Data == "" {
+			return OpenAIContentPart{}, fmt.Errorf("base64 image source has no data")
+		}
+		// Guard against absurd payloads BEFORE decoding: DecodedLen is a
+		// cheap arithmetic bound, so an oversized payload never causes an
+		// unbounded allocation in DecodeString below.
+		if n := base64.StdEncoding.DecodedLen(len(src.Data)); n > maxImageDecodedBytes {
+			return OpenAIContentPart{}, fmt.Errorf(
+				"base64 image payload is ~%d bytes decoded, exceeds the %d-byte cap", n, maxImageDecodedBytes)
+		}
+		if _, err := base64.StdEncoding.DecodeString(src.Data); err != nil {
+			return OpenAIContentPart{}, fmt.Errorf("base64 image data does not decode: %w", err)
+		}
+		return OpenAIContentPart{
+			Type:     "image_url",
+			ImageURL: &OpenAIImageURL{URL: "data:" + src.MediaType + ";base64," + src.Data},
+		}, nil
+	case "url":
+		if src.URL == "" {
+			return OpenAIContentPart{}, fmt.Errorf("url image source has no url")
+		}
+		return OpenAIContentPart{
+			Type:     "image_url",
+			ImageURL: &OpenAIImageURL{URL: src.URL},
+		}, nil
+	default:
+		return OpenAIContentPart{}, fmt.Errorf("unsupported image source type %q", src.Type)
+	}
+}
+
+// convertToolResultContent flattens a tool_result's polymorphic content into
+// either a plain string or an ordered array of OpenAI content parts.
+//
+// The array form is used only when the tool_result carries at least one
+// image (e.g. a screenshot returned by a computer-use tool); otherwise this
+// reproduces the exact pre-vision behaviour byte-for-byte, including the
+// tolerant fallback to the raw content bytes when it isn't decodable as
+// blocks at all — that leniency predates vision support and is not this
+// change's concern to tighten.
+func convertToolResultContent(raw json.RawMessage, msgIdx int) (any, error) {
+	content := string(raw)
+	inner, err := decodeContent(raw)
+	if err != nil {
+		return content, nil
+	}
+
+	hasImage := false
+	for _, ib := range inner {
+		if ib.Type == "image" {
+			hasImage = true
+			break
+		}
+	}
+	if !hasImage {
+		var flat string
+		for _, ib := range inner {
+			if ib.Type == "text" {
+				if flat != "" {
+					flat += "\n"
+				}
+				flat += ib.Text
+			}
+		}
+		if flat != "" {
+			content = flat
+		}
+		return content, nil
+	}
+
+	parts := make([]OpenAIContentPart, 0, len(inner))
+	for _, ib := range inner {
+		switch ib.Type {
+		case "text":
+			parts = append(parts, OpenAIContentPart{Type: "text", Text: ib.Text})
+		case "image":
+			part, err := convertImageBlock(ib)
+			if err != nil {
+				return nil, fmt.Errorf("messages[%d]: tool_result: %w", msgIdx, err)
+			}
+			parts = append(parts, part)
+		}
+	}
+	return parts, nil
+}
+
 // AnthropicToOpenAI converts a Claude Code request into an OpenAI one.
 func AnthropicToOpenAI(in *AnthropicRequest, opt Options) (*OpenAIRequest, error) {
 	model := in.Model
@@ -215,6 +371,11 @@ func AnthropicToOpenAI(in *AnthropicRequest, opt Options) (*OpenAIRequest, error
 		}
 
 		var text string
+		// parts mirrors text (and adds image_url entries) in block order, but
+		// is only USED when the message actually carries an image — see the
+		// hasImage branch below.
+		var parts []OpenAIContentPart
+		var hasImage bool
 		var calls []OpenAIToolCall
 		// tool_result blocks become separate role:"tool" messages, which must
 		// be emitted BEFORE the message that carries the remaining content.
@@ -227,6 +388,7 @@ func AnthropicToOpenAI(in *AnthropicRequest, opt Options) (*OpenAIRequest, error
 					text += "\n"
 				}
 				text += b.Text
+				parts = append(parts, OpenAIContentPart{Type: "text", Text: b.Text})
 			case "tool_use":
 				args := string(b.Input)
 				if args == "" {
@@ -237,36 +399,33 @@ func AnthropicToOpenAI(in *AnthropicRequest, opt Options) (*OpenAIRequest, error
 					Function: OpenAIFnCall{Name: b.Name, Arguments: args},
 				})
 			case "tool_result":
-				content := string(b.Content)
-				// tool_result content is itself polymorphic; flatten to text
-				// so upstreams that demand a string are satisfied.
-				if inner, err := decodeContent(b.Content); err == nil {
-					var flat string
-					for _, ib := range inner {
-						if ib.Type == "text" {
-							if flat != "" {
-								flat += "\n"
-							}
-							flat += ib.Text
-						}
-					}
-					if flat != "" {
-						content = flat
-					}
+				content, err := convertToolResultContent(b.Content, i)
+				if err != nil {
+					return nil, err
 				}
 				toolResults = append(toolResults, OpenAIMessage{
 					Role: "tool", ToolCallID: b.ToolUseID, Content: content,
 				})
 			case "image":
-				// Vision passthrough is not yet implemented. Failing loudly
-				// beats silently dropping the image and returning a confident
-				// answer about a picture the model never saw.
-				return nil, fmt.Errorf("messages[%d]: image content blocks are not supported yet", i)
+				part, err := convertImageBlock(b)
+				if err != nil {
+					return nil, fmt.Errorf("messages[%d]: %w", i, err)
+				}
+				parts = append(parts, part)
+				hasImage = true
 			}
 		}
 
 		out.Messages = append(out.Messages, toolResults...)
-		if text != "" || len(calls) > 0 {
+		switch {
+		case hasImage:
+			// At least one image forces the ARRAY content form: an image
+			// cannot be represented inside a plain string at all. Text-only
+			// messages deliberately do NOT take this path (see the case
+			// below) — some upstreams hard-reject an array for text-only
+			// content, which is exactly why sarvam_proxy.py exists.
+			out.Messages = append(out.Messages, OpenAIMessage{Role: m.Role, ToolCalls: calls, Content: parts})
+		case text != "" || len(calls) > 0:
 			msg := OpenAIMessage{Role: m.Role, ToolCalls: calls}
 			if text != "" {
 				msg.Content = text

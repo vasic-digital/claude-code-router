@@ -105,9 +105,22 @@ func matchMessage(msg translate.OpenAIMessage, exp MessageExpect, i int) []strin
 		}
 	}
 	if exp.ContentContains != nil {
-		s, ok := msg.Content.(string)
-		if !ok || !strings.Contains(s, *exp.ContentContains) {
-			add("content = %v, want it to contain %q", msg.Content, *exp.ContentContains)
+		// Content is polymorphic: a plain string for text-only messages, and a
+		// parts array once a message carries an image. Matching only the
+		// string case reported a mismatch against a Go struct dump
+		// ("[{image_url  0x...}]") even when the conversion was correct, which
+		// left array-content cases unassertable. Fall back to the JSON
+		// encoding so one substring check covers both shapes.
+		var haystack string
+		if s, ok := msg.Content.(string); ok {
+			haystack = s
+		} else if msg.Content != nil {
+			if b, err := json.Marshal(msg.Content); err == nil {
+				haystack = string(b)
+			}
+		}
+		if !strings.Contains(haystack, *exp.ContentContains) {
+			add("content = %s, want it to contain %q", haystack, *exp.ContentContains)
 		}
 	}
 	if exp.ContentNull != nil {

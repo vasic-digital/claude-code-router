@@ -7,36 +7,60 @@
       "id": "malformed-01-numeric-content-is-error",
       "description": "A bare numeric message content is neither a string nor a block array and must be rejected explicitly.",
       "category": "malformed",
-      "tags": ["malformed", "content"],
-      "input": {
-        "model": "m",
-        "messages": [{ "role": "user", "content": 12345 }]
-      },
-      "expect_error": true,
-      "error_contains": "neither string nor block array"
-    },
-    {
-      "id": "malformed-02-image-block-is-explicit-error",
-      "description": "An image content block hits the explicit \"not supported yet\" guard rather than being silently dropped -- failing loudly beats confidently answering about a picture the model never saw.",
-      "category": "malformed",
-      "tags": ["malformed", "image", "unsupported"],
+      "tags": [
+        "malformed",
+        "content"
+      ],
       "input": {
         "model": "m",
         "messages": [
           {
             "role": "user",
-            "content": [{ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBOR" } }]
+            "content": 12345
           }
         ]
       },
       "expect_error": true,
-      "error_contains": "image content blocks are not supported"
+      "error_contains": "neither string nor block array"
+    },
+    {
+      "id": "malformed-02-image-with-invalid-base64-is-explicit-error",
+      "description": "An image block whose base64 payload does not decode fails loudly with a named error rather than being silently dropped -- failing loudly beats confidently answering about a picture the model never saw. (Vision passthrough is now implemented; the guard that once rejected ALL images was replaced by per-field validation, so this fixture's malformed payload is caught by the base64 check.)",
+      "category": "malformed",
+      "tags": [
+        "malformed",
+        "image",
+        "base64"
+      ],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "iVBOR"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": true,
+      "error_contains": "does not decode"
     },
     {
       "id": "malformed-03-max-tokens-wrong-json-type",
       "description": "max_tokens sent as a string fails at JSON decode time with a clear type-mismatch message, before conversion is ever attempted.",
       "category": "malformed",
-      "tags": ["malformed", "decode-error"],
+      "tags": [
+        "malformed",
+        "decode-error"
+      ],
       "input": {
         "model": "m",
         "max_tokens": "a lot",
@@ -49,7 +73,10 @@
       "id": "malformed-04-model-wrong-json-type",
       "description": "model sent as a number fails at decode time.",
       "category": "malformed",
-      "tags": ["malformed", "decode-error"],
+      "tags": [
+        "malformed",
+        "decode-error"
+      ],
       "input": {
         "model": 123,
         "messages": []
@@ -61,7 +88,10 @@
       "id": "malformed-05-messages-wrong-json-type",
       "description": "messages sent as an object instead of an array fails at decode time.",
       "category": "malformed",
-      "tags": ["malformed", "decode-error"],
+      "tags": [
+        "malformed",
+        "decode-error"
+      ],
       "input": {
         "model": "m",
         "messages": {}
@@ -73,11 +103,19 @@
       "id": "malformed-06-system-wrong-json-type-boolean",
       "description": "A boolean system value is rejected the same way as an object or number -- every non-string, non-array shape hits the same guard.",
       "category": "malformed",
-      "tags": ["malformed", "system"],
+      "tags": [
+        "malformed",
+        "system"
+      ],
       "input": {
         "model": "m",
         "system": true,
-        "messages": [{ "role": "user", "content": "hi" }]
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
       },
       "expect_error": true,
       "error_contains": "neither string nor block array"
@@ -86,10 +124,22 @@
       "id": "malformed-07-content-as-bare-object-not-wrapped-in-array",
       "description": "A common real mistake: sending a single content block object directly instead of wrapping it in an array. This must fail the same way an array is required (schema/ergonomics honesty), not silently accept it as one block.",
       "category": "malformed",
-      "tags": ["malformed", "content", "common-mistake"],
+      "tags": [
+        "malformed",
+        "content",
+        "common-mistake"
+      ],
       "input": {
         "model": "m",
-        "messages": [{ "role": "user", "content": { "type": "text", "text": "hi" } }]
+        "messages": [
+          {
+            "role": "user",
+            "content": {
+              "type": "text",
+              "text": "hi"
+            }
+          }
+        ]
       },
       "expect_error": true,
       "error_contains": "neither string nor block array"
@@ -98,72 +148,155 @@
       "id": "malformed-08-tool-input-schema-not-an-object-passes-through",
       "description": "Characterisation case: input_schema is stored as opaque json.RawMessage and is never validated to be a JSON object -- a schema that is actually a bare array is forwarded verbatim as \"parameters\" rather than rejected. A strict upstream will reject the resulting tool definition, but the router itself does not crash or drop the tool.",
       "category": "malformed",
-      "tags": ["malformed", "tool_use", "characterisation"],
+      "tags": [
+        "malformed",
+        "tool_use",
+        "characterisation"
+      ],
       "input": {
         "model": "m",
-        "tools": [{ "name": "t", "input_schema": ["not", "an", "object"] }],
-        "messages": [{ "role": "user", "content": "hi" }]
+        "tools": [
+          {
+            "name": "t",
+            "input_schema": [
+              "not",
+              "an",
+              "object"
+            ]
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
       },
       "expect_error": false,
       "expect": {
         "tools_count": 1,
-        "tools": [{ "name": "t", "parameters_object": false }]
+        "tools": [
+          {
+            "name": "t",
+            "parameters_object": false
+          }
+        ]
       }
     },
     {
       "id": "malformed-09-role-key-missing-defaults-to-empty-string",
       "description": "A message with no \"role\" key at all converts with an empty-string role rather than erroring or defaulting to a guessed role -- worth pinning down since an empty role is exactly what a strict upstream will reject.",
       "category": "malformed",
-      "tags": ["malformed", "role", "characterisation"],
+      "tags": [
+        "malformed",
+        "role",
+        "characterisation"
+      ],
       "input": {
         "model": "m",
-        "messages": [{ "content": "hi" }]
+        "messages": [
+          {
+            "content": "hi"
+          }
+        ]
       },
       "expect_error": false,
       "expect": {
-        "messages": [{ "role": "" }]
+        "messages": [
+          {
+            "role": ""
+          }
+        ]
       }
     },
     {
       "id": "malformed-10-negative-max-tokens-not-validated",
       "description": "Characterisation case: max_tokens accepts a negative integer without complaint -- range validation, if any, is the upstream's job, not the converter's.",
       "category": "malformed",
-      "tags": ["malformed", "max_tokens", "characterisation"],
+      "tags": [
+        "malformed",
+        "max_tokens",
+        "characterisation"
+      ],
       "input": {
         "model": "m",
         "max_tokens": -5,
-        "messages": [{ "role": "user", "content": "hi" }]
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
       },
       "expect_error": false,
-      "expect": { "max_tokens": -5 }
+      "expect": {
+        "max_tokens": -5
+      }
     },
     {
       "id": "malformed-11-unknown-top-level-field-is-ignored",
       "description": "An unrecognised top-level field in the request body is silently ignored by JSON decoding (Go's default unmarshal behaviour), not rejected -- forward/backward compatible with future Anthropic API additions this router doesn't know about yet.",
       "category": "malformed",
-      "tags": ["malformed", "forward-compat"],
+      "tags": [
+        "malformed",
+        "forward-compat"
+      ],
       "input": {
         "model": "m",
-        "some_future_anthropic_field": { "nested": true },
-        "messages": [{ "role": "user", "content": "hi" }]
+        "some_future_anthropic_field": {
+          "nested": true
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
       },
       "expect_error": false,
       "expect": {
-        "messages": [{ "role": "user", "content": "hi" }]
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ]
       }
     },
     {
       "id": "malformed-12-tool-use-id-key-missing",
       "description": "A tool_use block missing the \"id\" key entirely converts with an empty-string call id rather than erroring.",
       "category": "malformed",
-      "tags": ["malformed", "tool_use", "characterisation"],
+      "tags": [
+        "malformed",
+        "tool_use",
+        "characterisation"
+      ],
       "input": {
         "model": "m",
-        "messages": [{ "role": "assistant", "content": [{ "type": "tool_use", "name": "f", "input": {} }] }]
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "name": "f",
+                "input": {}
+              }
+            ]
+          }
+        ]
       },
       "expect_error": false,
       "expect": {
-        "messages": [{ "tool_calls_count": 1, "tool_call_names": ["f"] }]
+        "messages": [
+          {
+            "tool_calls_count": 1,
+            "tool_call_names": [
+              "f"
+            ]
+          }
+        ]
       }
     }
   ]

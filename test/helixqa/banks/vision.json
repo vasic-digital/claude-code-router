@@ -1,0 +1,179 @@
+{
+  "version": "1.0",
+  "name": "vision",
+  "description": "Anthropic image content blocks converted to OpenAI image_url parts. The plain-string-vs-array choice is conditional and load-bearing: text-only content MUST stay a plain string (some upstreams hard-reject an array there, which is why sarvam_proxy.py exists), but any message carrying an image MUST become a parts array, because an image cannot be represented inside a plain string at all.",
+  "test_cases": [
+    {
+      "id": "vision-01-base64-image-becomes-image-url-part",
+      "description": "A base64 image source becomes an OpenAI image_url part carrying a data: URI with the declared media type.",
+      "category": "vision",
+      "tags": ["vision", "base64", "happy-path"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "aGVsbG8="
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [
+          {
+            "role": "user",
+            "content_contains": "data:image/png;base64,aGVsbG8="
+          }
+        ]
+      }
+    },
+    {
+      "id": "vision-02-url-source-passed-through",
+      "description": "A url image source is forwarded as the bare URL, not wrapped in a data: URI.",
+      "category": "vision",
+      "tags": ["vision", "url", "happy-path"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "url",
+                  "url": "https://example.test/cat.png"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [
+          {
+            "role": "user",
+            "content_contains": "https://example.test/cat.png"
+          }
+        ]
+      }
+    },
+    {
+      "id": "vision-03-image-and-text-both-survive",
+      "description": "When a message mixes text and an image, BOTH must reach the upstream. Dropping either half would let the model answer about a picture it never saw, or lose the question about it.",
+      "category": "vision",
+      "tags": ["vision", "mixed"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              { "type": "text", "text": "what is in this picture" },
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/jpeg",
+                  "data": "aGVsbG8="
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [
+          {
+            "role": "user",
+            "content_contains": "what is in this picture"
+          }
+        ]
+      }
+    },
+    {
+      "id": "vision-04-unknown-media-type-is-an-error",
+      "description": "An undeclared media type is rejected by name rather than forwarded and left for the upstream to reject opaquely.",
+      "category": "vision",
+      "tags": ["vision", "malformed"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/tiff",
+                  "data": "aGVsbG8="
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": true,
+      "error_contains": "media_type"
+    },
+    {
+      "id": "vision-05-unknown-source-type-is-an-error",
+      "description": "An unrecognised image source type fails loudly instead of being silently skipped.",
+      "category": "vision",
+      "tags": ["vision", "malformed"],
+      "input": {
+        "model": "m",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": { "type": "carrier-pigeon", "data": "aGVsbG8=" }
+              }
+            ]
+          }
+        ]
+      },
+      "expect_error": true,
+      "error_contains": "messages[0]"
+    },
+    {
+      "id": "vision-06-text-only-still-a-plain-string",
+      "description": "REGRESSION GUARD. Adding vision must not change text-only messages: they stay a plain JSON string. Emitting an array here is exactly the failure sarvam_proxy.py exists to work around (\"Input should be a valid string\").",
+      "category": "vision",
+      "tags": ["vision", "regression"],
+      "input": {
+        "model": "m",
+        "messages": [
+          { "role": "user", "content": [{ "type": "text", "text": "no image here" }] }
+        ]
+      },
+      "expect_error": false,
+      "expect": {
+        "messages_count": 1,
+        "messages": [
+          {
+            "role": "user",
+            "content": "no image here"
+          }
+        ]
+      }
+    }
+  ]
+}

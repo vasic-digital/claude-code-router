@@ -10,10 +10,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
+	"github.com/vasic-digital/claude-code-router/internal/router"
 	"github.com/vasic-digital/claude-code-router/internal/translate"
 )
 
@@ -253,23 +255,152 @@ func (s *Server) handleMessages(c *gin.Context) {
 		defer cancel()
 	}
 
-	resp, err := s.Upstream.Do(ctx, provider, outBody)
-	if err != nil {
-		writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("upstream request failed: %v", err))
+	resp, ok := s.doUpstreamWithRetry(c, ctx, provider, outBody)
+	if !ok {
+		// A terminal failure, an exhausted retry budget, or a cancelled
+		// context has already written the response — nothing left to do.
 		return
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		forwardUpstreamError(c, resp)
-		return
-	}
 
 	if in.Stream {
 		streamAnthropicSSE(c, resp.Body, model)
 		return
 	}
 	respondNonStreaming(c, resp.Body, model)
+}
+
+// ---------- Retry loop ----------
+//
+// internal/router classifies failures (Retryable vs Terminal) and computes
+// backoff, but proxy.Client.Do — reached here via s.Upstream.Do — makes
+// exactly ONE HTTP attempt and knows nothing about retrying. This is the
+// loop that actually drives those classifiers: it calls s.Upstream.Do up to
+// s.opt.MaxAttempts times, deciding after each attempt whether to try again
+// (and how long to wait first) purely from router.ClassifyStatus /
+// router.ClassifyTransportError.
+//
+// The retryDelayAfter* indirections below exist so tests can swap in a
+// near-zero delay and exercise the loop's control flow (attempt counts,
+// terminal-vs-retryable branching, context cancellation) without actually
+// waiting out router's real backoff floor (>=1s) on every retry scenario.
+// Production code always runs with these pointed at the real router
+// functions.
+var (
+	retryDelayAfterStatus       = router.FallbackRetryDelayAfterStatus
+	retryDelayAfterNetworkError = router.FallbackRetryDelayAfterNetworkError
+)
+
+// doUpstreamWithRetry calls s.Upstream.Do against provider, retrying on a
+// Retryable failure (see router.ClassifyStatus / router.ClassifyTransportError)
+// up to s.opt.MaxAttempts total attempts, and NEVER retrying a Terminal one
+// (a 401 retried is quota burned for a request that will fail identically
+// every time).
+//
+// It returns (resp, true) on a successful (status < 400) response, which the
+// caller owns and must resp.Body.Close(). It returns (nil, false) once an
+// error has already been written to c via writeAnthropicError or
+// forwardUpstreamError — covering a Terminal failure, an exhausted retry
+// budget, or ctx ending (client disconnect, or the non-streaming request
+// deadline) while waiting to retry.
+//
+// The critical invariant this function exists to uphold: it NEVER writes a
+// single response byte to c except on that final, no-more-retries outcome.
+// Every intermediate failed attempt is silently discarded (its body drained
+// and closed, nothing sent to the client) so the caller is free to retry
+// with a clean slate. Concretely, this means a streaming response is only
+// ever handed to streamAnthropicSSE — which commits the HTTP status and
+// begins flushing SSE events immediately — AFTER this function has already
+// returned its final, no-further-retries answer; retrying after that point
+// would corrupt an in-flight SSE conversation Claude Code is already
+// consuming, and cannot happen because this function has, by construction,
+// no further opportunity to run once streamAnthropicSSE starts.
+func (s *Server) doUpstreamWithRetry(c *gin.Context, ctx context.Context, provider config.Provider, body []byte) (*http.Response, bool) {
+	maxAttempts := s.opt.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultMaxAttempts
+	}
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			// The client disconnected, or (non-streaming only) the overall
+			// request deadline already passed, before this attempt even
+			// started. Hammering the upstream further would serve no one.
+			writeAnthropicError(c, http.StatusGatewayTimeout, "api_error",
+				fmt.Sprintf("request context ended before attempt %d: %v", attempt+1, err))
+			return nil, false
+		}
+
+		resp, err := s.Upstream.Do(ctx, provider, body)
+		if err != nil {
+			if router.ClassifyTransportError(err) == router.Retryable && attempt+1 < maxAttempts {
+				if !sleepForRetry(ctx, retryDelayAfterNetworkError(attempt)) {
+					writeAnthropicError(c, http.StatusGatewayTimeout, "api_error",
+						fmt.Sprintf("request context ended while waiting to retry: %v", ctx.Err()))
+					return nil, false
+				}
+				continue
+			}
+			writeAnthropicError(c, http.StatusBadGateway, "api_error", fmt.Sprintf("upstream request failed: %v", err))
+			return nil, false
+		}
+
+		if resp.StatusCode < 400 {
+			return resp, true
+		}
+
+		if router.ClassifyStatus(resp.StatusCode) == router.Retryable && attempt+1 < maxAttempts {
+			retryAfter := resp.Header.Get("Retry-After")
+			// This attempt is being discarded outright, not just its status
+			// code: drain (bounded — this is a body we are throwing away,
+			// not relaying) and close so the connection can be reused and
+			// nothing here leaks.
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+			_ = resp.Body.Close()
+			if !sleepForRetry(ctx, retryDelayAfterStatus(attempt, retryAfter)) {
+				writeAnthropicError(c, http.StatusGatewayTimeout, "api_error",
+					"request context ended while waiting to retry")
+				return nil, false
+			}
+			continue
+		}
+
+		// Either Terminal (never retry — see the package doc on
+		// router.Retryable/Terminal) or Retryable but out of attempts:
+		// either way, report exactly what upstream said.
+		forwardUpstreamError(c, resp)
+		_ = resp.Body.Close()
+		return nil, false
+	}
+
+	// Unreachable in practice: every branch above returns before the loop
+	// can exit on its own condition — a retryable failure only `continue`s
+	// when attempt+1 < maxAttempts guarantees another iteration is still in
+	// range. This exists solely to give the function a terminating return
+	// the compiler can see.
+	writeAnthropicError(c, http.StatusInternalServerError, "api_error", "retry loop ended without a result (this is a bug)")
+	return nil, false
+}
+
+// sleepForRetry blocks for d or until ctx is done, whichever comes first. It
+// reports false when ctx ended the wait early — the caller must not retry in
+// that case, since whoever would receive the retry's result is already gone
+// (client disconnect) or the request's own deadline has passed.
+//
+// d <= 0 is treated as "no wait": it still checks ctx so a context that is
+// already done is never silently treated as fine to proceed with.
+func sleepForRetry(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // writeAnthropicError writes {"type":"error","error":{"type":...,"message":...}}
