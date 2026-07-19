@@ -697,11 +697,17 @@ func (s *Server) relayAnthropicResponse(c *gin.Context, resp *http.Response, str
 	if stream {
 		// Shared line-by-line SSE relay (see relayRawStream in
 		// openai_inbound.go); the upstream's Anthropic SSE events reach the
-		// client unchanged, as they arrive. Token usage is NOT recorded here:
-		// the SSE is relayed byte-for-byte without parsing, so the per-event
-		// message_delta usage is never decoded — a documented gap for streaming
-		// Anthropic-native traffic; the non-streaming path below IS recorded.
-		relayRawStream(c.Writer, resp.Body)
+		// client unchanged, as they arrive. The stream is teed through
+		// anthropicStreamUsageScanner so message_start (input_tokens) and
+		// message_delta (output_tokens) usage is recorded once at stream end —
+		// the observe happens AFTER each verbatim write, so client bytes are
+		// unaffected. Anthropic-native streams always carry usage, so this is
+		// reliable (unlike the OpenAI facade, which depends on the client
+		// requesting stream_options.include_usage).
+		in, out := relayRawStream(c.Writer, resp.Body, &anthropicStreamUsageScanner{})
+		if s.Metrics != nil {
+			s.Metrics.RecordTokens(provider, model, in, out)
+		}
 		return
 	}
 

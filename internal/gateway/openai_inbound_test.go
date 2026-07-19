@@ -141,6 +141,118 @@ func metricLinePresent(exposition, want string) bool {
 	return false
 }
 
+// The OpenAI facade's STREAMING path must also record token usage (from the
+// terminal usage chunk) at parity with non-streaming — and must still relay the
+// SSE byte-for-byte (the tee observes chunks after they are written).
+func TestOpenAIInboundStreamingRecordsTokens(t *testing.T) {
+	upstreamSSE := `data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}` + "\n\n" +
+		`data: {"id":"chatcmpl-1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":17,"completion_tokens":9}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	up := &recordingUpstream{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+	}}
+	s := New(openaiCfg(""), Options{})
+	s.Upstream = up
+
+	clientBody := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(clientBody))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	// Verbatim relay preserved despite the usage tee.
+	if got := rec.Body.String(); got != upstreamSSE {
+		t.Errorf("streaming SSE not relayed verbatim:\n got: %q\nwant: %q", got, upstreamSSE)
+	}
+
+	var buf bytes.Buffer
+	s.Metrics.WriteExposition(&buf)
+	out := buf.String()
+	if !metricLinePresent(out, `ccr_gen_ai_input_tokens_total{provider="oai",model="routed-model"} 17`) {
+		t.Errorf("streaming input tokens not recorded (want 17):\n%s", out)
+	}
+	if !metricLinePresent(out, `ccr_gen_ai_output_tokens_total{provider="oai",model="routed-model"} 9`) {
+		t.Errorf("streaming output tokens not recorded (want 9):\n%s", out)
+	}
+}
+
+// A streaming OpenAI response WITHOUT a usage chunk (client did not request
+// stream_options.include_usage) records nothing — a legitimate best-effort miss,
+// not a spurious zero-labelled series or an error.
+func TestOpenAIInboundStreamingNoUsageRecordsNothing(t *testing.T) {
+	upstreamSSE := `data: {"id":"c","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	up := &recordingUpstream{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+	}}
+	s := New(openaiCfg(""), Options{})
+	s.Upstream = up
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var buf bytes.Buffer
+	s.Metrics.WriteExposition(&buf)
+	// The family's # TYPE header always prints; assert no labelled SERIES exists
+	// (a data line carries a `{` — RecordTokens ignores the 0/0 counts, so none
+	// is created).
+	if strings.Contains(buf.String(), `ccr_gen_ai_input_tokens_total{provider="oai"`) {
+		t.Errorf("no-usage stream must not emit a token series:\n%s", buf.String())
+	}
+}
+
+// Pure scanner tests — no server, exercising the tee's parsing directly.
+func TestOpenAIStreamUsageScanner(t *testing.T) {
+	var sc openAIStreamUsageScanner
+	for _, line := range []string{
+		`data: {"choices":[{"delta":{"content":"hi"}}]}`,
+		`event: ping`,
+		`data: not-json`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":8}}`,
+		`data: [DONE]`,
+	} {
+		sc.observe(line + "\n")
+	}
+	if in, out := sc.totals(); in != 42 || out != 8 {
+		t.Errorf("openAI scanner totals = %d/%d, want 42/8", in, out)
+	}
+
+	var empty openAIStreamUsageScanner
+	empty.observe(`data: {"choices":[{"delta":{"content":"x"}}]}` + "\n")
+	if in, out := empty.totals(); in != 0 || out != 0 {
+		t.Errorf("no-usage scanner totals = %d/%d, want 0/0", in, out)
+	}
+}
+
+func TestAnthropicStreamUsageScanner(t *testing.T) {
+	var sc anthropicStreamUsageScanner
+	for _, line := range []string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":31,"output_tokens":0}}}`,
+		`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}`,
+		`data: {"type":"message_delta","usage":{"output_tokens":7}}`,
+		`data: {"type":"message_delta","usage":{"output_tokens":14}}`,
+		`data: {"type":"message_stop"}`,
+	} {
+		sc.observe(line + "\n")
+	}
+	// input from message_start; output is the LAST positive delta (cumulative).
+	if in, out := sc.totals(); in != 31 || out != 14 {
+		t.Errorf("anthropic scanner totals = %d/%d, want 31/14", in, out)
+	}
+}
+
 func TestOpenAIInboundPassthroughStreaming(t *testing.T) {
 	upstreamSSE := `data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n" +
 		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +

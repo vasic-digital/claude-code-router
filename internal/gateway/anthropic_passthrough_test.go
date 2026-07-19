@@ -154,6 +154,54 @@ func TestAnthropicNativePassthroughStreaming(t *testing.T) {
 	}
 }
 
+// The Anthropic-native streaming relay must record token usage from the stream
+// itself: input_tokens from message_start, output_tokens from the (cumulative)
+// message_delta — while still relaying the SSE byte-for-byte.
+func TestAnthropicNativeStreamingRecordsTokens(t *testing.T) {
+	upstreamSSE := "event: message_start\n" +
+		`data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-x","usage":{"input_tokens":23,"output_tokens":1}}}` + "\n\n" +
+		"event: content_block_delta\n" +
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}` + "\n\n" +
+		"event: message_delta\n" +
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":12}}` + "\n\n" +
+		"event: message_stop\n" +
+		`data: {"type":"message_stop"}` + "\n\n"
+
+	up := &recordingUpstream{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+	}}
+	s := New(anthropicCfg(config.ProtocolAnthropic), Options{})
+	s.Upstream = up
+
+	clientBody := `{"model":"claude-sent","max_tokens":16,"stream":true,` +
+		`"messages":[{"role":"user","content":"hello"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(clientBody))
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if got := rec.Body.String(); got != upstreamSSE {
+		t.Errorf("SSE not relayed verbatim under the usage tee:\n got: %q\nwant: %q", got, upstreamSSE)
+	}
+
+	var buf bytes.Buffer
+	s.Metrics.WriteExposition(&buf)
+	out := buf.String()
+	// anthropicCfg routes to provider "anthropic" model "routed-model" (see the
+	// non-streaming passthrough test); assert on the substrings to stay robust to
+	// the exact resolved names.
+	if !strings.Contains(out, "ccr_gen_ai_input_tokens_total{") || !strings.Contains(out, "} 23") {
+		t.Errorf("anthropic-native streaming input tokens not recorded (want 23):\n%s", out)
+	}
+	if !strings.Contains(out, "ccr_gen_ai_output_tokens_total{") || !strings.Contains(out, "} 12") {
+		t.Errorf("anthropic-native streaming output tokens not recorded (want 12):\n%s", out)
+	}
+}
+
 // A provider whose api_base_url is the canonical Anthropic endpoint but which
 // sets NO explicit protocol must ALSO take the passthrough path, via inference.
 // This proves the gateway consults ResolvedProtocol (inference included), not a

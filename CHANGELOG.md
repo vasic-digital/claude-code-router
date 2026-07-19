@@ -4,9 +4,35 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning is SemVer with a `v` prefix (see [`docs/RELEASE.md`](docs/RELEASE.md)).
-`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3` (below) is the current
-release. Entries are drawn from this repository's real `git log` history —
-nothing here is speculative.
+`v0.1.0`–`v0.4.2` were tagged 2026-07-19; `v0.4.3`–`v0.4.4` (below) are the
+current releases. Entries are drawn from this repository's real `git log`
+history — nothing here is speculative.
+
+## [0.4.4] - 2026-07-20
+
+Streaming responses now record token usage, closing the last gen_ai
+observability gap. No change to relayed bytes or any served behavior.
+
+### Fixed
+
+- Streaming responses now record `ccr_gen_ai_input_tokens_total` /
+  `ccr_gen_ai_output_tokens_total`, at parity with non-streaming. Two relay
+  paths that previously copied SSE byte-for-byte without decoding usage — the
+  Anthropic-native streaming relay (`relayAnthropicResponse`) and the OpenAI
+  facade streaming relay (`relayOpenAIResponse`) — now tee the stream through a
+  `streamUsageScanner` that extracts usage as chunks fly by and records once at
+  stream end. The client bytes are unchanged (the scanner observes each chunk
+  only after it is written and flushed), and recording is nil-safe, secret-free
+  (provider/model/int counts only), and single (no double-count with the
+  already-recording OpenAI→Anthropic translation path `streamAnthropicSSE`).
+  Anthropic-native streams always carry usage (message_start + message_delta),
+  so recording is reliable there; the OpenAI facade forwards the client body
+  verbatim and never injects `stream_options.include_usage`, so a client that
+  did not request usage legitimately records 0 (best-effort, documented). Pinned
+  by pure scanner unit tests, gateway streaming tests (exact token values +
+  verbatim-relay preserved with a usage chunk present + no-usage→records-nothing),
+  and the live `liveprod` matrix (a streaming `/v1/chat/completions` call whose
+  13/5 usage moves the counters end-to-end).
 
 ## [0.4.3] - 2026-07-19
 

@@ -171,15 +171,19 @@ func overrideModelField(raw []byte, model string) ([]byte, error) {
 // Like every other response path here, it copies NO upstream header — the
 // response is rebuilt from the body alone.
 //
-// On the non-streaming path it also records token usage for observability,
-// parsing the OpenAI usage block best-effort from the SAME buffered body it
-// relays (the body is still emitted verbatim — parsing is read-only). Streaming
-// is NOT recorded: relayRawStream copies the SSE byte-for-byte without decoding
-// the per-chunk usage, a documented gap symmetric with the Anthropic-native
-// streaming relay (see relayAnthropicResponse).
+// Both paths record token usage for observability. Non-streaming parses the
+// OpenAI usage block from the SAME buffered body it relays (read-only). Streaming
+// tees the SSE through openAIStreamUsageScanner as it forwards each chunk
+// verbatim, recording once at stream end. Best-effort: an OpenAI stream only
+// carries a usage chunk when the client requested stream_options.include_usage —
+// the facade forwards the body verbatim and never injects it, so a client that
+// did not ask for usage legitimately records 0 (documented, not a bug).
 func (s *Server) relayOpenAIResponse(c *gin.Context, resp *http.Response, stream bool, provider, model string) {
 	if stream {
-		relayRawStream(c.Writer, resp.Body)
+		in, out := relayRawStream(c.Writer, resp.Body, &openAIStreamUsageScanner{})
+		if s.Metrics != nil {
+			s.Metrics.RecordTokens(provider, model, in, out)
+		}
 		return
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamResponseBytes))
@@ -200,11 +204,105 @@ func (s *Server) relayOpenAIResponse(c *gin.Context, resp *http.Response, stream
 	c.Data(http.StatusOK, "application/json", raw)
 }
 
+// streamUsageScanner observes each raw SSE chunk as relayRawStream forwards it
+// verbatim, extracting token usage without buffering the stream. totals() is
+// read ONCE after the relay loop ends, so at most one RecordTokens call happens
+// per request — no double-count.
+type streamUsageScanner interface {
+	observe(chunk string)
+	totals() (input, output int)
+}
+
+// sseData returns the JSON payload of an SSE `data:` line, or "" for any other
+// line (event:/id: fields, blanks, or the terminal "[DONE]" sentinel). Parsing
+// is best-effort: a malformed line from an untrusted upstream yields "" and is
+// skipped, never aborting the relay.
+func sseData(chunk string) string {
+	line := strings.TrimSpace(chunk)
+	if !strings.HasPrefix(line, "data:") {
+		return ""
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return ""
+	}
+	return payload
+}
+
+// openAIStreamUsageScanner extracts prompt/completion tokens from the terminal
+// usage chunk of an OpenAI chat-completions SSE stream. The last positive value
+// of each wins; a stream without a usage chunk yields 0/0.
+type openAIStreamUsageScanner struct{ input, output int }
+
+func (s *openAIStreamUsageScanner) observe(chunk string) {
+	payload := sseData(chunk)
+	if payload == "" {
+		return
+	}
+	var c openAIStreamChunk
+	if json.Unmarshal([]byte(payload), &c) != nil || c.Usage == nil {
+		return
+	}
+	if c.Usage.PromptTokens > 0 {
+		s.input = c.Usage.PromptTokens
+	}
+	if c.Usage.CompletionTokens > 0 {
+		s.output = c.Usage.CompletionTokens
+	}
+}
+
+func (s *openAIStreamUsageScanner) totals() (int, int) { return s.input, s.output }
+
+// anthropicUsageEvent is the minimal shape needed to read usage out of an
+// Anthropic-native SSE stream: input_tokens arrive in message_start
+// (message.usage), output_tokens in message_delta (usage).
+type anthropicUsageEvent struct {
+	Type    string `json:"type"`
+	Message *struct {
+		Usage *anthropicUsage `json:"usage"`
+	} `json:"message"`
+	Usage *anthropicUsage `json:"usage"`
+}
+
+// anthropicStreamUsageScanner extracts usage from an Anthropic-native SSE
+// stream. The last positive input/output seen wins (message_delta usage is
+// cumulative in the Anthropic spec, so the final delta carries the total).
+type anthropicStreamUsageScanner struct{ input, output int }
+
+func (s *anthropicStreamUsageScanner) observe(chunk string) {
+	payload := sseData(chunk)
+	if payload == "" {
+		return
+	}
+	var ev anthropicUsageEvent
+	if json.Unmarshal([]byte(payload), &ev) != nil {
+		return
+	}
+	if ev.Message != nil && ev.Message.Usage != nil && ev.Message.Usage.InputTokens > 0 {
+		s.input = ev.Message.Usage.InputTokens
+	}
+	if ev.Usage != nil {
+		if ev.Usage.InputTokens > 0 {
+			s.input = ev.Usage.InputTokens
+		}
+		if ev.Usage.OutputTokens > 0 {
+			s.output = ev.Usage.OutputTokens
+		}
+	}
+}
+
+func (s *anthropicStreamUsageScanner) totals() (int, int) { return s.input, s.output }
+
 // relayRawStream copies an SSE body through to the client line by line,
 // flushing each line so events arrive as they are produced. Shared by the
 // Anthropic-native and OpenAI relay paths. Only the Content-Type/cache headers
 // this gateway itself sets are written; no upstream header is forwarded.
-func relayRawStream(w gin.ResponseWriter, r io.Reader) {
+//
+// If scan is non-nil it observes each chunk (after the verbatim write, so the
+// client bytes are never affected) and relayRawStream returns the accumulated
+// (input, output) token totals for the caller to record once; a nil scan
+// returns 0, 0.
+func relayRawStream(w gin.ResponseWriter, r io.Reader, scan streamUsageScanner) (input, output int) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -216,14 +314,21 @@ func relayRawStream(w gin.ResponseWriter, r io.Reader) {
 		chunk, readErr := reader.ReadString('\n')
 		if len(chunk) > 0 {
 			if _, werr := io.WriteString(w, chunk); werr != nil {
-				return // client hung up; nothing more we can do
+				break // client hung up; nothing more we can do
 			}
 			w.Flush()
+			if scan != nil {
+				scan.observe(chunk)
+			}
 		}
 		if readErr != nil {
-			return
+			break
 		}
 	}
+	if scan != nil {
+		return scan.totals()
+	}
+	return 0, 0
 }
 
 // ---------- Error-envelope strategy ----------

@@ -137,13 +137,14 @@ func testEndpointSurface(t *testing.T) {
 // the EXACT RED + gen_ai deltas.
 //
 // METRIC PARITY (fixed): the OpenAI inbound facade (handleOpenAIChatCompletions)
-// now records RecordUpstream AND RecordTokens on its non-streaming path, exactly
-// like the Anthropic path (handleMessages) — closing a prior attribution gap
-// where a /v1/chat/completions call reached the upstream but contributed nothing
-// to ccr_gen_ai_upstream_requests_total or the token counters. So all THREE
-// upstream calls are now attributed: upstream delta == 3, and the token counters
-// include the facade's non-stream response (11/7) on top of the two /v1/messages
-// calls (non-stream 11/7 + stream 13/5). This subtest pins that parity live.
+// now records RecordUpstream AND RecordTokens — on BOTH its non-streaming path
+// (parsed usage block) and its streaming path (usage tee in relayRawStream) —
+// exactly like the Anthropic path, closing a prior gap where /v1/chat/completions
+// calls reached the upstream but contributed nothing to the gen_ai counters. So
+// all FOUR upstream calls are attributed: upstream delta == 4, with token
+// counters covering /v1/messages non-stream (11/7) + stream (13/5) and the facade
+// non-stream (11/7) + stream (13/5) = input 48, output 24. This subtest pins that
+// parity — including the streaming token-tee — live.
 func testConfigPlain(t *testing.T) {
 	fake := newFakeUpstream(t)
 	fake.handle("main", openAIEcho("chatcmpl-main", "plain answer"))
@@ -169,10 +170,18 @@ func testConfigPlain(t *testing.T) {
 	mustEqualInt(t, "plain chat/completions status", r3.status, 200)
 	mustContain(t, "plain chat/completions raw openai", r3.body, `"object":"chat.completion"`)
 
+	// r4: a STREAMING facade call. Its token usage (13/5, from openAIEcho's
+	// stream branch) must also be recorded now — the streaming token-accounting
+	// fix — via the usage tee in relayRawStream, while the SSE is relayed
+	// verbatim.
+	r4 := post(t, si.gwURL("/v1/chat/completions"), openAIBody("m", "hi", `,"stream":true`), nil)
+	mustEqualInt(t, "plain chat/completions stream status", r4.status, 200)
+	mustContain(t, "plain chat/completions stream chunk", r4.body, "chat.completion.chunk")
+
 	after := scrapeMetrics(t, si)
 
-	// All three calls reached the upstream.
-	mustEqualInt(t, "plain: upstream reached by all 3 requests", fake.count("main"), 3)
+	// All four calls reached the upstream.
+	mustEqualInt(t, "plain: upstream reached by all 4 requests", fake.count("main"), 4)
 
 	// RED: exact per-path request counts.
 	mustEqualFloat(t, "RED ccr_http_requests_total{POST,/v1/messages,200} delta",
@@ -180,23 +189,24 @@ func testConfigPlain(t *testing.T) {
 			metricValue(before, "ccr_http_requests_total", map[string]string{"method": "POST", "path": "/v1/messages", "status": "200"}), 2)
 	mustEqualFloat(t, "RED ccr_http_requests_total{POST,/v1/chat/completions,200} delta",
 		metricValue(after, "ccr_http_requests_total", map[string]string{"method": "POST", "path": "/v1/chat/completions", "status": "200"})-
-			metricValue(before, "ccr_http_requests_total", map[string]string{"method": "POST", "path": "/v1/chat/completions", "status": "200"}), 1)
+			metricValue(before, "ccr_http_requests_total", map[string]string{"method": "POST", "path": "/v1/chat/completions", "status": "200"}), 2)
 
-	// gen_ai upstream attribution: ALL THREE calls are attributed now — the two
-	// /v1/messages calls and the OpenAI-facade /v1/chat/completions call (metric
-	// parity fix). See METRIC PARITY note above.
+	// gen_ai upstream attribution: ALL FOUR calls are attributed now — the two
+	// /v1/messages calls and both OpenAI-facade calls (non-stream + stream), at
+	// parity with the Anthropic path. See METRIC PARITY note above.
 	mustEqualFloat(t, "gen_ai upstream_requests_total{main,main-model} delta (both paths)",
 		metricValue(after, "ccr_gen_ai_upstream_requests_total", map[string]string{"provider": "main", "model": "main-model"})-
-			metricValue(before, "ccr_gen_ai_upstream_requests_total", map[string]string{"provider": "main", "model": "main-model"}), 3)
+			metricValue(before, "ccr_gen_ai_upstream_requests_total", map[string]string{"provider": "main", "model": "main-model"}), 4)
 
 	// Tokens: /v1/messages non-stream (11/7) + stream (13/5) + facade
-	// chat/completions non-stream (11/7) = input 35, output 19.
+	// chat/completions non-stream (11/7) + facade stream (13/5) = input 48,
+	// output 24. The two streaming calls prove the usage-tee accounting.
 	mustEqualFloat(t, "gen_ai input_tokens_total{main,main-model} delta",
 		metricValue(after, "ccr_gen_ai_input_tokens_total", map[string]string{"provider": "main", "model": "main-model"})-
-			metricValue(before, "ccr_gen_ai_input_tokens_total", map[string]string{"provider": "main", "model": "main-model"}), 35)
+			metricValue(before, "ccr_gen_ai_input_tokens_total", map[string]string{"provider": "main", "model": "main-model"}), 48)
 	mustEqualFloat(t, "gen_ai output_tokens_total{main,main-model} delta",
 		metricValue(after, "ccr_gen_ai_output_tokens_total", map[string]string{"provider": "main", "model": "main-model"})-
-			metricValue(before, "ccr_gen_ai_output_tokens_total", map[string]string{"provider": "main", "model": "main-model"}), 19)
+			metricValue(before, "ccr_gen_ai_output_tokens_total", map[string]string{"provider": "main", "model": "main-model"}), 24)
 }
 
 // ---------- Config (b/c): cache backends — a HIT skips the upstream ----------
