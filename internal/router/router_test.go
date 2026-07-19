@@ -1,12 +1,44 @@
 package router
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
 	"github.com/vasic-digital/claude-code-router/internal/translate"
 )
+
+// fourRouteCfg has a distinct provider behind each of the four routes so a test
+// can tell which route fired purely from the resolved provider name.
+func fourRouteCfg() *config.Config {
+	return &config.Config{
+		Providers: []config.Provider{
+			{Name: "main-prov", APIBaseURL: "https://main/v1/chat/completions", APIKey: "k1", Models: []string{"main-model-a", "main-model-b"}},
+			{Name: "bg-prov", APIBaseURL: "https://bg/v1/chat/completions", APIKey: "k2", Models: []string{"bg-model-a"}},
+			{Name: "think-prov", APIBaseURL: "https://think/v1/chat/completions", APIKey: "k3", Models: []string{"think-model"}},
+			{Name: "lc-prov", APIBaseURL: "https://lc/v1/chat/completions", APIKey: "k4", Models: []string{"lc-model"}},
+		},
+		Router: config.Route{
+			Default:     "main-prov,main-model-a",
+			Background:  "bg-prov,bg-model-a",
+			Think:       "think-prov,think-model",
+			LongContext: "lc-prov,lc-model",
+		},
+	}
+}
+
+// bigContentRequest builds a request whose single message is large enough that
+// estimateTokenCount clears DefaultLongContextThreshold. model lets a caller
+// also set the tier (e.g. a haiku id) to exercise the precedence interplay.
+func bigContentRequest(model string) *translate.AnthropicRequest {
+	// A JSON string of this many characters estimates to > threshold tokens.
+	body := `"` + strings.Repeat("x", (DefaultLongContextThreshold+1000)*charsPerToken) + `"`
+	return &translate.AnthropicRequest{
+		Model:    model,
+		Messages: []translate.AnthropicMessage{{Role: "user", Content: json.RawMessage(body)}},
+	}
+}
 
 func twoProviderCfg() *config.Config {
 	return &config.Config{
@@ -218,5 +250,206 @@ func TestTransformerOptionsMapsProviderFlags(t *testing.T) {
 				t.Errorf("TransformerOptions = %+v, want %+v", got, tc.want)
 			}
 		})
+	}
+}
+
+// ---------- Think / LongContext override precedence ----------
+
+// TestChooseRoutePrecedence pins the full route-override precedence directly on
+// chooseRoute, so the think signal (which no production request carries today —
+// see requestWantsThinking) is supplied explicitly rather than through a real
+// request body. The rest of the matrix (longContext, haiku, default, and the
+// regression case where think/longContext are unset) is covered here too.
+func TestChooseRoutePrecedence(t *testing.T) {
+	all := config.Route{
+		Default:     "main-prov,main-model-a",
+		Background:  "bg-prov,bg-model-a",
+		Think:       "think-prov,think-model",
+		LongContext: "lc-prov,lc-model",
+	}
+	cases := []struct {
+		name  string
+		route config.Route
+		sig   routeSignals
+		want  string
+	}{
+		{"ordinary -> default", all, routeSignals{}, "main-prov,main-model-a"},
+		{"thinking with think set -> think", all, routeSignals{thinking: true}, "think-prov,think-model"},
+		{
+			"thinking with think unset -> default (unchanged)",
+			config.Route{Default: "main-prov,main-model-a"},
+			routeSignals{thinking: true},
+			"main-prov,main-model-a",
+		},
+		{"longContext with lc set -> longContext", all, routeSignals{longContext: true}, "lc-prov,lc-model"},
+		{
+			"longContext with lc unset -> default (unchanged)",
+			config.Route{Default: "main-prov,main-model-a", Background: "bg-prov,bg-model-a"},
+			routeSignals{longContext: true},
+			"main-prov,main-model-a",
+		},
+		{"haiku -> background", all, routeSignals{haiku: true}, "bg-prov,bg-model-a"},
+		{
+			"haiku with background unset -> default",
+			config.Route{Default: "main-prov,main-model-a"},
+			routeSignals{haiku: true},
+			"main-prov,main-model-a",
+		},
+		// Precedence interplay:
+		{"longContext beats think", all, routeSignals{longContext: true, thinking: true}, "lc-prov,lc-model"},
+		{"longContext beats background (haiku)", all, routeSignals{longContext: true, haiku: true}, "lc-prov,lc-model"},
+		{"background beats think (haiku + thinking)", all, routeSignals{haiku: true, thinking: true}, "bg-prov,bg-model-a"},
+		{"longContext beats everything", all, routeSignals{longContext: true, haiku: true, thinking: true}, "lc-prov,lc-model"},
+		// Regression guard: with Think AND LongContext both unset, every signal
+		// combination collapses to the old haiku->Background-else-Default rule.
+		{
+			"regression: no think/lc, haiku -> background",
+			config.Route{Default: "main-prov,main-model-a", Background: "bg-prov,bg-model-a"},
+			routeSignals{haiku: true, thinking: true, longContext: true},
+			"bg-prov,bg-model-a",
+		},
+		{
+			"regression: no think/lc, ordinary -> default",
+			config.Route{Default: "main-prov,main-model-a", Background: "bg-prov,bg-model-a"},
+			routeSignals{thinking: true, longContext: true},
+			"main-prov,main-model-a",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := chooseRoute(tc.route, tc.sig); got != tc.want {
+				t.Errorf("chooseRoute(%+v) = %q, want %q", tc.sig, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSelectLongContextRouteFiresFromLargeRequest proves the long-context path
+// end-to-end through Select from a real request body — no caller plumbing
+// needed, since the size is computed from fields Select already receives.
+func TestSelectLongContextRouteFiresFromLargeRequest(t *testing.T) {
+	cfg := fourRouteCfg()
+	p, model, err := Select(cfg, bigContentRequest("claude-3-7-sonnet-20250219"))
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if p.Name != "lc-prov" || model != "lc-model" {
+		t.Errorf("got (%q,%q), want (lc-prov, lc-model)", p.Name, model)
+	}
+}
+
+// A large request whose model is also haiku-tier must STILL go to LongContext:
+// the oversized prompt outranks the background tier (see chooseRoute).
+func TestSelectLongContextBeatsBackgroundForLargeHaikuRequest(t *testing.T) {
+	cfg := fourRouteCfg()
+	p, model, err := Select(cfg, bigContentRequest("claude-3-5-haiku-20241022"))
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if p.Name != "lc-prov" || model != "lc-model" {
+		t.Errorf("got (%q,%q), want (lc-prov, lc-model)", p.Name, model)
+	}
+}
+
+// A below-threshold request must NOT trip the long-context route: it resolves
+// to Default like any ordinary turn.
+func TestSelectBelowThresholdUsesDefault(t *testing.T) {
+	cfg := fourRouteCfg()
+	req := &translate.AnthropicRequest{
+		Model:    "claude-3-7-sonnet-20250219",
+		Messages: []translate.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"hello there"`)}},
+	}
+	p, model, err := Select(cfg, req)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if p.Name != "main-prov" || model != "main-model-a" {
+		t.Errorf("got (%q,%q), want (main-prov, main-model-a)", p.Name, model)
+	}
+}
+
+// Regression: with LongContext UNSET, even an enormous request stays on Default
+// — behaviour is identical to before the override existed.
+func TestSelectLargeRequestUnchangedWhenLongContextUnset(t *testing.T) {
+	cfg := fourRouteCfg()
+	cfg.Router.LongContext = ""
+	p, model, err := Select(cfg, bigContentRequest("claude-3-7-sonnet-20250219"))
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if p.Name != "main-prov" || model != "main-model-a" {
+		t.Errorf("got (%q,%q), want (main-prov, main-model-a)", p.Name, model)
+	}
+}
+
+// An explicit "provider/model" selector must win over the think and
+// long-context overrides just as it wins over Default/Background — even when the
+// request is also huge (would otherwise trip LongContext).
+func TestSelectExplicitSelectorBeatsOverrides(t *testing.T) {
+	cfg := fourRouteCfg()
+	req := bigContentRequest("bg-prov/bg-model-a")
+	p, model, err := Select(cfg, req)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if p.Name != "bg-prov" || model != "bg-model-a" {
+		t.Errorf("explicit selector ignored: got (%q,%q), want (bg-prov, bg-model-a)", p.Name, model)
+	}
+}
+
+// Honesty lock: think-routing does NOT fire from any request the gateway builds
+// today, because the typed request carries no thinking field. Even with
+// Router.Think configured, an ordinary request resolves to Default, and
+// requestWantsThinking reports false for every request.
+func TestSelectThinkInertForTodaysRequests(t *testing.T) {
+	cfg := fourRouteCfg()
+	req := &translate.AnthropicRequest{
+		Model:    "claude-3-7-sonnet-20250219",
+		Messages: []translate.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"think hard about this"`)}},
+	}
+	if requestWantsThinking(req) {
+		t.Fatal("requestWantsThinking should be false until translate.AnthropicRequest models the thinking field")
+	}
+	p, model, err := Select(cfg, req)
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if p.Name != "main-prov" || model != "main-model-a" {
+		t.Errorf("think must not fire from a real request today: got (%q,%q), want (main-prov, main-model-a)", p.Name, model)
+	}
+}
+
+// TestEstimateTokenCount checks the coarse estimator over its inputs: it counts
+// system, message content and tool bytes, excludes max_tokens, and clears the
+// threshold only for genuinely large prompts.
+func TestEstimateTokenCount(t *testing.T) {
+	if got := estimateTokenCount(nil); got != 0 {
+		t.Errorf("estimateTokenCount(nil) = %d, want 0", got)
+	}
+
+	small := &translate.AnthropicRequest{
+		Model:     "m",
+		MaxTokens: 1 << 20, // huge OUTPUT budget must NOT count as prompt input
+		Messages:  []translate.AnthropicMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}},
+	}
+	if got := estimateTokenCount(small); got > DefaultLongContextThreshold {
+		t.Errorf("small request estimated %d tokens, should be below threshold %d", got, DefaultLongContextThreshold)
+	}
+
+	big := bigContentRequest("m")
+	if got := estimateTokenCount(big); got <= DefaultLongContextThreshold {
+		t.Errorf("big request estimated %d tokens, should exceed threshold %d", got, DefaultLongContextThreshold)
+	}
+
+	// System block and tool payloads contribute to the estimate too.
+	withTools := &translate.AnthropicRequest{
+		Model:  "m",
+		System: json.RawMessage(`"` + strings.Repeat("s", 40) + `"`),
+		Tools: []translate.AnthropicTool{
+			{Name: "t", Description: strings.Repeat("d", 40), InputSchema: json.RawMessage(strings.Repeat("i", 40))},
+		},
+	}
+	if got := estimateTokenCount(withTools); got == 0 {
+		t.Error("estimateTokenCount ignored system/tool payloads")
 	}
 }

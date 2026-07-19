@@ -21,28 +21,41 @@ import (
 // Select picks the upstream provider and the model id to send it for req.
 //
 // Rule order, matching the Node implementation's routing behaviour so an
-// operator's existing config.json continues to route the same way:
+// operator's existing config.json continues to route the same way. The first
+// applicable rule wins:
 //
 //  0. If req's model is an explicit "provider,model" or "provider/model"
 //     selector (see resolveExplicitSelector), that pins the exact upstream
 //     the caller asked for and wins over every rule below — including the
-//     haiku heuristic, since a caller that names a provider by hand has
-//     already made a more specific choice than any tier-based default could.
-//  1. If req's model is literally "haiku" or contains "haiku" (Claude Code's
-//     cheap/background tier — ids like "claude-3-5-haiku-20241022" wrap the
-//     tier name rather than equalling it, hence a substring match), prefer
-//     cfg.Router.Background when it is set.
-//  2. Otherwise, and whenever Background is unset, use cfg.Router.Default.
-//  3. If the resulting route string is empty (operator configured providers
+//     tier/override heuristics, since a caller that names a provider by hand
+//     has already made a more specific choice than any tier-based default.
+//  1. LongContext: if the request's estimated prompt size exceeds
+//     DefaultLongContextThreshold AND cfg.Router.LongContext is set, route
+//     there. Checked before the tier rules because an oversized prompt may
+//     not physically fit the background/think/default models (see chooseRoute).
+//  2. Background: if req's model is literally "haiku" or contains "haiku"
+//     (Claude Code's cheap/background tier — ids like
+//     "claude-3-5-haiku-20241022" wrap the tier name rather than equalling it,
+//     hence a substring match), prefer cfg.Router.Background when it is set.
+//  3. Think: if the request asked for extended reasoning AND cfg.Router.Think
+//     is set, route there. See requestWantsThinking for the honest caveat that
+//     this signal is inert for the requests the gateway builds today.
+//  4. Default: otherwise, and whenever the applicable override is unset, use
+//     cfg.Router.Default.
+//  5. If the resulting route string is empty (operator configured providers
 //     but never wrote a Router block), and req names a bare model that
 //     EXACTLY ONE provider lists, route to that provider (resolveBareModel).
 //     This is a last-resort resolution that runs ONLY in the no-route window,
 //     so a configured Router.Default always wins over it; a bare model served
 //     by two or more providers is a loud ambiguity error, never a silent
 //     arbitrary pick.
-//  4. If still unresolved (no route and no unambiguous bare match), fall back
+//  6. If still unresolved (no route and no unambiguous bare match), fall back
 //     to the first provider and the first model in its Models list, so a
 //     minimal single-provider config still works.
+//
+// Regression guarantee: when neither Router.Think nor Router.LongContext is
+// configured, rules 1 and 3 can never fire, so Select behaves byte-identically
+// to its previous haiku->Background-else-Default form.
 //
 // Every failure to resolve a concrete provider is returned as an error
 // rather than silently picking something arbitrary — routing a request to
@@ -64,17 +77,14 @@ func Select(cfg *config.Config, req *translate.AnthropicRequest) (*config.Provid
 		}
 	}
 
-	route := cfg.Router.Default
-	if req != nil && isHaikuTier(req.Model) && cfg.Router.Background != "" {
-		route = cfg.Router.Background
-	}
+	route := chooseRoute(cfg.Router, routeSignalsFor(req))
 
 	if route == "" {
 		// No route configured at all. Before the blind first-provider
 		// fallback, try to honour a bare model that unambiguously names a
-		// single provider. This never overrides Router.Default (we only reach
-		// here when Default — and, for haiku, Background — is empty); an
-		// ambiguous bare model fails loudly rather than being guessed.
+		// single provider. This never overrides a configured route (we only
+		// reach here when chooseRoute found nothing applicable); an ambiguous
+		// bare model fails loudly rather than being guessed.
 		if req != nil {
 			if p, matched, err := resolveBareModel(cfg, req.Model); err != nil {
 				return nil, "", err
@@ -94,6 +104,74 @@ func Select(cfg *config.Config, req *translate.AnthropicRequest) (*config.Provid
 		return nil, "", fmt.Errorf("router: route %q references unknown provider %q", route, name)
 	}
 	return p, model, nil
+}
+
+// routeSignals are the request-derived facts the route-override precedence
+// depends on. They are extracted once, up front, from the incoming request so
+// that chooseRoute — where the precedence actually lives — can be exercised in
+// isolation without constructing whole request bodies, and so the (currently
+// inert) thinking signal has a single, well-documented seam rather than being
+// smeared through the selection logic.
+type routeSignals struct {
+	// haiku marks Claude Code's cheap/background tier (see isHaikuTier).
+	haiku bool
+	// thinking marks a request that asked for extended reasoning. See
+	// requestWantsThinking for why this is false for every request the gateway
+	// builds today, and exactly what caller-side change makes it fire.
+	thinking bool
+	// longContext marks a request whose estimated prompt token footprint
+	// exceeds DefaultLongContextThreshold (see estimateTokenCount).
+	longContext bool
+}
+
+// routeSignalsFor extracts the routing signals from req. A nil req yields the
+// zero value (no tier, no thinking, not long) so chooseRoute cleanly resolves
+// to Router.Default — the same result the old nil-request path produced.
+func routeSignalsFor(req *translate.AnthropicRequest) routeSignals {
+	if req == nil {
+		return routeSignals{}
+	}
+	return routeSignals{
+		haiku:       isHaikuTier(req.Model),
+		thinking:    requestWantsThinking(req),
+		longContext: estimateTokenCount(req) > DefaultLongContextThreshold,
+	}
+}
+
+// chooseRoute applies the route-override precedence to the extracted signals
+// and returns the configured route string to use, or "" when none of the
+// configured routes apply (Select then falls through to bare-model resolution
+// and finally the first-provider fallback).
+//
+// Precedence, highest first (the explicit "provider,model" selector is handled
+// earlier, in Select, and outranks everything here):
+//
+//  1. LongContext — request estimated to exceed DefaultLongContextThreshold AND
+//     Router.LongContext configured. Checked first, matching the Node
+//     implementation: an oversized request must go to the wide-context model
+//     even when it is also a background/thinking turn, because the other models
+//     may not physically fit the prompt.
+//  2. Background — haiku-tier request AND Router.Background configured. The
+//     pre-existing cheap/background-tier rule, unchanged and kept ahead of
+//     Think so a haiku turn still lands on Background exactly as before even
+//     when Think is also configured.
+//  3. Think — thinking request AND Router.Think configured.
+//  4. Default — Router.Default, the base route for every ordinary request.
+//
+// When neither Router.Think nor Router.LongContext is configured, branches 1
+// and 3 can never be taken, so the result is byte-identical to the previous
+// haiku->Background-else-Default behaviour (the regression guard).
+func chooseRoute(r config.Route, s routeSignals) string {
+	if s.longContext && r.LongContext != "" {
+		return r.LongContext
+	}
+	if s.haiku && r.Background != "" {
+		return r.Background
+	}
+	if s.thinking && r.Think != "" {
+		return r.Think
+	}
+	return r.Default
 }
 
 // isHaikuTier reports whether model belongs to Claude Code's haiku

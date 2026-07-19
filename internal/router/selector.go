@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/vasic-digital/claude-code-router/internal/config"
+	"github.com/vasic-digital/claude-code-router/internal/translate"
 )
 
 // parseExplicitSelector splits a client-supplied model string into a
@@ -89,6 +90,80 @@ func resolveExplicitSelector(cfg *config.Config, model string) (p *config.Provid
 		return nil, "", true, fmt.Errorf("router: explicit selector %q: provider %q does not serve model %q", model, providerName, resolvedModel)
 	}
 	return p, resolvedModel, true, nil
+}
+
+// DefaultLongContextThreshold is the estimated prompt token count above which a
+// request is treated as "long context" and routed to Router.LongContext (when
+// configured — see chooseRoute). It matches the Node implementation's default
+// trigger of 60000 tokens (1000*60). The Node router exposes this as a
+// configurable Router.longContextThreshold; config.Route here carries no such
+// field, so the threshold is a fixed constant — change it here if a different
+// cutoff is wanted.
+const DefaultLongContextThreshold = 60000
+
+// charsPerToken is the coarse characters-per-token divisor used to turn a byte
+// length into an approximate token count. Real BPE tokenisers (tiktoken and the
+// like) average close to 4 characters per token across English prose and code,
+// which is all the precision a "is this prompt huge?" gate needs. This is
+// deliberately an estimate rather than a real tokeniser call, so routing stays a
+// pure, dependency-free, fast function of the request.
+const charsPerToken = 4
+
+// estimateTokenCount approximates the prompt token footprint of req.
+//
+// It sums the byte lengths of the raw payloads that actually carry prompt text
+// — every message's content, the system block(s), and each tool's name,
+// description and input schema — and divides by charsPerToken. The polymorphic
+// fields (System and message Content are json.RawMessage) are measured by their
+// raw byte length rather than re-decoded; the small amount of structural JSON
+// punctuation that adds only biases the long-context gate very slightly more
+// eager, never less, which is the safe direction. max_tokens (the requested
+// OUTPUT budget, not prompt input) is intentionally excluded.
+//
+// This reads only fields the router already receives on translate.AnthropicRequest,
+// so — unlike think-routing — long-context routing fires in production today
+// with no caller-side change.
+func estimateTokenCount(req *translate.AnthropicRequest) int {
+	if req == nil {
+		return 0
+	}
+	chars := len(req.System)
+	for _, m := range req.Messages {
+		chars += len(m.Content)
+	}
+	for _, t := range req.Tools {
+		chars += len(t.Name) + len(t.Description) + len(t.InputSchema)
+	}
+	return chars / charsPerToken
+}
+
+// requestWantsThinking reports whether req asked for extended reasoning
+// ("thinking"), which — when Router.Think is configured — routes the request to
+// the think model (see chooseRoute).
+//
+// HONEST LIMITATION: the typed translate.AnthropicRequest this router receives
+// does NOT model Anthropic's `thinking` request field (see its definition in
+// internal/translate/anthropic.go — Model, MaxTokens, Messages, System, Tools,
+// Temperature, TopP, StopSequences, Stream, and nothing else). There is
+// therefore nothing here to inspect: this returns false for every request the
+// gateway builds today, so think-routing is inert in production.
+//
+// Making it fire requires a caller-side change OUTSIDE this package's ownership:
+// add a
+//
+//	Thinking json.RawMessage `json:"thinking,omitempty"`
+//
+// field to translate.AnthropicRequest so the incoming `thinking` block survives
+// decoding, then have this return true when it is present and non-null (e.g.
+// len(req.Thinking) > 0 && !bytes.Equal(req.Thinking, []byte("null"))). No proxy
+// signal (max_tokens, stop sequences, …) is substituted, because inferring
+// "thinking" from an unrelated field would misroute ordinary requests — exactly
+// the kind of silent misrouting the rest of this package is careful to avoid.
+//
+// The routing LOGIC that consumes this signal is real and is pinned directly by
+// unit tests that set routeSignals.thinking (see the chooseRoute tests).
+func requestWantsThinking(req *translate.AnthropicRequest) bool {
+	return false
 }
 
 // containsString reports whether s appears verbatim in list. Extracted
