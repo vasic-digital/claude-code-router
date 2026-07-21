@@ -2,3 +2,7 @@
 /dist/
 *.test
 coverage.out
+
+# Stray root build output: `go build ./cmd/ccr` with no -o drops a ~32MB binary here
+# instead of bin/ccr. CONST-053 — no versioned build artefacts.
+/ccr
