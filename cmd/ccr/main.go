@@ -32,6 +32,7 @@ Usage:
   ccr ui    [--host <host>] [--port <port>] [--open|--no-open] [--gateway|--no-gateway]
   ccr serve [--host <host>] [--port <port>] [--open|--no-open] [--gateway|--no-gateway]
   ccr stop
+  ccr restart [--host <host>] [--port <port>] [--gateway|--no-gateway]
   ccr <profile-name-or-id> [cli|app] [-- <agent args>]
 
 Commands:
@@ -40,6 +41,11 @@ Commands:
   serve   Run the router service in the foreground. Alias: web.
   web     Alias for serve.
   stop    Stop the background service started with "start" (or "ui").
+  restart Stop the running service and start a replacement, applying the
+          current config.json. A running gateway keeps serving the config it
+          started with, so this is what makes an edited config take effect.
+          Invoked bare it replays the running service's own flags. Restarting
+          when nothing is running is a plain start, not an error.
 
 Flags (start, ui, serve, web):
   --host <host>            Management interface host (default 127.0.0.1, env CCR_WEB_HOST)
@@ -106,13 +112,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdServe(args[1:], stdout, stderr)
 	case "stop":
 		return cmdStop(args[1:], stdout, stderr)
+	case "restart":
+		return cmdRestart(args[1:], stdout, stderr)
 	case "config":
 		return cmdConfig(args[1:], stdout, stderr)
+	// The agent-launch grammar: `ccr default-claude-code -- <agent args>` (and
+	// the pre-3.0.0 spelling `ccr code`). This is how claude_toolkit starts
+	// Claude Code for every router-transport provider alias (scripts/lib.sh:953).
+	//
+	// These are deliberately explicit case arms rather than a predicate inside
+	// `default:`. The toolkit's conformance test (scripts/tests/
+	// test_ccr_conformance.sh) statically checks that every `ccr <subcommand>`
+	// the toolkit invokes is implemented here, by parsing this switch's case
+	// arms — a grammar hidden behind a predicate would be invisible to it, and
+	// the check exists precisely because a missing launch subcommand silently
+	// killed every provider alias once already.
+	case "default-claude-code", "code":
+		return cmdLaunch(args[0], args[1:], stdout, stderr)
 	default:
-		// Unknown positionals are profile names/ids, per the grammar's last
-		// line. The real ccr prints this exact message and exits non-zero;
-		// claude_toolkit's alias wrapper depends on that being reproduced
-		// verbatim, not paraphrased.
+		// Anything else is an unknown profile name/id. The real ccr prints this
+		// exact message and exits non-zero; reproducing it verbatim keeps a
+		// user's typo an honest error instead of a silent launch.
 		fmt.Fprintf(stderr, "Profile %q was not found or is disabled.\n", args[0])
 		return 1
 	}
