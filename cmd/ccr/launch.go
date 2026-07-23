@@ -5,11 +5,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/vasic-digital/claude-code-router/internal/config"
 )
 
 // Agent launch: the subcommand that runs Claude Code routed through this
@@ -90,6 +93,13 @@ func cmdLaunch(_ string, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 1
 	}
+	// ATM-852 (2026-07-23): expose the routed provider in the base URL the
+	// agent sees (http://host:port/<provider>) so /usage can attribute the
+	// session to its provider. The gateway accepts and strips the segment
+	// (internal/gateway registerRoutes). Best-effort: an unreadable config or
+	// an empty default route keeps the bare base — exactly the pre-change
+	// behaviour — rather than refusing to launch.
+	base = providerScopedBase(base, defaultRouteProvider())
 
 	bin, err := resolveAgentBin()
 	if err != nil {
@@ -197,9 +207,9 @@ func ensureGateway(stdout, stderr io.Writer) (string, error) {
 	// available. A genuinely absent pidfile (err != nil at line ~133) recorded no
 	// auth posture, so a first-ever fresh start is unaffected.
 	if err == nil && st.AuthEnabled && len(flags.APIKeys) == 0 {
-		return "", fmt.Errorf("the previous ccr service had inbound authentication enabled but is no "+
-			"longer running, and no keys are available to this launch (CCR_API_KEYS is unset here). "+
-			"Rebuilding it now would bring the gateway back UNAUTHENTICATED. Set CCR_API_KEYS (or pass "+
+		return "", fmt.Errorf("the previous ccr service had inbound authentication enabled but is no " +
+			"longer running, and no keys are available to this launch (CCR_API_KEYS is unset here). " +
+			"Rebuilding it now would bring the gateway back UNAUTHENTICATED. Set CCR_API_KEYS (or pass " +
 			"--api-key) and retry.")
 	}
 
@@ -363,6 +373,32 @@ func agentEnv(parent []string, base string) []string {
 // that case is to export the same CCR_API_KEYS in the launching shell — the
 // alternative, reading another process's environment, is neither portable nor
 // race-free, and persisting the keys to the pidfile would put secrets on disk.
+// providerScopedBase appends the routed provider's name as ONE path segment to
+// the gateway base URL (ATM-852) so the agent-visible base becomes
+// http://host:port/<provider>. Empty provider -> base unchanged (backward
+// compatible); a trailing slash on base never produces "//"; the name is
+// path-escaped so a hostile provider name cannot smuggle extra segments.
+func providerScopedBase(base, provider string) string {
+	if provider == "" {
+		return base
+	}
+	return strings.TrimRight(base, "/") + "/" + url.PathEscape(provider)
+}
+
+// defaultRouteProvider reads the provider half of Router.default ("prov,model")
+// from the on-disk config — the toolkit rewrites it before every routed launch,
+// so at launch time it names exactly the provider this session will use.
+// Best-effort by design: unreadable config or empty route -> "" (caller keeps
+// the bare base, the pre-ATM-852 behaviour).
+func defaultRouteProvider() string {
+	cfg, err := config.Load(config.Path())
+	if err != nil || cfg == nil {
+		return ""
+	}
+	name, _, _ := strings.Cut(cfg.Router.Default, ",")
+	return strings.TrimSpace(name)
+}
+
 func gatewayToken() string {
 	if keys := splitAPIKeys(os.Getenv("CCR_API_KEYS")); len(keys) > 0 {
 		return keys[0]

@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -365,6 +366,36 @@ func (s *Server) routes() {
 		"/v1/chat/completions", "/proxy/v1/chat/completions",
 	} {
 		s.eng.POST(p, inbound, s.handleInbound)
+	}
+
+	// Provider-scoped inbound paths (ATM-852, 2026-07-23): the launcher exports
+	// ANTHROPIC_BASE_URL as http://host:port/<provider> so client-side usage
+	// accounting can recognize WHICH provider an alias routes to, and Claude
+	// Code then appends /v1/messages — so routed requests arrive as
+	// /<provider>/v1/messages. Accept and strip the leading segment for
+	// CONFIGURED providers only: an unknown segment stays 404 (a typo must not
+	// silently route to the default provider), and the bare /v1/* paths above
+	// keep working unchanged for every pre-existing client. The segment is
+	// informational — routing stays Router.default-driven — and the metrics
+	// route template is the bounded literal "/:provider/..." (no cardinality
+	// leak).
+	scoped := func(c *gin.Context) {
+		name := c.Param("provider")
+		if s.cfg.ProviderByName(name) == nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "unknown provider path segment"})
+			return
+		}
+		// STRIP the segment before delegating: the protocol classifier
+		// (requestProtocolForPath) reads the RAW request path, so downstream
+		// must see the canonical /v1/... form.
+		c.Request.URL.Path = strings.TrimPrefix(c.Request.URL.Path, "/"+name)
+		s.handleInbound(c)
+	}
+	for _, p := range []string{
+		"/:provider/v1/messages",
+		"/:provider/v1/chat/completions",
+	} {
+		s.eng.POST(p, inbound, scoped)
 	}
 }
 
